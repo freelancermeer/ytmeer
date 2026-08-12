@@ -13,6 +13,8 @@ Usage:
 Optional flags:
     --min-height N       Quality floor   (default: 720)
     --max-height N       Quality ceiling (default: 1080)
+    --no-subs            Do NOT build transcripts (built by default)
+    --sub-lang CODE      Transcript language code (default: en)
 
 Examples:
     python3 downloader.py "/Users/me/Videos/YT"
@@ -20,7 +22,11 @@ Examples:
 
 - Downloads in 1080p (priority) down to 720p (floor) — never below the floor
 - Each video -> its own folder named after the video title
-- Inside each folder: videoinfo.txt (title, link, quality, status/error)
+- Inside each folder:
+    videoinfo.txt        (title, link, quality, status/error)
+    trans_<name>.txt     English transcript, grouped lines  -> [hh:mm:ss] text
+    words_<name>.txt     word-level transcript              -> [hh:mm:ss.mmm] word
+  (transcript formatting adapted from ../Transcript with timestamps/transcribe.py)
 """
 
 import argparse
@@ -38,8 +44,9 @@ DOWNLOAD_DIR   = "."
 MAX_HEIGHT     = 1080
 MIN_HEIGHT     = 720
 FORMAT         = ""
-DOWNLOAD_SUBS  = True      # also fetch English auto-subtitles as .srt
-SUB_LANG       = "en"      # subtitle language code
+DOWNLOAD_SUBS  = True      # also write an English auto-transcript .txt
+SUB_LANG       = "en"      # transcript language code
+TRANSCRIPT_WRAP = 40       # max chars per line before wrapping (transcribe.py default)
 
 
 def build_format():
@@ -123,38 +130,169 @@ def base_cmd():
     return cmd
 
 
+# =================== transcript formatting component =======================
+# Adapted from ../Transcript with timestamps/transcribe.py (its "default" and
+# "oneword" modes). Kept as a self-contained copy so this repo has no external
+# path dependency (and doesn't pull in that script's hard-coded HF token).
+#   trans_<name>.txt : grouped, wrapped lines   -> [hh:mm:ss] text
+#   words_<name>.txt : one word per line        -> [hh:mm:ss.mmm] word
+
+def format_timestamp(seconds: float) -> str:
+    """0.0 -> [00:00:00] (floored to whole seconds)."""
+    total = int(seconds or 0)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"[{h:02d}:{m:02d}:{s:02d}]"
+
+
+def format_timestamp_ms(seconds: float) -> str:
+    """1.2534 -> [00:00:01.253] (with millisecond decimals)."""
+    ms_total = int(round(float(seconds or 0) * 1000))
+    h, rem = divmod(ms_total, 3600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"[{h:02d}:{m:02d}:{s:02d}.{ms:03d}]"
+
+
+def group_words_into_lines(words):
+    """words: list of (start, end, word_text) -> list of (start, line_text)."""
+    lines, current, start = [], [], None
+    for w_start, _w_end, text in words:
+        if start is None:
+            start = w_start
+        candidate = ("".join(current) + text).strip()
+        if current and len(candidate) > TRANSCRIPT_WRAP:
+            lines.append((start, "".join(current).strip()))
+            current, start = [text], w_start
+        else:
+            current.append(text)
+    if current:
+        lines.append((start, "".join(current).strip()))
+    return lines
+
+
+def parse_json3_words(path):
+    """Parse a YouTube json3 caption file into [(start_sec, None, word_text), ...]."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    words = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs")
+        if not segs:
+            continue
+        base = ev.get("tStartMs", 0) or 0
+        for s in segs:
+            text = s.get("utf8", "")
+            if not text or not text.strip():   # skip blanks / newline separators
+                continue
+            start = (base + (s.get("tOffsetMs") or 0)) / 1000.0
+            words.append((start, None, text))
+    return words
+
+
+def write_trans_txt(out_txt, words):
+    """Default style: grouped, wrapped lines with [hh:mm:ss] timestamps."""
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for start, text in group_words_into_lines(words):
+            if text:
+                f.write(f"{format_timestamp(start)} {text}\n")
+
+
+def write_words_txt(out_txt, words):
+    """Oneword style: one word per line with [hh:mm:ss.mmm] timestamps."""
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for start, _end, text in words:
+            word = text.strip()
+            if word:
+                f.write(f"{format_timestamp_ms(start)} {word}\n")
+
+
+# ============================ transcript helpers ===========================
 def sub_flags():
-    """yt-dlp flags to write the English AUTO-subtitle as .srt (empty if disabled).
+    """yt-dlp flags to fetch the English AUTO-caption as json3 (word-level).
     Only auto-generated captions are fetched (no manual subs)."""
     if not DOWNLOAD_SUBS:
         return []
-    return ["--write-auto-subs", "--sub-langs", SUB_LANG, "--sub-format", "srt"]
+    return ["--write-auto-subs", "--sub-langs", SUB_LANG, "--sub-format", "json3"]
 
 
-def find_sub_file(folder):
-    """Return path to an existing .srt in the folder, if any."""
+def find_json3(folder):
+    """Return path to a downloaded .json3 caption in the folder, if any."""
     try:
         for name in os.listdir(folder):
-            if name.lower().endswith(".srt"):
+            if name.lower().endswith(".json3"):
                 return os.path.join(folder, name)
     except OSError:
         pass
     return None
 
 
+def find_transcript_file(folder):
+    """Return the trans_*.txt transcript in the folder, if one exists."""
+    try:
+        for name in os.listdir(folder):
+            if name.startswith("trans_") and name.endswith(".txt"):
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
+
+def make_transcripts(folder):
+    """Convert a downloaded json3 caption into trans_<name>.txt + words_<name>.txt,
+    then delete the json3. Returns (trans_path, words_path) or (None, None)."""
+    j = find_json3(folder)
+    if not j:
+        return None, None
+    words = parse_json3_words(j)
+    try:
+        os.remove(j)
+    except OSError:
+        pass
+    if not words:
+        return None, None
+    base = os.path.basename(folder.rstrip("/"))
+    trans_path = os.path.join(folder, f"trans_{base}.txt")
+    words_path = os.path.join(folder, f"words_{base}.txt")
+    write_trans_txt(trans_path, words)
+    write_words_txt(words_path, words)
+    return trans_path, words_path
+
+
+def update_info_transcripts(folder, trans, words):
+    """Add/refresh the Transcript: and Words: lines in an existing videoinfo.txt."""
+    info = os.path.join(folder, "videoinfo.txt")
+    if not os.path.exists(info):
+        return
+    try:
+        with open(info, "r", encoding="utf-8") as f:
+            kept = [ln for ln in f.read().splitlines()
+                    if not ln.startswith(("Transcript:", "Words:"))]
+    except OSError:
+        return
+    kept.append(f"Transcript: {os.path.basename(trans) if trans else 'none'}")
+    kept.append(f"Words:      {os.path.basename(words) if words else 'none'}")
+    with open(info, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + "\n")
+
+
 def download_subs(folder, url):
-    """Fetch just the subtitle (.srt) for an already-downloaded video (backfill).
-    Returns the subtitle path if one exists afterwards, else None."""
+    """Backfill: fetch the caption for an already-downloaded video and build the
+    two transcript files. Returns (trans_path, words_path)."""
     if not DOWNLOAD_SUBS:
-        return None
-    existing = find_sub_file(folder)
+        return None, None
+    existing = find_transcript_file(folder)
     if existing:
-        return existing
+        words = os.path.join(folder, os.path.basename(existing).replace("trans_", "words_", 1))
+        return existing, (words if os.path.exists(words) else None)
     cmd = base_cmd() + ["--skip-download"] + sub_flags() + [
         "--no-warnings", "-o", os.path.join(folder, "%(title)s.%(ext)s"), url,
     ]
     subprocess.run(cmd, capture_output=True, text=True)
-    return find_sub_file(folder)
+    return make_transcripts(folder)
 
 
 def fetch_info(url: str):
@@ -245,7 +383,8 @@ def already_done(base, url):
     return None
 
 
-def write_info(folder, title, url, quality, status, error=None, subtitle=None):
+def write_info(folder, title, url, quality, status, error=None,
+               transcript=None, words=None):
     """Write videoinfo.txt inside the video's folder."""
     lines = [
         f"Title:   {title}",
@@ -254,7 +393,8 @@ def write_info(folder, title, url, quality, status, error=None, subtitle=None):
         f"Status:  {status}",
     ]
     if DOWNLOAD_SUBS:
-        lines.append(f"Subtitle: {os.path.basename(subtitle) if subtitle else 'none'}")
+        lines.append(f"Transcript: {os.path.basename(transcript) if transcript else 'none'}")
+        lines.append(f"Words:      {os.path.basename(words) if words else 'none'}")
     if error:
         lines.append(f"Error:   {error}")
     with open(os.path.join(folder, "videoinfo.txt"), "w", encoding="utf-8") as f:
@@ -270,11 +410,15 @@ def download_one(url, index, total):
     done = already_done(DOWNLOAD_DIR, url)
     if done:
         print(f"    Already downloaded -> {os.path.basename(done)}/  (skipping)")
-        # Backfill the subtitle if the video is there but no .srt yet.
-        if DOWNLOAD_SUBS and not find_sub_file(done):
-            sub = download_subs(done, url)
-            print(f"      + subtitle: {os.path.basename(sub)}" if sub
-                  else "      (no subtitle available)")
+        # Backfill the transcripts if the video is there but no trans_*.txt yet.
+        if DOWNLOAD_SUBS and not find_transcript_file(done):
+            trans, words = download_subs(done, url)
+            update_info_transcripts(done, trans, words)
+            if trans:
+                print(f"      + {os.path.basename(trans)} + "
+                      f"{os.path.basename(words) if words else 'words_*.txt'}")
+            else:
+                print("      (no transcript available)")
         return "skip"
 
     # 1) Get the title first so we can name the folder correctly.
@@ -296,7 +440,7 @@ def download_one(url, index, total):
         write_info(folder, title, url, "FAILED", "ERROR", err)
         return "fail"
 
-    # 2) Download best 720p-1080p video+audio (merged mp4) + English .srt subtitle.
+    # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
     out_template = os.path.join(folder, "%(title)s.%(ext)s")
     cmd = base_cmd() + [
         "-f", FORMAT,
@@ -326,14 +470,17 @@ def download_one(url, index, total):
     height = probe_height(vfile) if vfile else None
     quality = f"{height}p" if height else "Unknown"
 
-    # Subtitle: it downloads alongside the video; report what we got.
-    sub = find_sub_file(folder) if DOWNLOAD_SUBS else None
+    # Transcripts: the json3 caption downloads alongside the video; convert it
+    # into trans_<name>.txt (grouped) + words_<name>.txt (word-level).
+    trans = words = None
     sub_note = ""
     if DOWNLOAD_SUBS:
-        sub_note = (f"  Subtitle: {os.path.basename(sub)}" if sub
-                    else "  Subtitle: none available")
+        trans, words = make_transcripts(folder)
+        sub_note = (f"  Transcript: {os.path.basename(trans)} + "
+                    f"{os.path.basename(words)}" if trans
+                    else "  Transcript: none available")
     print(f"\n    Done. Quality: {quality}{sub_note}")
-    write_info(folder, title, url, quality, "OK", subtitle=sub)
+    write_info(folder, title, url, quality, "OK", transcript=trans, words=words)
     return "ok"
 
 
@@ -347,9 +494,9 @@ def parse_args():
     p.add_argument("--min-height", type=int, default=720, help="Quality floor (default 720).")
     p.add_argument("--max-height", type=int, default=1080, help="Quality ceiling (default 1080).")
     p.add_argument("--no-subs", action="store_true",
-                   help="Do NOT download subtitles (subtitles are downloaded by default).")
+                   help="Do NOT build transcripts (transcripts are built by default).")
     p.add_argument("--sub-lang", default="en",
-                   help="Subtitle language code (default en).")
+                   help="Transcript language code (default en).")
     return p.parse_args()
 
 
@@ -373,7 +520,7 @@ def main():
     print(f"  Folder  : {DOWNLOAD_DIR}")
     print(f"  Cookies : {COOKIES_FILE}")
     print(f"  Links   : {LINKS_FILE}")
-    print(f"  Subtitles: {'yes (' + SUB_LANG + ', .srt)' if DOWNLOAD_SUBS else 'no'}")
+    print(f"  Transcript: {'yes (' + SUB_LANG + ', trans_ + words_ .txt)' if DOWNLOAD_SUBS else 'no'}")
 
     if not os.path.isdir(DOWNLOAD_DIR):
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")

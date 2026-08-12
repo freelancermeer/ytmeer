@@ -55,13 +55,18 @@ Status:  ERROR
 Error:   Requested format not available
 ```
 
-## Subtitles
+## Transcripts
 
-By default it also downloads the **English auto-subtitle as `.srt`** next to each video (`<Video Title>.en.srt`). The chosen file is noted in `videoinfo.txt` (`Subtitle: ...` line).
+By default it also builds **two English transcript `.txt` files** next to each video, from YouTube's word-level auto-caption. Format is the same as `../Transcript with timestamps/transcribe.py` (its `default` and `oneword` modes):
 
-- Turn subtitles off:  `python3 downloader.py "<dir>" --no-subs`
-- Different language:  `python3 downloader.py "<dir>" --sub-lang es`  (e.g. Spanish)
-- **Backfill:** if a video is already downloaded but has no `.srt`, re-running fetches just the subtitle for it (no re-download of the video).
+- `trans_<Video Title>.txt` — grouped, wrapped lines:  `[hh:mm:ss] text`
+- `words_<Video Title>.txt` — one word per line:       `[hh:mm:ss.mmm] word`
+
+Both are noted in `videoinfo.txt` (`Transcript:` / `Words:` lines).
+
+- Turn transcripts off:  `python3 downloader.py "<dir>" --no-subs`
+- Different language:    `python3 downloader.py "<dir>" --sub-lang es`  (e.g. Spanish)
+- **Backfill:** if a video is already downloaded but has no `trans_*.txt`, re-running builds the transcripts for it (no re-download of the video).
 
 ## Notes
 - **Quality:** always 720p–1080p, H.264/mp4 preferred (best compatibility). If a video has no stream in that range, it is **not** downloaded at lower quality — the error is written to `videoinfo.txt` instead.
