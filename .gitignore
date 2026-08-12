@@ -1,0 +1,21 @@
+# Secrets / auth — never commit
+cookies.txt
+
+# Downloaded media & outputs
+downloads/
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.srt
+*.vtt
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Editor / local tooling
+.claude/
