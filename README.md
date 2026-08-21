@@ -115,10 +115,13 @@ in a 20-video batch, verified four ways:
 | The original version of this script | wrote no words file at all |
 | **YouTube's own timedtext API, asking for `kind=asr`** | **HTTP 404 — the track does not exist** |
 
-The script still does everything it can to find one: it prefers auto-captions
-over broadcast tracks, re-checks through a second player client when the first
-reports none, and copes with YouTube listing an auto track that then serves
-nothing.
+The marker is a last resort, not a first verdict. Before writing it the script
+walks **every** English track the video has — auto-captions first, then broadcast
+ones — and stops at the first with word timings. If the metadata shows no
+auto-caption it asks a second player client, which sometimes sees tracks the
+first does not, and it copes with YouTube listing an auto track that then serves
+nothing. Only when no track anywhere carries word timings does the marker
+appear, and `trans_*.txt` is still written from the best track found.
 
 Measured over that batch: **18 with word timings, 2 without.**
 
@@ -246,7 +249,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-86 tests, no network and no downloads. Every test runs twice — once through the
+96 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.

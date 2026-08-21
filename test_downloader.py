@@ -205,6 +205,80 @@ class PlatformCase:
         self.assertEqual(flags[flags.index("--sub-langs") + 1], "en",
                          "a wildcard here would pull hundreds of tracks and hit HTTP 429")
 
+    def test_candidates_try_auto_tracks_before_broadcast_ones(self):
+        info = {"automatic_captions": {"en-orig": self._track("English (Original)"),
+                                       "en": self._track("English")},
+                "subtitles": {"en-uYU": self._track("English - CC1")},
+                "_dummy": None}
+        got = [(code, source) for code, source, _c in d.caption_candidates("u", info)]
+        self.assertEqual(got, [("en", "auto"), ("en-orig", "auto"), ("en-uYU", "manual")])
+
+    def test_candidates_ignore_other_languages(self):
+        info = {"automatic_captions": {"de": self._track("German"),
+                                       "fr": self._track("French")}}
+        self.assertEqual(list(d.caption_candidates("u", info)), [])
+
+    # A fake track store: each code maps to the caption entries it serves.
+    def _stub_fetch(self, store, log):
+        def fetch(folder, url, lang, source, client=()):
+            log.append(lang)
+            entries = store.get(lang)
+            if entries is None:
+                return False
+            with open(os.path.join(folder, f"c.{lang}.json3"), "w", encoding="utf-8") as f:
+                json.dump({"events": [{"tStartMs": int(s * 1000), "dDurationMs": 500,
+                                       "segs": [{"utf8": t}]} for s, _e, t in entries]}, f)
+            return True
+        return fetch
+
+    def _with_stub(self, store, info):
+        log = []
+        real_fetch, real_info = d.fetch_caption, d.fetch_info
+        d.fetch_caption = self._stub_fetch(store, log)
+        d.fetch_info = lambda url, extra=(): (info, None)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                trans, words = d.build_transcripts(folder, "u", info)
+                return log, (os.path.basename(words) if words else None)
+        finally:
+            d.fetch_caption, d.fetch_info = real_fetch, real_info
+
+    def test_keeps_looking_past_a_phrase_timed_track(self):
+        info = {"automatic_captions": {"en": self._track("English"),
+                                       "en-orig": self._track("English (Original)")}}
+        store = {"en":      [(0.0, None, "A WHOLE PHRASE HERE NOW")],
+                 "en-orig": [(0.0, None, "one"), (0.4, None, "word"), (0.8, None, "each")]}
+        log, words = self._with_stub(store, info)
+        self.assertEqual(log, ["en", "en-orig"], "it must try the next track")
+        self.assertTrue(words.startswith("words_") and "not_found" not in words,
+                        "the word-timed track was available and should have won")
+
+    def test_marker_only_after_every_track_was_tried(self):
+        info = {"automatic_captions": {"en": self._track("English")},
+                "subtitles": {"en-uYU": self._track("English - CC1"),
+                              "en-JkeT": self._track("English - DTVCC1")}}
+        store = {"en": None,                                     # listed but serves nothing
+                 "en-uYU":  [(0.0, None, "A WHOLE PHRASE HERE")],
+                 "en-JkeT": [(0.0, None, "ANOTHER WHOLE PHRASE")]}
+        log, words = self._with_stub(store, info)
+        # Exact code, then the rest in a stable alphabetical order.
+        self.assertEqual(log, ["en", "en-JkeT", "en-uYU"], "every English track must be tried")
+        self.assertTrue(words.startswith("words_not_found_"))
+
+    def test_phrase_track_still_produces_a_transcript(self):
+        info = {"subtitles": {"en-uYU": self._track("English - CC1")}}
+        store = {"en-uYU": [(0.0, None, "A WHOLE PHRASE HERE NOW")]}
+        with tempfile.TemporaryDirectory() as folder:
+            real_fetch, real_info = d.fetch_caption, d.fetch_info
+            d.fetch_caption = self._stub_fetch(store, [])
+            d.fetch_info = lambda url, extra=(): (info, None)
+            try:
+                trans, words = d.build_transcripts(folder, "u", info)
+            finally:
+                d.fetch_caption, d.fetch_info = real_fetch, real_info
+            self.assertTrue(os.path.exists(trans), "trans_ must exist even without word timings")
+            self.assertIn("not_found", os.path.basename(words))
+
     # ------------------------------------------------------------ transcript
     def test_word_timed_segments_join_on_their_own_spaces(self):
         words = [(0.0, None, "of"), (0.1, None, " the"), (0.3, None, " FBI,")]

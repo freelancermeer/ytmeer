@@ -553,41 +553,46 @@ def find_transcript_file(folder):
     return None
 
 
-def make_transcripts(folder):
-    """Turn a downloaded json3 caption into the transcript files, then delete it.
-
-    trans_<name>.txt is always written. Its companion depends on what the caption
-    actually contains: words_<name>.txt when the track is timed per word, and
-    words_not_found_<name>.txt when it is only timed per phrase, so a folder
-    never leaves you guessing which kind you got.
-
-    Returns (trans_path, words_path); words_path is the marker file when no
-    word-level timings existed.
-    """
+def take_caption(folder):
+    """Read whatever json3 caption is sitting in the folder, and remove it.
+    The caption file is only ever a means to the transcript files."""
     found = find_json3(folder)
     best = pick_best_json3(found)
-    if not best:
-        return None, None
-    words = parse_json3_words(best)
-    for j in found:            # the caption files were only a means to an end
+    entries = parse_json3_words(best) if best else []
+    for j in found:
         try:
             os.remove(j)
         except OSError:
             pass
-    if not words:
-        return None, None
+    return entries
 
+
+def write_transcripts(folder, entries):
+    """Write the transcript files for one caption. Returns (trans, words).
+
+    trans_<name>.txt is always written. Its companion depends on what the
+    caption actually contains: words_<name>.txt when the track is timed per
+    word, and words_not_found_<name>.txt when it is only timed per phrase, so a
+    folder never leaves you guessing which kind you got.
+    """
+    if not entries:
+        return None, None
     base = os.path.basename(folder.rstrip("/\\"))   # strip both separators (Mac + Windows)
     trans_path = os.path.join(folder, f"trans_{base}.txt")
-    write_trans_txt(trans_path, words)
+    write_trans_txt(trans_path, entries)
 
-    if is_word_level(words):
+    if is_word_level(entries):
         words_path = os.path.join(folder, f"words_{base}.txt")
-        write_words_txt(words_path, words)
+        write_words_txt(words_path, entries)
     else:
         words_path = os.path.join(folder, f"words_not_found_{base}.txt")
-        write_words_not_found(words_path, words)
+        write_words_not_found(words_path, entries)
     return trans_path, words_path
+
+
+def make_transcripts(folder):
+    """Turn the caption already in the folder into the transcript files."""
+    return write_transcripts(folder, take_caption(folder))
 
 
 def update_info_transcripts(folder, trans, words):
@@ -641,25 +646,69 @@ def fetch_caption(folder, url, lang, source, client=()):
     return bool(find_json3(folder))
 
 
+# How many caption tracks to try before settling. Enough to exhaust a video's
+# English tracks, few enough that a long batch never looks like hammering.
+MAX_CAPTION_TRIES = 4
+
+
+def caption_candidates(url, info):
+    """Every English caption track worth trying, best first.
+
+    Auto-captions come first because they are the ones timed per word. If the
+    metadata shows none, the PO-token client is asked for a second opinion — it
+    sometimes sees tracks the default client does not — and its tracks are tried
+    through that same client. Broadcast tracks come last: they still make a
+    perfectly good trans_ file when nothing better exists.
+    """
+    seen = set()
+    sources = [(info, ())]
+    if not (info or {}).get("automatic_captions"):
+        richer, _ = fetch_info(url, PO_TOKEN_FLAGS)
+        if richer:
+            sources.append((richer, tuple(PO_TOKEN_FLAGS)))
+
+    for kind, source in (("automatic_captions", "auto"), ("subtitles", "manual")):
+        for meta, client in sources:
+            tracks = (meta or {}).get(kind) or {}
+            ordered = sorted(tracks, key=lambda c: (c != SUB_LANG, c))
+            for code in ordered:
+                if not (code == SUB_LANG or code.startswith(f"{SUB_LANG}-")):
+                    continue
+                if code in seen:
+                    continue
+                seen.add(code)
+                yield code, source, list(client)
+
+
 def build_transcripts(folder, url, info):
     """Produce trans_/words_ for a video, fetching the caption if needed.
 
     A caption normally arrives with the video, so usually there is nothing to
-    fetch. When there isn't one, the word-timed auto-caption is tried first —
-    and if YouTube listed an auto track that serves nothing (it does happen),
-    the manual track is taken rather than leaving the video with no transcript
-    at all.
+    fetch. If what we have is not timed per word, the other English tracks are
+    tried before giving up — words_not_found is meant to be the last word on a
+    video, not the first track's verdict. The best phrase-timed track found
+    along the way is kept, so a video never loses its trans_ file either.
     """
     if not DOWNLOAD_SUBS:
         return None, None
-    if not find_json3(folder):
-        lang, source, client = choose_caption(url, info)
-        got = fetch_caption(folder, url, lang, source, client) if lang else False
-        if not got and source == "auto":
-            manual = best_track_in((info or {}).get("subtitles") or {})
-            if manual:
-                fetch_caption(folder, url, manual, "manual")
-    return make_transcripts(folder)
+
+    entries = take_caption(folder)          # whatever came down with the video
+    if is_word_level(entries):
+        return write_transcripts(folder, entries)
+
+    fallback = entries
+    tried = 0
+    for lang, source, client in caption_candidates(url, info):
+        if tried >= MAX_CAPTION_TRIES:
+            break
+        tried += 1
+        if not fetch_caption(folder, url, lang, source, client):
+            continue
+        got = take_caption(folder)
+        if is_word_level(got):
+            return write_transcripts(folder, got)
+        fallback = fallback or got
+    return write_transcripts(folder, fallback)
 
 
 def download_subs(folder, url):
