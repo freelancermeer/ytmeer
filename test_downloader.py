@@ -237,7 +237,7 @@ class PlatformCase:
         log = []
         real_fetch, real_info = d.fetch_caption, d.fetch_info
         d.fetch_caption = self._stub_fetch(store, log)
-        d.fetch_info = lambda url, extra=(): (info, None)
+        d.fetch_info = lambda url, extra=(), **kw: (info, None)
         try:
             with tempfile.TemporaryDirectory() as folder:
                 trans, words = d.build_transcripts(folder, "u", info)
@@ -273,7 +273,7 @@ class PlatformCase:
         with tempfile.TemporaryDirectory() as folder:
             real_fetch, real_info = d.fetch_caption, d.fetch_info
             d.fetch_caption = self._stub_fetch(store, [])
-            d.fetch_info = lambda url, extra=(): (info, None)
+            d.fetch_info = lambda url, extra=(), **kw: (info, None)
             try:
                 trans, words = d.build_transcripts(folder, "u", info)
             finally:
@@ -387,6 +387,53 @@ class PlatformCase:
                      "Did not get any data blocks",
                      "This video is not available"):
             self.assertFalse(d.is_permanent(text), text)
+
+    def _stub_info(self, results):
+        """Make fetch_info_once return each result in turn; records the flags used."""
+        seen = []
+        results = list(results)
+        real = d.fetch_info_once
+
+        def once(url, extra_flags=()):
+            seen.append(tuple(extra_flags))
+            return results.pop(0) if results else (None, "exhausted")
+
+        d.fetch_info_once = once
+        self.addCleanup(lambda: setattr(d, "fetch_info_once", real))
+        return seen
+
+    def test_metadata_lookup_is_retried(self):
+        self._no_sleep()
+        seen = self._stub_info([(None, "HTTP Error 429: Too Many Requests"),
+                                ({"title": "T"}, None)])
+        info, err = d.fetch_info("u")
+        self.assertEqual(info, {"title": "T"}, "the second lookup succeeded")
+        self.assertIsNone(err)
+        self.assertEqual(len(seen), 2)
+
+    def test_metadata_lookup_falls_back_to_the_po_token_client(self):
+        self._no_sleep()
+        seen = self._stub_info([(None, "timed out"), (None, "timed out"),
+                                ({"title": "T"}, None)])
+        info, _err = d.fetch_info("u")
+        self.assertEqual(info, {"title": "T"})
+        self.assertEqual(len(seen), d.INFO_ATTEMPTS)
+        self.assertEqual(seen[-1], tuple(d.PO_TOKEN_FLAGS),
+                         "the last try should go through the PO-token client")
+
+    def test_metadata_lookup_gives_up_on_a_dead_video(self):
+        self._no_sleep()
+        seen = self._stub_info([(None, "ERROR: [youtube] x: Video unavailable")])
+        info, err = d.fetch_info("u")
+        self.assertIsNone(info)
+        self.assertIn("unavailable", err.lower())
+        self.assertEqual(len(seen), 1, "a dead video must not be looked up three times")
+
+    def test_caption_second_opinion_stays_cheap(self):
+        self._no_sleep()
+        seen = self._stub_info([(None, "timed out")])
+        d.fetch_info("u", d.PO_TOKEN_FLAGS, attempts=1)
+        self.assertEqual(len(seen), 1, "an optional caption lookup should not retry")
 
     def test_routes_skip_the_default_client_once_a_token_is_known_to_be_needed(self):
         saved = d.po_token_first[0]

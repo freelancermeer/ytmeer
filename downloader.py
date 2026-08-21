@@ -648,7 +648,7 @@ def choose_caption(url, info):
     lang, source = resolve_sub_lang(info)
     if source == "auto" or not DOWNLOAD_SUBS:
         return lang, source, []
-    richer, _ = fetch_info(url, PO_TOKEN_FLAGS)
+    richer, _ = fetch_info(url, PO_TOKEN_FLAGS, attempts=1)
     if richer:
         better, better_source = resolve_sub_lang(richer)
         if better_source == "auto":
@@ -686,7 +686,7 @@ def caption_candidates(url, info):
     seen = set()
     sources = [(info, ())]
     if not (info or {}).get("automatic_captions"):
-        richer, _ = fetch_info(url, PO_TOKEN_FLAGS)
+        richer, _ = fetch_info(url, PO_TOKEN_FLAGS, attempts=1)
         if richer:
             sources.append((richer, tuple(PO_TOKEN_FLAGS)))
 
@@ -750,8 +750,14 @@ def download_subs(folder, url):
     return build_transcripts(folder, url, info)
 
 
-def fetch_info(url: str, extra_flags=()):
-    """Fetch video metadata (title, id) without downloading. Returns (info, error)."""
+# The metadata lookup gets its own attempts. A hiccup here ends a video before
+# the download retries can do anything about it, so it is worth a couple of goes.
+INFO_ATTEMPTS = 3
+INFO_RETRY_DELAY = 5
+
+
+def fetch_info_once(url: str, extra_flags=()):
+    """One metadata lookup. Returns (info, error)."""
     cmd = base_cmd() + ["--skip-download", "--dump-single-json",
                         "--no-warnings"] + list(extra_flags) + [url]
     try:
@@ -765,6 +771,31 @@ def fetch_info(url: str, extra_flags=()):
         return json.loads(out.stdout), None
     except json.JSONDecodeError:
         return None, "Could not parse video info (invalid JSON from yt-dlp)"
+
+
+def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
+    """Fetch video metadata (title, id, captions), retrying a couple of times.
+
+    Everything about a video hangs off this call, so one rate-limited or dropped
+    request should not be the end of it. Permanently gone videos still fail on
+    the first try. The last attempt switches to the PO-token client, which
+    sometimes resolves metadata the default client cannot.
+    """
+    err = None
+    flags = list(extra_flags)
+    for attempt in range(1, attempts + 1):
+        info, err = fetch_info_once(url, flags)
+        if info:
+            return info, None
+        if is_permanent(err):
+            return None, err
+        if attempt < attempts:
+            if attempt == attempts - 1 and not extra_flags:
+                flags = list(PO_TOKEN_FLAGS)
+            print(f"      info lookup failed ({(err or '').strip()[:70]}); "
+                  f"retry {attempt + 1}/{attempts}...")
+            time.sleep(INFO_RETRY_DELAY)
+    return None, err
 
 
 def probe_height(filepath: str):

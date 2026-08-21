@@ -208,11 +208,14 @@ Delete a video's folder if you want a genuinely fresh pull.
 Most YouTube failures pass on their own — a throttled stream, a token gone
 stale, a fragment that 403s once. So a video is never given up on after one go:
 
-1. Each video is tried by every **route** in turn — the default client, the
-   PO-token client, then the PO-token client on a single connection.
-2. That whole set repeats up to **3 times**, waiting 10s then 30s in between,
+1. The **metadata lookup** gets up to 3 goes, 5s apart, with the last one
+   through the PO-token client. Everything about a video hangs off this call, so
+   one rate-limited request must not be the end of it.
+2. The **download** is then tried by every route in turn — the default client,
+   the PO-token client, then the PO-token client on a single connection.
+3. That whole set repeats up to **3 times**, waiting 10s then 30s in between,
    because some failures only clear with a pause.
-3. After the batch, a **final sweep** retries everything that still failed, by
+4. After the batch, a **final sweep** retries everything that still failed, by
    which point a bad stretch has usually passed.
 
 Private, deleted, and unavailable videos are the exception: nothing about those
@@ -265,7 +268,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-108 tests, no network and no downloads. Every test runs twice — once through the
+116 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.
