@@ -1,6 +1,6 @@
 # YouTube Video Downloader
 
-Batch-downloads YouTube videos in **1080p** (priority) down to **720p** (floor) using **yt-dlp** and your own **cookies.txt**. Every video gets its own folder, with an info file and two timestamped transcripts inside.
+Batch-downloads YouTube videos in **1080p** (priority) down to **720p** (floor) using **yt-dlp**. Every video gets its own folder, with an info file and two timestamped transcripts inside. Runs on macOS and Windows; no cookies needed for public videos.
 
 ## Setup
 
