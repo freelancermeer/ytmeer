@@ -11,6 +11,8 @@ No network access and no downloads: this exercises the pure logic — naming,
 video-id matching, resume indexing, caption selection, transcript formatting.
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -361,6 +363,84 @@ class PlatformCase:
                 with open(out, encoding="utf-8") as f:
                     for line in f:
                         self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}")
+
+    # ------------------------------------------------------------- retrying
+    def _no_sleep(self):
+        """Skip the real backoff waits, and keep the retry chatter out of the
+        test output."""
+        real = d.time.sleep
+        d.time.sleep = lambda _s: None
+        self.addCleanup(lambda: setattr(d.time, "sleep", real))
+        quiet = contextlib.redirect_stdout(io.StringIO())
+        quiet.__enter__()
+        self.addCleanup(lambda: quiet.__exit__(None, None, None))
+
+    def test_permanent_failures_are_not_retried(self):
+        for text in ("ERROR: Private video. Sign in if you've been granted access",
+                     "ERROR: [youtube] xxx: This video is unavailable",
+                     "Video has been removed by the uploader"):
+            self.assertTrue(d.is_permanent(text), text)
+
+    def test_recoverable_failures_are_not_treated_as_permanent(self):
+        for text in ("HTTP Error 403: Forbidden",
+                     "aria2c exited with code 22",
+                     "Did not get any data blocks",
+                     "This video is not available"):
+            self.assertFalse(d.is_permanent(text), text)
+
+    def test_routes_skip_the_default_client_once_a_token_is_known_to_be_needed(self):
+        saved = d.po_token_first[0]
+        try:
+            d.po_token_first[0] = False
+            self.assertEqual(d.download_routes()[0][0], "default client")
+            d.po_token_first[0] = True
+            labels = [label for label, _f, _fast in d.download_routes()]
+            self.assertNotIn("default client", labels,
+                             "no point paying for an attempt already known to 403")
+        finally:
+            d.po_token_first[0] = saved
+
+    def test_a_failing_video_gets_several_attempts(self):
+        self._no_sleep()
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = False
+        calls = []
+        try:
+            def always_fails(flags, fast=True):
+                calls.append((tuple(flags), fast))
+                return "HTTP Error 403: Forbidden"
+            err = d.run_with_retries(always_fails)
+        finally:
+            d.po_token_first[0] = saved
+        self.assertTrue(err)
+        self.assertEqual(len(calls), d.MAX_ATTEMPTS * len(d.download_routes()),
+                         "every route should be tried on every attempt")
+        self.assertGreaterEqual(len(calls), 3, "a failing video must get retried")
+
+    def test_retrying_stops_as_soon_as_one_route_works(self):
+        self._no_sleep()
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = False
+        calls = []
+        try:
+            def second_one_works(flags, fast=True):
+                calls.append(tuple(flags))
+                return None if flags else "HTTP Error 403: Forbidden"
+            err = d.run_with_retries(second_one_works)
+        finally:
+            d.po_token_first[0] = saved
+        self.assertIsNone(err)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_permanent_failure_gives_up_immediately(self):
+        self._no_sleep()
+        calls = []
+        def gone(flags, fast=True):
+            calls.append(tuple(flags))
+            return "ERROR: Private video. Sign in if you've been granted access"
+        err = d.run_with_retries(gone)
+        self.assertTrue(err)
+        self.assertEqual(len(calls), 1, "a private video must not be retried nine times")
 
     # ------------------------------------------------------- command building
     def test_po_token_errors_trigger_a_retry(self):

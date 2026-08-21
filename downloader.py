@@ -53,6 +53,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 # These are filled in from command-line arguments in main().
 LINKS_FILE     = "links.txt"
@@ -266,6 +267,28 @@ def is_transient(error_text):
     """True if a failure looks like a hiccup worth retrying once."""
     low = (error_text or "").lower()
     return any(hint in low for hint in TRANSIENT_ERRORS)
+
+
+# Nothing about these changes on a retry, so a video that reports one is failed
+# immediately instead of spending three rounds proving it.
+PERMANENT_ERRORS = ("private video", "video is unavailable", "video unavailable",
+                    "removed by the uploader", "has been terminated",
+                    "sign in to confirm your age", "members-only",
+                    "is not a valid url", "unsupported url",
+                    "video has been removed", "copyright claim")
+
+
+def is_permanent(error_text):
+    """True when retrying cannot possibly help."""
+    low = (error_text or "").lower()
+    return any(hint in low for hint in PERMANENT_ERRORS)
+
+
+# How many times to work through every download route before giving up, and how
+# long to wait between those rounds. The waits matter: when YouTube throttles or
+# a token goes stale, the same request often succeeds a moment later.
+MAX_ATTEMPTS = 3
+RETRY_DELAYS = (10, 30)
 
 
 def mark_incomplete(folder):
@@ -925,9 +948,58 @@ def rel(path):
         return path
 
 
+def download_routes():
+    """The ways a video can be fetched, in the order worth trying.
+
+    Each is (label, extra flags, use the fast multi-connection downloader). The
+    default client is skipped once something in this batch has proved the
+    PO-token client is needed, and the single-connection route exists because a
+    token-bound URL sometimes rejects aria2c's parallel range requests.
+    """
+    routes = []
+    if not po_token_first[0]:
+        routes.append(("default client", [], True))
+    routes.append(("PO-token client (mweb)", list(PO_TOKEN_FLAGS), True))
+    if ARIA2C:
+        routes.append(("PO-token client, single connection", list(PO_TOKEN_FLAGS), False))
+    return routes
+
+
+def run_with_retries(attempt):
+    """Try every download route, and repeat the whole set a few times.
+
+    Most YouTube failures pass on their own: a throttled stream, a token that
+    went stale, a fragment that 403s once. Switching route fixes some of them
+    and waiting fixes others, so both are tried before a video is given up on.
+    Returns None on success, else the last error.
+    """
+    err = None
+    for round_no in range(1, MAX_ATTEMPTS + 1):
+        for label, flags, fast in download_routes():
+            if err:
+                print(f"\n    ! {err}\n    Attempt {round_no}/{MAX_ATTEMPTS} "
+                      f"via {label}...\n")
+            err = attempt(flags, fast)
+            if not err:
+                if flags:
+                    po_token_first[0] = True   # the rest of the batch will need it
+                return None
+            if is_permanent(err):
+                return err                     # retrying cannot help
+        if round_no < MAX_ATTEMPTS:
+            delay = RETRY_DELAYS[min(round_no - 1, len(RETRY_DELAYS) - 1)]
+            print(f"\n    ! {err}\n    Every route failed; waiting {delay}s before "
+                  f"attempt {round_no + 1} of {MAX_ATTEMPTS}...\n")
+            time.sleep(delay)
+    return err
+
+
 def download_one(url, index, total):
     """Download a single video into its own folder.
-    Returns one of: "ok", "skip", "fail"."""
+
+    Returns "ok", "skip", "fail" (worth another go later), or "gone" (private,
+    deleted, or otherwise never coming back — retrying it would be pointless).
+    """
     print(f"\n[{index}/{total}] {url}")
 
     # 0) Skip if this video is already finished — matched by video id, so a link
@@ -960,7 +1032,7 @@ def download_one(url, index, total):
         err = (err or "Failed to fetch video info").replace("ERROR:", "").strip()
         print(f"    ! Failed to fetch info: {err}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
-        return "fail"
+        return "gone" if is_permanent(err) else "fail"
 
     # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
     out_template = output_template(folder, folder_name)
@@ -990,27 +1062,7 @@ def download_one(url, index, total):
         return err.replace("ERROR:", "").strip()
 
     print(f"    Downloading (>= {MIN_HEIGHT}p, <= {MAX_HEIGHT}p) -> {rel(folder)}/\n")
-    err = attempt(PO_TOKEN_FLAGS if po_token_first[0] else [])
-
-    # Some videos are gated behind a PO token and 403 on the normal path (aria2c
-    # reports that same 403 as exit code 22). Retry once through the mweb client,
-    # which mints a token — the fast multi-connection download still applies.
-    if err and needs_po_token(err) and not po_token_first[0]:
-        print(f"\n    ! {err}\n    Retrying with the PO-token client (mweb)...\n")
-        err = attempt(PO_TOKEN_FLAGS)
-        if not err:
-            po_token_first[0] = True   # the rest of this batch will need it too
-
-    # A token-bound URL occasionally rejects parallel range requests; fall back
-    # to a single connection rather than failing the video outright.
-    if err and ARIA2C and needs_po_token(err):
-        print(f"\n    ! {err}\n    Retrying once more on a single connection...\n")
-        err = attempt(PO_TOKEN_FLAGS, fast=False)
-
-    # A stalled or dropped stream is not the video's fault — try once more.
-    if err and is_transient(err):
-        print(f"\n    ! {err}\n    Stream problem, retrying...\n")
-        err = attempt(PO_TOKEN_FLAGS if po_token_first[0] else [])
+    err = run_with_retries(attempt)
 
     if err:
         print(f"\n    ! Download failed: {err}")
@@ -1018,7 +1070,7 @@ def download_one(url, index, total):
         for name in leftovers:
             print(f"      partial file kept as {name}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
-        return "fail"
+        return "gone" if is_permanent(err) else "fail"
 
     # 3) Verify the actual downloaded quality with ffprobe.
     vfile = find_video_file(folder)
@@ -1126,20 +1178,43 @@ def main():
         print(f"  Resuming: {len(DONE_INDEX)} video(s) already downloaded here.")
 
     total = len(links)
-    ok = skipped = 0
+    counts = {"ok": 0, "skip": 0}
     failed = []
-    for i, url in enumerate(links, 1):
-        result = download_one(url, i, total)
-        if result == "ok":
-            ok += 1
-        elif result == "skip":
-            skipped += 1
-        else:
-            failed.append(url)
+
+    gone = []
+
+    def run(batch, batch_total):
+        """Download a list of links, returning the ones worth trying again."""
+        remaining = []
+        for i, url in enumerate(batch, 1):
+            result = download_one(url, i, batch_total)
+            if result in counts:
+                counts[result] += 1
+            elif result == "gone":
+                gone.append(url)      # nothing a retry could change
+            else:
+                remaining.append(url)
+        return remaining
+
+    failed = run(links, total)
+
+    # A final sweep. Whatever was wrong earlier — a throttled stretch, a stale
+    # token, a stream that dropped — has usually passed by the end of a long
+    # batch, and these videos get a fresh set of attempts rather than none.
+    if failed:
+        print("\n" + "=" * 60)
+        print(f"  Final sweep: retrying {len(failed)} video(s) that failed.")
+        print("=" * 60)
+        time.sleep(RETRY_DELAYS[-1])
+        failed = run(failed, len(failed))
 
     print("\n" + "=" * 60)
-    print(f"  Summary: {ok} downloaded, {skipped} skipped (already done), "
-          f"{len(failed)} failed  (of {total} links).")
+    print(f"  Summary: {counts['ok']} downloaded, {counts['skip']} skipped "
+          f"(already done), {len(failed) + len(gone)} failed  (of {total} links).")
+    if gone:
+        print("  Unavailable (private, deleted — not retried):")
+        for u in gone:
+            print(f"    - {u}")
     if failed:
         print("  Failed links (see each folder's videoinfo.txt for details):")
         for u in failed:

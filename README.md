@@ -199,11 +199,27 @@ Finished videos are indexed **by video id** at startup, so a re-run:
 - treats `?v=ABC` and `?v=ABC&pp=…` as the same video, so duplicate links in `links.txt` are downloaded once;
 - retries anything that failed or was interrupted (yt-dlp continues its partial `.part` file).
 
+See [Retrying](#retrying) for what happens when a download does fail.
+
 Delete a video's folder if you want a genuinely fresh pull.
 
-A stalled or dropped stream (`Did not get any data blocks`, a 5xx, a timeout) is
-retried once on its own — one flaky moment should not cost you a video in a long
-batch. If a download still fails after that, any media it left behind is renamed
+### Retrying
+
+Most YouTube failures pass on their own — a throttled stream, a token gone
+stale, a fragment that 403s once. So a video is never given up on after one go:
+
+1. Each video is tried by every **route** in turn — the default client, the
+   PO-token client, then the PO-token client on a single connection.
+2. That whole set repeats up to **3 times**, waiting 10s then 30s in between,
+   because some failures only clear with a pause.
+3. After the batch, a **final sweep** retries everything that still failed, by
+   which point a bad stretch has usually passed.
+
+Private, deleted, and unavailable videos are the exception: nothing about those
+changes on a retry, so they fail immediately and are listed separately in the
+summary rather than burning attempts.
+
+If a download still fails after all that, any media it left behind is renamed
 `INCOMPLETE_…`: a half-finished file is the right size and plays, so without the
 marker a video with no sound looks exactly like a good one. Marked files are
 ignored by resume, so the next run downloads them properly.
@@ -249,7 +265,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-96 tests, no network and no downloads. Every test runs twice — once through the
+108 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.
