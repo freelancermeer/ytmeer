@@ -95,12 +95,32 @@ def build_format():
     )
 
 
+# Names Windows refuses to use for a file or folder, with or without an
+# extension. Creating one raises OSError there, while macOS accepts it happily.
+WINDOWS_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
+                    | {f"COM{i}" for i in range(1, 10)}
+                    | {f"LPT{i}" for i in range(1, 10)})
+
+# Windows caps a whole path at 260 characters by default, and --channel nests a
+# channel folder above the video folder, so components are kept much shorter
+# there. Budget: base + channel + folder + "words_<folder>.txt" stays inside 260
+# even from a fairly deep base directory.
+NAME_LIMIT = 60 if IS_WINDOWS else 150
+
+
 def sanitize(name: str) -> str:
-    """Make a string safe to use as a folder/file name on macOS/Windows."""
+    """Make a string safe to use as a folder/file name on macOS *and* Windows."""
     name = re.sub(r'[\\/:*?"<>|]', "_", name)   # forbidden chars
+    name = re.sub(r"[\x00-\x1f]", "", name)       # control chars
     name = re.sub(r"\s+", " ", name).strip()      # collapse whitespace
     name = name.rstrip(". ")                       # no trailing dots/spaces
-    return name[:150] if len(name) > 150 else name  # keep it filesystem-safe
+    name = name[:NAME_LIMIT].rstrip(". ")          # keep the path within limits
+    # Windows matches a reserved device by the part before the first dot, so the
+    # underscore has to go on the stem: "aux.txt_" is still AUX, "aux_.txt" is not.
+    stem, dot, rest = name.partition(".")
+    if stem.upper() in WINDOWS_RESERVED:
+        name = f"{stem}_{dot}{rest}"
+    return name
 
 
 def read_links(path: str):
@@ -198,10 +218,17 @@ def windows_flags():
     """
     if not IS_WINDOWS:
         return []
-    flags = list(PO_TOKEN_FLAGS)
+    # Let yt-dlp apply its own Windows-safe name rules as a backstop; the actual
+    # length budget is handled by naming the output file ourselves (see
+    # output_template), because --trim-filenames would trim the whole path
+    # template and collapse the per-video folder into the filename.
+    flags = ["--windows-filenames"]
     node = shutil.which("node")
     if node:
         flags += ["--js-runtimes", f"node:{node}"]
+    # The PO-token client itself is not added here: po_token_first starts True
+    # on Windows, so the download already begins with PO_TOKEN_FLAGS. Adding it
+    # in both places would pass the same --extractor-args twice.
     return flags
 
 
@@ -323,10 +350,18 @@ def parse_json3_words(path):
     return words
 
 
+def one_line(text):
+    """Collapse a caption's whitespace so it cannot break the one-line-per-
+    timestamp format. Both writers apply it, so that guarantee holds whatever
+    the caption track contained."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 def write_trans_txt(out_txt, words):
     """Default style: grouped, wrapped lines with [hh:mm:ss] timestamps."""
     with open(out_txt, "w", encoding="utf-8") as f:
         for start, text in group_words_into_lines(words):
+            text = one_line(text)
             if text:
                 f.write(f"{format_timestamp(start)} {text}\n")
 
@@ -335,7 +370,7 @@ def write_words_txt(out_txt, words):
     """Oneword style: one word per line with [hh:mm:ss.mmm] timestamps."""
     with open(out_txt, "w", encoding="utf-8") as f:
         for start, _end, text in words:
-            word = text.strip()
+            word = one_line(text)
             if word:
                 f.write(f"{format_timestamp_ms(start)} {word}\n")
 
@@ -472,8 +507,9 @@ def download_subs(folder, url):
     flags = sub_flags(resolve_sub_lang(info))
     if not flags:
         return None, None
+    name = os.path.basename(folder.rstrip("/\\"))
     cmd = base_cmd() + ["--skip-download"] + flags + [
-        "--no-warnings", "-o", os.path.join(folder, "%(title)s.%(ext)s"), url,
+        "--no-warnings", "-o", output_template(folder, name), url,
     ]
     subprocess.run(cmd, capture_output=True, text=True)
     return make_transcripts(folder)
@@ -630,6 +666,18 @@ def write_info(folder, title, url, quality, status, error=None,
         f.write("\n".join(lines) + "\n")
 
 
+def output_template(folder, folder_name):
+    """yt-dlp -o template that names the file after its folder.
+
+    The name is the one sanitize() already vetted, rather than yt-dlp's raw
+    %(title)s: that keeps the file within the path-length budget on Windows,
+    keeps the .mp4 and the trans_/words_ files consistently named, and avoids
+    --trim-filenames, which trims the whole template and would flatten the
+    per-video folder away. A literal % must be doubled to survive the template.
+    """
+    return os.path.join(folder, folder_name.replace("%", "%%") + ".%(ext)s")
+
+
 def skip_finished(folder, url):
     """Report an already-finished video and backfill its transcripts if missing."""
     print(f"    Already downloaded -> {rel(folder)}/  (skipping)")
@@ -689,7 +737,7 @@ def download_one(url, index, total):
         return "fail"
 
     # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
-    out_template = os.path.join(folder, "%(title)s.%(ext)s")
+    out_template = output_template(folder, folder_name)
 
     def attempt(extra_flags, fast=True):
         """Run yt-dlp, teeing its output so the live progress bar (%, size,
@@ -775,10 +823,29 @@ def parse_args():
     return p.parse_args()
 
 
+def use_utf8_output():
+    """Print UTF-8 regardless of the console's code page.
+
+    Video titles routinely contain characters (＂ ： ？ …) that Windows' default
+    cp1252 cannot encode, and printing one there raises UnicodeEncodeError the
+    moment output is piped or redirected to a file.
+
+    Line buffering is turned on for the same reason it matters here: yt-dlp
+    writes straight to the same handle, so without it our own lines sit in a
+    buffer and land out of order in a redirected log.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, OSError):
+            pass
+
+
 def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
 
+    use_utf8_output()
     args = parse_args()
     DOWNLOAD_DIR  = os.path.expanduser(args.directory)
     COOKIES_FILE  = os.path.join(DOWNLOAD_DIR, "cookies.txt")

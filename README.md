@@ -182,12 +182,32 @@ pip install -r requirements.txt
 
 ## Windows
 
-Windows needs extra yt-dlp flags that macOS does not. The script applies them **automatically when it runs on Windows** and never on macOS, so the Mac path stays as-is (see `windows_flags()` in `downloader.py`, and `fix_yt_dlp_windows.md`):
+Everything works on both macOS and Windows from the same file. Platform
+differences are handled automatically, so the Mac path stays exactly as it is
+(see `windows_flags()` and `sanitize()` in `downloader.py`, plus
+`fix_yt_dlp_windows.md`):
 
 1. **`n challenge solving failed`** — Windows (especially inside a venv, under a Python subprocess) fails to auto-detect Node, so the absolute path is passed explicitly via `--js-runtimes node:<path>`.
 2. **`HTTP Error 403: Forbidden`** — see [PO tokens](#po-tokens-the-403-fix). Windows starts on the `mweb` client directly; macOS uses it as an automatic retry after a 403, so the fast path stays the default.
-3. **Console hangs / "Bad file descriptor"** — output is streamed with `read1()` rather than a raw `os.read()` on the file descriptor, which is safe on both platforms.
-4. **Paths** — folder names are stripped of both `/` and `\`.
+3. **Console hangs / "Bad file descriptor"** — output is streamed with `read1()` rather than a raw `os.read()` on the file descriptor.
+4. **Reserved names** — Windows refuses `CON`, `NUL`, `AUX`, `COM1`…`LPT9` as file or folder names, matching on the part before the first dot. A video titled one of those gets an underscore on the stem (`aux.txt` → `aux_.txt`).
+5. **260-character path limit** — name components are capped at 60 characters on Windows (150 on macOS), and the media file is named after its folder rather than left to yt-dlp's raw title, which keeps `<base>\<channel>\<video>\<file>` inside the limit.
+6. **Console encoding** — output is forced to UTF-8. Video titles routinely contain characters that Windows' default cp1252 cannot encode, which otherwise raises `UnicodeEncodeError` as soon as output is piped to a file.
+7. **Paths** — both `/` and `\` are handled throughout.
+
+On Windows, install the requirements the same way, and make sure `node`,
+`ffmpeg`, and (optionally) `aria2c` are on `PATH`.
+
+## Tests
+
+```bash
+python3 test_downloader.py
+```
+
+66 tests, no network and no downloads. Every test runs twice — once through the
+macOS code path and once through the Windows one — so you can check both from
+either machine. They cover naming rules, video-id matching, the resume index in
+both layouts, caption-track selection, and transcript formatting.
 
 ## Notes
 
