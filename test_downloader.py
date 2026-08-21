@@ -157,26 +157,45 @@ class PlatformCase:
     def test_exact_language_preferred(self):
         info = {"automatic_captions": {"en": self._track("English"),
                                        "en-orig": self._track("English (Original)")}}
-        self.assertEqual(d.resolve_sub_lang(info), "en")
+        self.assertEqual(d.resolve_sub_lang(info), ("en", "auto"))
 
     def test_variant_used_when_plain_code_absent(self):
         info = {"automatic_captions": {"en-orig": self._track("English (Original)")}}
-        self.assertEqual(d.resolve_sub_lang(info), "en-orig")
+        self.assertEqual(d.resolve_sub_lang(info), ("en-orig", "auto"))
 
     def test_machine_translated_track_is_last_resort(self):
         info = {"automatic_captions": {"en-fr-X": self._track("English from French - CC1"),
                                        "en-Jk": self._track("English - CC1")}}
-        self.assertEqual(d.resolve_sub_lang(info), "en-Jk")
+        self.assertEqual(d.resolve_sub_lang(info), ("en-Jk", "auto"))
 
-    def test_manual_captions_are_considered(self):
-        self.assertEqual(d.resolve_sub_lang({"subtitles": {"en": self._track("English")}}), "en")
+    def test_auto_captions_beat_manual_ones(self):
+        # Auto-captions carry word timings; a broadcast CC track is per phrase.
+        # Picking the manual one here is what words_<name>.txt cannot survive.
+        info = {"automatic_captions": {"en": self._track("English")},
+                "subtitles": {"en": self._track("English - CC1"),
+                              "en-uYU": self._track("English - CC1")}}
+        self.assertEqual(d.resolve_sub_lang(info), ("en", "auto"))
+
+    def test_manual_captions_used_only_when_nothing_else(self):
+        self.assertEqual(d.resolve_sub_lang({"subtitles": {"en": self._track("English")}}),
+                         ("en", "manual"))
 
     def test_no_english_track_returns_none(self):
-        self.assertIsNone(d.resolve_sub_lang({"automatic_captions": {"de": self._track("German")}}))
-        self.assertEqual(d.sub_flags(None), [], "no track means no subtitle flags")
+        self.assertEqual(d.resolve_sub_lang({"automatic_captions": {"de": self._track("German")}}),
+                         (None, None))
+        self.assertEqual(d.sub_flags(None, None), [], "no track means no subtitle flags")
+
+    def test_only_the_chosen_kind_of_track_is_requested(self):
+        auto = d.sub_flags("en", "auto")
+        self.assertIn("--write-auto-subs", auto)
+        self.assertNotIn("--write-subs", auto,
+                         "enabling both lets yt-dlp swap in the phrase-timed manual track")
+        manual = d.sub_flags("en", "manual")
+        self.assertIn("--write-subs", manual)
+        self.assertNotIn("--write-auto-subs", manual)
 
     def test_only_one_track_is_requested(self):
-        flags = d.sub_flags("en")
+        flags = d.sub_flags("en", "auto")
         self.assertEqual(flags[flags.index("--sub-langs") + 1], "en",
                          "a wildcard here would pull hundreds of tracks and hit HTTP 429")
 

@@ -87,9 +87,31 @@ Two `.txt` files are built next to each video from YouTube's auto-caption, in th
 - `trans_<Video Title>.txt` — grouped, wrapped lines: `[hh:mm:ss] text`
 - `words_<Video Title>.txt` — one word per line: `[hh:mm:ss.mmm] word`
 
+**Both files are always written** when the video has any English caption at all.
+
 **Backfill:** if a video is already downloaded but has no `trans_*.txt`, re-running builds the transcripts for it without re-downloading the video.
 
-Note: a few videos publish closed-caption tracks that are timed per *phrase* rather than per *word*. For those, `words_*.txt` carries phrases — the finer timing simply isn't in the source.
+### Where the word timings come from
+
+YouTube's **auto-generated** captions carry a timestamp per word, which is what
+`words_*.txt` needs. Some videos — typically TV news clips — instead ship the
+broadcast **closed-caption** tracks (`CC1`, `DTVCC1`), which are timed per
+*phrase*. YouTube does not auto-caption those videos, so no word timings exist
+anywhere in the source.
+
+The script always prefers the auto-caption and only falls back to a broadcast
+track when there is genuinely no auto-caption (it also re-checks through a second
+player client first, and copes with YouTube listing an auto track that serves
+nothing). When it does fall back, `words_*.txt` holds phrases — that is the
+source's limit, not the script's.
+
+Measured over a 20-video batch: **18 word-level, 2 phrase-level**. Both
+phrase-level videos were confirmed against an independent captions API, which
+returned the same phrase-timed text.
+
+If you need true word timings for one of those, transcribe the downloaded `.mp4`
+locally with `../Transcript with timestamps/transcribe.py oneword`, which runs
+Whisper and produces the same `[hh:mm:ss.mmm] word` format.
 
 ## Speed
 

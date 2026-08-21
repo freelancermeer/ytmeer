@@ -409,21 +409,15 @@ def write_words_txt(out_txt, words):
 
 
 # ============================ transcript helpers ===========================
-def resolve_sub_lang(info):
-    """Pick the one caption track to fetch, from the metadata we already have.
+def best_track_in(tracks):
+    """The closest match to SUB_LANG among one set of caption tracks.
 
     Videos do not all publish English as plain "en" — it can be "en-orig", a
     regional "en-US", or a closed-caption code like "en-uYU-mmqFLq8". Matching
     with a wildcard would drag in every machine-translated "English from French"
-    track too: dozens of downloads, and YouTube answers with HTTP 429. So the
-    available tracks are read from the info JSON (no extra request) and exactly
-    one code is chosen. Returns None when the video has no such track.
+    track too: dozens of downloads, and YouTube answers with HTTP 429. So one
+    explicit code is chosen instead.
     """
-    tracks = {}
-    for key in ("automatic_captions", "subtitles"):
-        for code, entries in ((info or {}).get(key) or {}).items():
-            tracks.setdefault(code, entries)
-
     if SUB_LANG in tracks:
         return SUB_LANG
     if f"{SUB_LANG}-orig" in tracks:
@@ -440,18 +434,35 @@ def resolve_sub_lang(info):
     return (native or variants or [None])[0]
 
 
-def sub_flags(lang):
-    """yt-dlp flags to fetch exactly one caption track as json3 (word-level).
+def resolve_sub_lang(info):
+    """Choose the caption track to fetch: (code, "auto"|"manual"|None).
 
-    Auto-captions are preferred (resolve_sub_lang looks there first), but some
-    videos publish their English track only as a regular caption, so both kinds
-    are enabled. That is safe here because a single explicit code is requested
-    rather than a wildcard.
+    Auto-captions are timed per WORD, which is what words_<name>.txt is for.
+    Broadcast closed-caption tracks are timed per phrase, so they can only ever
+    produce phrase-level output — they are the fallback, never the default.
+    The caller keeps the two apart, because asking yt-dlp for both kinds at once
+    lets it hand back the manual track and silently lose the word timings.
+    """
+    auto = (info or {}).get("automatic_captions") or {}
+    manual = (info or {}).get("subtitles") or {}
+    pick = best_track_in(auto)
+    if pick:
+        return pick, "auto"
+    pick = best_track_in(manual)
+    return (pick, "manual") if pick else (None, None)
+
+
+def sub_flags(lang, source):
+    """yt-dlp flags to fetch exactly one caption track as json3.
+
+    Only the kind of track we actually chose is enabled: passing both
+    --write-auto-subs and --write-subs makes yt-dlp prefer the manual track for
+    a language, which would quietly downgrade word timings to phrase timings.
     """
     if not DOWNLOAD_SUBS or not lang:
         return []
-    return ["--write-auto-subs", "--write-subs",
-            "--sub-langs", lang, "--sub-format", "json3"]
+    kind = "--write-auto-subs" if source == "auto" else "--write-subs"
+    return [kind, "--sub-langs", lang, "--sub-format", "json3"]
 
 
 def find_json3(folder):
@@ -527,9 +538,63 @@ def update_info_transcripts(folder, trans, words):
         f.write("\n".join(kept) + "\n")
 
 
+def choose_caption(url, info):
+    """Decide which caption track to download: (lang, source, client_flags).
+
+    YouTube's metadata is not consistent between player clients — the default
+    one sometimes reports no auto-captions for a video that plainly has them.
+    Settling for a phrase-timed broadcast track when word timings exist would
+    quietly cost words_<name>.txt its whole point, so before falling back to a
+    manual track we ask the PO-token client for a second opinion, and download
+    through that same client if it is the one that can see the track.
+    """
+    lang, source = resolve_sub_lang(info)
+    if source == "auto" or not DOWNLOAD_SUBS:
+        return lang, source, []
+    richer, _ = fetch_info(url, PO_TOKEN_FLAGS)
+    if richer:
+        better, better_source = resolve_sub_lang(richer)
+        if better_source == "auto":
+            return better, better_source, PO_TOKEN_FLAGS
+    return lang, source, []
+
+
+def fetch_caption(folder, url, lang, source, client=()):
+    """Download one caption track into the folder. True if a json3 arrived."""
+    flags = sub_flags(lang, source)
+    if not flags:
+        return False
+    name = os.path.basename(folder.rstrip("/\\"))
+    cmd = base_cmd() + ["--skip-download"] + flags + list(client) + [
+        "--no-warnings", "-o", output_template(folder, name), url,
+    ]
+    subprocess.run(cmd, capture_output=True, text=True)
+    return bool(find_json3(folder))
+
+
+def build_transcripts(folder, url, info):
+    """Produce trans_/words_ for a video, fetching the caption if needed.
+
+    A caption normally arrives with the video, so usually there is nothing to
+    fetch. When there isn't one, the word-timed auto-caption is tried first —
+    and if YouTube listed an auto track that serves nothing (it does happen),
+    the manual track is taken rather than leaving the video with no transcript
+    at all.
+    """
+    if not DOWNLOAD_SUBS:
+        return None, None
+    if not find_json3(folder):
+        lang, source, client = choose_caption(url, info)
+        got = fetch_caption(folder, url, lang, source, client) if lang else False
+        if not got and source == "auto":
+            manual = best_track_in((info or {}).get("subtitles") or {})
+            if manual:
+                fetch_caption(folder, url, manual, "manual")
+    return make_transcripts(folder)
+
+
 def download_subs(folder, url):
-    """Backfill: fetch the caption for an already-downloaded video and build the
-    two transcript files. Returns (trans_path, words_path)."""
+    """Backfill: build the transcripts for an already-downloaded video."""
     if not DOWNLOAD_SUBS:
         return None, None
     existing = find_transcript_file(folder)
@@ -537,20 +602,13 @@ def download_subs(folder, url):
         words = os.path.join(folder, os.path.basename(existing).replace("trans_", "words_", 1))
         return existing, (words if os.path.exists(words) else None)
     info, _ = fetch_info(url)          # tells us which caption track to ask for
-    flags = sub_flags(resolve_sub_lang(info))
-    if not flags:
-        return None, None
-    name = os.path.basename(folder.rstrip("/\\"))
-    cmd = base_cmd() + ["--skip-download"] + flags + [
-        "--no-warnings", "-o", output_template(folder, name), url,
-    ]
-    subprocess.run(cmd, capture_output=True, text=True)
-    return make_transcripts(folder)
+    return build_transcripts(folder, url, info)
 
 
-def fetch_info(url: str):
+def fetch_info(url: str, extra_flags=()):
     """Fetch video metadata (title, id) without downloading. Returns (info, error)."""
-    cmd = base_cmd() + ["--skip-download", "--dump-single-json", "--no-warnings", url]
+    cmd = base_cmd() + ["--skip-download", "--dump-single-json",
+                        "--no-warnings"] + list(extra_flags) + [url]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
@@ -784,6 +842,9 @@ def download_one(url, index, total):
 
     # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
     out_template = output_template(folder, folder_name)
+    sub_lang, sub_source, sub_client = choose_caption(url, info)
+    if sub_client:
+        po_token_first[0] = True   # only that client can see the caption track
 
     def attempt(extra_flags, fast=True):
         """Run yt-dlp, teeing its output so the live progress bar (%, size,
@@ -797,7 +858,7 @@ def download_one(url, index, total):
             "-o", out_template,
             url,
         ] + (speed_flags() if fast else ["--concurrent-fragments", "8"]) \
-          + sub_flags(resolve_sub_lang(info)) + extra_flags
+          + sub_flags(sub_lang, sub_source) + extra_flags
         text = run_streaming(cmd)
         if last_returncode[0] == 0:
             return None
@@ -847,7 +908,7 @@ def download_one(url, index, total):
     trans = words = None
     sub_note = ""
     if DOWNLOAD_SUBS:
-        trans, words = make_transcripts(folder)
+        trans, words = build_transcripts(folder, url, info)
         sub_note = (f"  Transcript: {os.path.basename(trans)} + "
                     f"{os.path.basename(words)}" if trans
                     else "  Transcript: none available")
