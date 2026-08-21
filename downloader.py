@@ -253,6 +253,39 @@ def needs_po_token(error_text):
     return any(hint in low for hint in PO_TOKEN_ERRORS)
 
 
+# A stream can simply stall or drop mid-batch — nothing is wrong with the video,
+# and the same command usually works on the next try. Worth one retry before
+# giving up, rather than losing a video out of a long run.
+TRANSIENT_ERRORS = ("did not get any data blocks", "content too short",
+                    "connection", "timed out", "timeout", "temporary failure",
+                    "unable to connect", "read error", "http error 5",
+                    "incomplete", "remote end closed")
+
+
+def is_transient(error_text):
+    """True if a failure looks like a hiccup worth retrying once."""
+    low = (error_text or "").lower()
+    return any(hint in low for hint in TRANSIENT_ERRORS)
+
+
+def mark_incomplete(folder):
+    """Rename media left by a failed download so it can never be mistaken for a
+    finished one. A half-finished video (say, the picture with no sound) is the
+    right size and plays, which makes it the most misleading thing in the folder.
+    """
+    marked = []
+    for path in [find_video_file(folder)]:
+        if path and not os.path.basename(path).startswith("INCOMPLETE_"):
+            target = os.path.join(os.path.dirname(path),
+                                  "INCOMPLETE_" + os.path.basename(path))
+            try:
+                os.replace(path, target)
+                marked.append(os.path.basename(target))
+            except OSError:
+                pass
+    return marked
+
+
 def base_cmd():
     """Common yt-dlp arguments (cookies added only if the file exists)."""
     cmd = ["yt-dlp"]
@@ -546,12 +579,25 @@ def probe_height(filepath: str):
 
 
 def find_video_file(folder: str):
-    """Return the path to the downloaded video file in a folder, if any."""
+    """Return the path to the finished video file in a folder, if any.
+
+    Media left over from a failed attempt is prefixed INCOMPLETE_ and ignored,
+    so it is never mistaken for a usable download. When a folder holds more than
+    one video — an older download made under different naming, say — the one
+    named after the folder wins, so the answer never depends on listing order.
+    """
     exts = (".mp4", ".mkv", ".webm", ".mov")
-    for name in os.listdir(folder):
-        if name.lower().endswith(exts) and name != "videoinfo.txt":
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    wanted = os.path.basename(folder.rstrip("/\\"))
+    candidates = [n for n in names
+                  if n.lower().endswith(exts) and not n.startswith("INCOMPLETE_")]
+    for name in candidates:
+        if os.path.splitext(name)[0] == wanted:
             return os.path.join(folder, name)
-    return None
+    return os.path.join(folder, candidates[0]) if candidates else None
 
 
 # ======================= identity, layout & resume =========================
@@ -778,8 +824,16 @@ def download_one(url, index, total):
         print(f"\n    ! {err}\n    Retrying once more on a single connection...\n")
         err = attempt(PO_TOKEN_FLAGS, fast=False)
 
+    # A stalled or dropped stream is not the video's fault — try once more.
+    if err and is_transient(err):
+        print(f"\n    ! {err}\n    Stream problem, retrying...\n")
+        err = attempt(PO_TOKEN_FLAGS if po_token_first[0] else [])
+
     if err:
         print(f"\n    ! Download failed: {err}")
+        leftovers = mark_incomplete(folder)
+        for name in leftovers:
+            print(f"      partial file kept as {name}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
         return "fail"
 

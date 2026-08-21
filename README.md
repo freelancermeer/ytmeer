@@ -163,6 +163,13 @@ Finished videos are indexed **by video id** at startup, so a re-run:
 
 Delete a video's folder if you want a genuinely fresh pull.
 
+A stalled or dropped stream (`Did not get any data blocks`, a 5xx, a timeout) is
+retried once on its own — one flaky moment should not cost you a video in a long
+batch. If a download still fails after that, any media it left behind is renamed
+`INCOMPLETE_…`: a half-finished file is the right size and plays, so without the
+marker a video with no sound looks exactly like a good one. Marked files are
+ignored by resume, so the next run downloads them properly.
+
 ## Requirements
 
 System tools:
@@ -204,7 +211,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-66 tests, no network and no downloads. Every test runs twice — once through the
+74 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.

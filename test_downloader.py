@@ -228,6 +228,47 @@ class PlatformCase:
     def test_real_errors_do_not_trigger_a_retry(self):
         for text in ("Video unavailable", "This video is private", ""):
             self.assertFalse(d.needs_po_token(text), text)
+            self.assertFalse(d.is_transient(text), text)
+
+    def test_stream_hiccups_are_retried(self):
+        for text in ("ERROR: Did not get any data blocks",
+                     "HTTP Error 503: Service Unavailable",
+                     "The read operation timed out",
+                     "Remote end closed connection without response"):
+            self.assertTrue(d.is_transient(text), text)
+
+    def test_failed_download_leftovers_are_marked(self):
+        with tempfile.TemporaryDirectory() as folder:
+            partial = os.path.join(folder, "Clip.mp4")
+            with open(partial, "w") as f:
+                f.write("video with no audio")
+
+            marked = d.mark_incomplete(folder)
+
+            self.assertEqual(marked, ["INCOMPLETE_Clip.mp4"])
+            self.assertFalse(os.path.exists(partial))
+            self.assertIsNone(d.find_video_file(folder),
+                              "a marked partial must never count as the video")
+
+    def test_folder_named_video_wins_over_an_older_one(self):
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "My Clip")
+            os.makedirs(folder)
+            for name in ("An Older Download.mp4", "My Clip.mp4", "Another.mkv"):
+                with open(os.path.join(folder, name), "w") as f:
+                    f.write("x")
+            self.assertEqual(d.find_video_file(folder),
+                             os.path.join(folder, "My Clip.mp4"))
+
+    def test_marked_partial_does_not_satisfy_resume(self):
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "Video")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "INCOMPLETE_Clip.mp4"), "w") as f:
+                f.write("x")
+            d.write_info(folder, "T", "https://www.youtube.com/watch?v=aaaaaaaaaaa", "1080p", "OK")
+            self.assertEqual(d.index_downloaded(base), {},
+                             "a video with only a partial file must be downloaded again")
 
     def test_windows_only_flags(self):
         flags = d.windows_flags()
