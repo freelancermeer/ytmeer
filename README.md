@@ -4,12 +4,12 @@ Batch-downloads YouTube videos in **1080p** (priority) down to **720p** (floor) 
 
 ## Setup
 
-Point the script at **one folder** that holds both of these:
+Point the script at **one folder**:
 
 ```
 <your folder>/
-├── cookies.txt     your cookies, Netscape format, exported from the browser
-└── links.txt       one YouTube link per line   (# = comment, blank = skipped)
+├── links.txt       one YouTube link per line   (# = comment, blank = skipped)
+└── cookies.txt     OPTIONAL — see "Cookies" below
 ```
 
 Videos are downloaded into that same folder.
@@ -91,6 +91,67 @@ Two `.txt` files are built next to each video from YouTube's auto-caption, in th
 
 Note: a few videos publish closed-caption tracks that are timed per *phrase* rather than per *word*. For those, `words_*.txt` carries phrases — the finer timing simply isn't in the source.
 
+## Speed
+
+YouTube throttles any single connection far below your line rate. When **aria2c**
+is installed the script hands downloads to it with 16 parallel connections — the
+same technique IDM uses — and yt-dlp fetches DASH/HLS fragments 8 at a time.
+
+Measured on this machine (line ceiling ≈ 1.8 MB/s):
+
+| | Speed |
+|---|---|
+| Built-in downloader | ~0.47 MB/s |
+| aria2c, 16 connections | **~1.9 MB/s** |
+
+Install it once and the script picks it up automatically:
+
+```bash
+brew install aria2
+```
+
+Without aria2c everything still works, just at the slower built-in speed — the
+startup banner tells you which one is in use.
+
+## PO tokens (the 403 fix)
+
+YouTube gates some videos behind a "Proof of Origin" token. Without one those
+downloads fail with `HTTP Error 403` (aria2c reports the same thing as
+`exited with code 22`).
+
+The script handles this on its own: it tries the normal, fast path first, and
+only if that 403s does it retry through the `mweb` client, which mints a token.
+Once one video in a batch needs it, the rest go straight there — no wasted
+attempts.
+
+The token comes from the **bgutil** provider, which runs a small JS script.
+**No browser window ever opens.** Install it once:
+
+```bash
+pip install bgutil-ytdlp-pot-provider
+mkdir -p ~/.local/share/bgutil-pot && cd ~/.local/share/bgutil-pot
+curl -sL https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/1.3.2.tar.gz | tar xz --strip-components=1
+cd server && npm install && npx tsc
+```
+
+The script is found automatically at `~/.local/share/bgutil-pot/server/build/generate_once.js`;
+set `BGUTIL_SCRIPT` to point somewhere else. Keep the pip package and the server
+on the **same version**. The startup banner shows whether it was found.
+
+> Avoid the browser-based providers (e.g. `yt-dlp-getpot-wpc`) — they open a
+> Chrome window for every video that needs a token, and cannot run headless.
+
+## Cookies
+
+**Optional.** Public videos download fine without any `cookies.txt`, so you can
+leave it out entirely. Add one only for videos that genuinely need an account:
+private, members-only, or age-restricted.
+
+Two things worth knowing if you do use cookies: they expire quickly (YouTube
+rotates them, and a stale file causes confusing failures), and heavy downloading
+on a logged-in account carries a real risk to that account. Skipping cookies
+avoids both.
+
 ## Resume
 
 Finished videos are indexed **by video id** at startup, so a re-run:
@@ -109,6 +170,7 @@ System tools:
 - **Python 3**
 - **ffmpeg** — merges the 1080p video+audio streams and reads back the real quality
 - **node** (or **deno** on macOS) — the JavaScript runtime yt-dlp needs to solve YouTube's "n" challenge
+- **aria2c** — optional but strongly recommended; see [Speed](#speed)
 
 Python packages:
 
@@ -123,7 +185,7 @@ pip install -r requirements.txt
 Windows needs extra yt-dlp flags that macOS does not. The script applies them **automatically when it runs on Windows** and never on macOS, so the Mac path stays as-is (see `windows_flags()` in `downloader.py`, and `fix_yt_dlp_windows.md`):
 
 1. **`n challenge solving failed`** — Windows (especially inside a venv, under a Python subprocess) fails to auto-detect Node, so the absolute path is passed explicitly via `--js-runtimes node:<path>`.
-2. **`HTTP Error 403: Forbidden`** — some videos are gated behind a "Proof of Origin" token. The `mweb` client plus the `yt-dlp-getpot-wpc` package mints one. Windows starts there; macOS uses it as an **automatic retry** after a 403, so the fast path stays default.
+2. **`HTTP Error 403: Forbidden`** — see [PO tokens](#po-tokens-the-403-fix). Windows starts on the `mweb` client directly; macOS uses it as an automatic retry after a 403, so the fast path stays the default.
 3. **Console hangs / "Bad file descriptor"** — output is streamed with `read1()` rather than a raw `os.read()` on the file descriptor, which is safe on both platforms.
 4. **Paths** — folder names are stripped of both `/` and `\`.
 

@@ -1,11 +1,18 @@
 # Core downloader
 yt-dlp>=2026.7.4
 
-# Windows only: lets yt-dlp mint the PO token that audio-only streams now
-# require, so downloads don't fail with HTTP Error 403. Harmless elsewhere.
-yt-dlp-getpot-wpc>=1.1.2
+# Mints the "Proof of Origin" token some videos now require — without it those
+# downloads fail with HTTP Error 403. This provider runs a small JS script, so
+# no browser window ever opens. It needs its server half too; see README.md.
+bgutil-ytdlp-pot-provider>=1.3.2
+
+# Lets yt-dlp impersonate a browser. Optional, but some videos want it.
+# Pinned below 0.16 because that is the range yt-dlp supports.
+curl_cffi>=0.10,<0.16
 
 # Also required on the system (not pip):
 #   ffmpeg  — merges the 1080p video+audio streams and reports the real quality
-#   node    — JavaScript runtime yt-dlp needs to solve YouTube's "n" challenge
-#             (macOS: deno also works and is auto-detected)
+#   node    — runs the PO-token script, and is the JS runtime yt-dlp needs for
+#             YouTube's "n" challenge (macOS: deno also works, auto-detected)
+#   aria2c  — optional but strongly recommended: 16-connection downloads, which
+#             measured ~4x faster than the built-in downloader (brew install aria2)
