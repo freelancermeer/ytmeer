@@ -358,7 +358,11 @@ def group_words_into_lines(words):
 
 
 def parse_json3_words(path):
-    """Parse a YouTube json3 caption file into [(start_sec, None, word_text), ...]."""
+    """Parse a YouTube json3 caption file into [(start_sec, end_sec, text), ...].
+
+    The end time is kept because closed-caption tracks time a whole phrase at
+    once; word_spans() needs the phrase's span to place the words inside it.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -370,7 +374,9 @@ def parse_json3_words(path):
         if not segs:
             continue
         base = ev.get("tStartMs", 0) or 0
-        for s in segs:
+        span_end = base + (ev.get("dDurationMs") or 0)
+        offsets = [s.get("tOffsetMs") or 0 for s in segs]
+        for i, s in enumerate(segs):
             # Flatten any newline/tab inside a segment to a single space: CC-style
             # tracks pack whole lines (with line breaks) into one segment, which
             # would otherwise spill across output lines with no timestamp. A
@@ -378,8 +384,14 @@ def parse_json3_words(path):
             text = re.sub(r"\s+", " ", s.get("utf8", "") or "")
             if not text.strip():               # blanks / newline-only separators
                 continue
-            start = (base + (s.get("tOffsetMs") or 0)) / 1000.0
-            words.append((start, None, text))
+            start = base + offsets[i]
+            # This segment runs until the next one in the event, or to the end
+            # of the event when it is the last.
+            nxt = next((o for o in offsets[i + 1:] if o > offsets[i]), None)
+            end = base + nxt if nxt is not None else span_end
+            words.append((start / 1000.0,
+                          end / 1000.0 if end > start else None,
+                          text))
     return words
 
 
@@ -399,6 +411,22 @@ def write_trans_txt(out_txt, words):
                 f.write(f"{format_timestamp(start)} {text}\n")
 
 
+# A caption is word-level when almost every entry holds a single word. Auto-
+# captions look like that; broadcast closed-caption tracks time a whole phrase
+# at once. A small tolerance allows the occasional "New York" style entry.
+WORD_LEVEL_TOLERANCE = 0.2
+
+
+def is_word_level(entries):
+    """True when the caption carries a timestamp per word rather than per phrase."""
+    texts = [one_line(t) for _s, _e, t in entries]
+    texts = [t for t in texts if t]
+    if not texts:
+        return False
+    multi = sum(1 for t in texts if len(t.split()) > 1)
+    return multi <= len(texts) * WORD_LEVEL_TOLERANCE
+
+
 def write_words_txt(out_txt, words):
     """Oneword style: one word per line with [hh:mm:ss.mmm] timestamps."""
     with open(out_txt, "w", encoding="utf-8") as f:
@@ -406,6 +434,33 @@ def write_words_txt(out_txt, words):
             word = one_line(text)
             if word:
                 f.write(f"{format_timestamp_ms(start)} {word}\n")
+
+
+def write_words_not_found(out_txt, entries):
+    """Explain, in the video's own folder, why there is no word-level file.
+
+    Timings are never invented here: spreading a phrase's words across its span
+    would put most of them near the right place and some of them seconds away,
+    and a file that looks precise while being approximate is worse than an
+    honest gap.
+    """
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write(
+            "No word-level transcript is available for this video.\n"
+            "\n"
+            "YouTube only times captions per word in its auto-generated track.\n"
+            "This video does not have one: it carries the broadcast closed-caption\n"
+            "tracks (CC1 / DTVCC1) instead, which are timed one phrase at a time.\n"
+            "YouTube does not auto-caption a video that already ships captions, so\n"
+            "per-word timings do not exist anywhere in the source.\n"
+            "\n"
+            f"The phrase-level text is in the trans_ file next to this one "
+            f"({len(entries)} caption lines).\n"
+            "\n"
+            "To get real word-level timings, transcribe the .mp4 locally with\n"
+            "Whisper — for example:\n"
+            "    python3 transcribe.py oneword \"<folder containing this video>\"\n"
+        )
 
 
 # ============================ transcript helpers ===========================
@@ -499,8 +554,16 @@ def find_transcript_file(folder):
 
 
 def make_transcripts(folder):
-    """Convert a downloaded json3 caption into trans_<name>.txt + words_<name>.txt,
-    then delete the json3. Returns (trans_path, words_path) or (None, None)."""
+    """Turn a downloaded json3 caption into the transcript files, then delete it.
+
+    trans_<name>.txt is always written. Its companion depends on what the caption
+    actually contains: words_<name>.txt when the track is timed per word, and
+    words_not_found_<name>.txt when it is only timed per phrase, so a folder
+    never leaves you guessing which kind you got.
+
+    Returns (trans_path, words_path); words_path is the marker file when no
+    word-level timings existed.
+    """
     found = find_json3(folder)
     best = pick_best_json3(found)
     if not best:
@@ -513,11 +576,17 @@ def make_transcripts(folder):
             pass
     if not words:
         return None, None
+
     base = os.path.basename(folder.rstrip("/\\"))   # strip both separators (Mac + Windows)
     trans_path = os.path.join(folder, f"trans_{base}.txt")
-    words_path = os.path.join(folder, f"words_{base}.txt")
     write_trans_txt(trans_path, words)
-    write_words_txt(words_path, words)
+
+    if is_word_level(words):
+        words_path = os.path.join(folder, f"words_{base}.txt")
+        write_words_txt(words_path, words)
+    else:
+        words_path = os.path.join(folder, f"words_not_found_{base}.txt")
+        write_words_not_found(words_path, words)
     return trans_path, words_path
 
 
@@ -599,8 +668,12 @@ def download_subs(folder, url):
         return None, None
     existing = find_transcript_file(folder)
     if existing:
-        words = os.path.join(folder, os.path.basename(existing).replace("trans_", "words_", 1))
-        return existing, (words if os.path.exists(words) else None)
+        name = os.path.basename(existing)
+        for prefix in ("words_", "words_not_found_"):
+            companion = os.path.join(folder, name.replace("trans_", prefix, 1))
+            if os.path.exists(companion):
+                return existing, companion
+        return existing, None
     info, _ = fetch_info(url)          # tells us which caption track to ask for
     return build_transcripts(folder, url, info)
 

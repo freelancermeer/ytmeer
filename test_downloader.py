@@ -20,6 +20,12 @@ import unittest
 import downloader as d
 
 
+def glob_words(folder):
+    """Real words_ files in a folder (excluding the not-found marker)."""
+    return [n for n in os.listdir(folder)
+            if n.startswith("words_") and not n.startswith("words_not_found_")]
+
+
 class PlatformCase:
     """Mixin holding the tests; the two subclasses below run them per platform.
 
@@ -222,6 +228,51 @@ class PlatformCase:
             words = d.parse_json3_words(path)
             self.assertEqual(len(words), 1, "the newline-only segment is not a word")
             self.assertNotIn("\n", words[0][2])
+
+    def test_word_level_detection(self):
+        word_timed = [(0.0, 0.4, "Senator"), (0.4, 0.6, " Van"), (0.6, 1.2, " Hollen")]
+        phrase_timed = [(0.0, 2.0, "SENATOR VAN HOLLEN IS ASKING"),
+                        (2.0, 4.0, "ABOUT THE EXCESSIVE DRINKING.")]
+        self.assertTrue(d.is_word_level(word_timed))
+        self.assertFalse(d.is_word_level(phrase_timed))
+        self.assertFalse(d.is_word_level([]), "no caption is not word-level")
+
+    def test_word_level_survives_a_few_multiword_entries(self):
+        entries = [(float(i), None, "word") for i in range(20)]
+        entries += [(20.0, None, "New York"), (21.0, None, "San Francisco")]
+        self.assertTrue(d.is_word_level(entries), "a couple of place names are fine")
+
+    def test_phrase_caption_yields_marker_not_fake_timings(self):
+        import downloader
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "clip.en.json3")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"events": [
+                    {"tStartMs": 0, "dDurationMs": 2000,
+                     "segs": [{"utf8": "SENATOR VAN HOLLEN IS ASKING"}]},
+                    {"tStartMs": 2000, "dDurationMs": 2000,
+                     "segs": [{"utf8": "ABOUT THE EXCESSIVE DRINKING."}]}]}, f)
+            trans, words = d.make_transcripts(folder)
+            self.assertTrue(os.path.basename(trans).startswith("trans_"))
+            self.assertTrue(os.path.basename(words).startswith("words_not_found_"),
+                            "phrase-timed captions must not masquerade as word-level")
+            self.assertFalse(glob_words(folder), "no words_ file should be written")
+
+    def test_word_caption_yields_a_real_words_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "clip.en.json3")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"events": [{"tStartMs": 0, "dDurationMs": 1200, "segs": [
+                    {"utf8": "Senator"}, {"tOffsetMs": 400, "utf8": " Van"},
+                    {"tOffsetMs": 600, "utf8": " Hollen"}]}]}, f)
+            trans, words = d.make_transcripts(folder)
+            self.assertTrue(os.path.basename(words).startswith("words_"))
+            self.assertNotIn("not_found", os.path.basename(words))
+            with open(words, encoding="utf-8") as f:
+                lines = [l for l in f if l.strip()]
+            self.assertEqual(len(lines), 3, "one line per word")
+            self.assertTrue(lines[1].startswith("[00:00:00.400]"),
+                            "the caption's own timing must be used verbatim")
 
     def test_timestamp_formats(self):
         self.assertEqual(d.format_timestamp(3661.9), "[01:01:01]")

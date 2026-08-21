@@ -44,7 +44,7 @@ Default layout:
     ├── <Video Title>.mp4
     ├── videoinfo.txt
     ├── trans_<Video Title>.txt
-    └── words_<Video Title>.txt
+    └── words_<Video Title>.txt        (or words_not_found_<Video Title>.txt)
 ```
 
 With `--channel`:
@@ -87,31 +87,44 @@ Two `.txt` files are built next to each video from YouTube's auto-caption, in th
 - `trans_<Video Title>.txt` — grouped, wrapped lines: `[hh:mm:ss] text`
 - `words_<Video Title>.txt` — one word per line: `[hh:mm:ss.mmm] word`
 
-**Both files are always written** when the video has any English caption at all.
+**Both files are always written** when the video has any English caption at all — and when word timings do not exist, the second one is `words_not_found_<Video Title>.txt`, which says why. See [When there is no words_ file](#when-there-is-no-words_-file).
 
 **Backfill:** if a video is already downloaded but has no `trans_*.txt`, re-running builds the transcripts for it without re-downloading the video.
 
-### Where the word timings come from
+### When there is no words_ file
 
-YouTube's **auto-generated** captions carry a timestamp per word, which is what
-`words_*.txt` needs. Some videos — typically TV news clips — instead ship the
-broadcast **closed-caption** tracks (`CC1`, `DTVCC1`), which are timed per
-*phrase*. YouTube does not auto-caption those videos, so no word timings exist
-anywhere in the source.
+`words_*.txt` needs a timestamp per word, and only YouTube's **auto-generated**
+(ASR) captions have those. A minority of videos — typically TV news clips — ship
+the broadcast **closed-caption** tracks (`CC1`, `DTVCC1`) instead, which are
+timed one *phrase* at a time. For those, the folder gets
+**`words_not_found_<Video Title>.txt`** explaining why, and `trans_*.txt` is
+written as usual from the phrase text.
 
-The script always prefers the auto-caption and only falls back to a broadcast
-track when there is genuinely no auto-caption (it also re-checks through a second
-player client first, and copes with YouTube listing an auto track that serves
-nothing). When it does fall back, `words_*.txt` holds phrases — that is the
-source's limit, not the script's.
+No timings are ever invented. Spreading a phrase's words across its span was
+measured against real word timings: half the words land within 0.1 s, but the
+tail runs to 2.5 s out. A file that looks precise while being approximate is
+worse than an honest gap, so the marker is written instead.
 
-Measured over a 20-video batch: **18 word-level, 2 phrase-level**. Both
-phrase-level videos were confirmed against an independent captions API, which
-returned the same phrase-timed text.
+**This is a limit of the source, not of the script.** For the two affected videos
+in a 20-video batch, verified four ways:
 
-If you need true word timings for one of those, transcribe the downloaded `.mp4`
-locally with `../Transcript with timestamps/transcribe.py oneword`, which runs
-Whisper and produces the same `[hh:mm:ss.mmm] word` format.
+| Check | Result |
+|---|---|
+| yt-dlp metadata, every working player client | 0 auto-captions |
+| An independent captions API | same phrase-timed text |
+| The original version of this script | wrote no words file at all |
+| **YouTube's own timedtext API, asking for `kind=asr`** | **HTTP 404 — the track does not exist** |
+
+The script still does everything it can to find one: it prefers auto-captions
+over broadcast tracks, re-checks through a second player client when the first
+reports none, and copes with YouTube listing an auto track that then serves
+nothing.
+
+Measured over that batch: **18 with word timings, 2 without.**
+
+To get word timings for one of those, transcribe the downloaded `.mp4` locally —
+`../Transcript with timestamps/transcribe.py oneword` runs Whisper and produces
+the same `[hh:mm:ss.mmm] word` format.
 
 ## Speed
 
@@ -233,7 +246,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-74 tests, no network and no downloads. Every test runs twice — once through the
+86 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.
