@@ -368,6 +368,53 @@ class PlatformCase:
                     for line in f:
                         self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}")
 
+    # ------------------------------------------------------------- backfill
+    def _record_runs(self):
+        """Capture the yt-dlp command lines a backfill would run."""
+        runs = []
+        real = d.subprocess.run
+
+        class Done:
+            returncode = 0
+            stdout = stderr = ""
+
+        d.subprocess.run = lambda cmd, *a, **k: runs.append(cmd) or Done()
+        self.addCleanup(lambda: setattr(d.subprocess, "run", real))
+        return runs
+
+    def test_lone_caption_fetch_escalates_to_the_po_token_client(self):
+        # A caption fetched on its own hits the same bot check the video does.
+        # Without escalation the backfill silently produces nothing.
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = False
+        runs = self._record_runs()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                got = d.fetch_caption(folder, "u", "en", "auto")
+        finally:
+            d.po_token_first[0] = saved
+        self.assertFalse(got, "no caption file appeared")
+        self.assertEqual(len(runs), 2, "it should try again through the token client")
+        self.assertIn("youtube:player_client=mweb,default", runs[1])
+
+    def test_lone_thumbnail_fetch_escalates_too(self):
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = False
+        runs = self._record_runs()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                d.build_extras(folder, "u", {})
+        finally:
+            d.po_token_first[0] = saved
+        self.assertEqual(len(runs), 2)
+        self.assertIn("youtube:player_client=mweb,default", runs[1])
+
+    def test_a_caller_that_knows_the_client_is_trusted(self):
+        runs = self._record_runs()
+        with tempfile.TemporaryDirectory() as folder:
+            d.fetch_caption(folder, "u", "en", "auto", client=d.PO_TOKEN_FLAGS)
+        self.assertEqual(len(runs), 1, "no need to guess when the client is known")
+
     # ------------------------------------------------ thumbnail & description
     def test_thumbnail_is_converted_to_jpg(self):
         flags = d.thumb_flags()

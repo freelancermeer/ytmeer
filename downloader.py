@@ -754,16 +754,29 @@ def choose_caption(url, info):
 
 
 def fetch_caption(folder, url, lang, source, client=()):
-    """Download one caption track into the folder. True if a json3 arrived."""
+    """Download one caption track into the folder. True if a json3 arrived.
+
+    Fetching a caption on its own — which is what a backfill does — runs into
+    the same bot check the video download does, so it gets the same escalation
+    to the PO-token client. A caller that already knows which client can see the
+    track passes it, and that one is used as given.
+    """
     flags = sub_flags(lang, source)
     if not flags:
         return False
     name = os.path.basename(folder.rstrip("/\\"))
-    cmd = base_cmd() + ["--skip-download"] + flags + list(client) + [
-        "--no-warnings", "-o", output_template(folder, name), url,
-    ]
-    subprocess.run(cmd, capture_output=True, text=True)
-    return bool(find_json3(folder))
+    if client:
+        routes = [list(client)]
+    else:
+        routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
+    for extra in routes:
+        cmd = base_cmd() + ["--skip-download"] + flags + list(extra) + [
+            "--no-warnings", "-o", output_template(folder, name), url,
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+        if find_json3(folder):
+            return True
+    return False
 
 
 # How many caption tracks to try before settling. Enough to exhaust a video's
@@ -880,6 +893,8 @@ def fetch_info_once(url: str, extra_flags=()):
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         return None, "Timed out while fetching video info"
+    except OSError as e:
+        return None, f"Could not run yt-dlp: {e}"
     if out.returncode != 0:
         msg = out.stderr.strip().splitlines()
         return None, (msg[-1] if msg else "Failed to fetch video info")
@@ -1177,9 +1192,12 @@ def download_one(url, index, total):
     # 1) Get the metadata first: it names the folder (title) and, in --channel
     #    mode, the channel folder it goes under.
     info, err = fetch_info(url)
+    vid = (info or {}).get("id") or vid or ""
     title = (info or {}).get("title") or "Unknown Title"
-    vid   = (info or {}).get("id") or vid or ""
-    safe_title = sanitize(title)
+    # With no metadata there is no title to name the folder after, so the video
+    # id is used: two dead links would otherwise share one folder and overwrite
+    # each other's error record.
+    safe_title = sanitize(title) if info else sanitize(f"video_{vid}" if vid else "")
 
     # The id was unknown until now (unusual URL form) — re-check the index.
     if vid and vid in DONE_INDEX:
@@ -1190,7 +1208,11 @@ def download_one(url, index, total):
     parent = channel_dir(info)
     folder_name = safe_title or (f"video_{vid}" if vid else "video")
     folder = choose_folder(parent, folder_name, vid)
-    os.makedirs(folder, exist_ok=True)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as e:
+        print(f"    ! Cannot create {rel(folder)}/: {e}")
+        return "fail"
 
     # If we couldn't even fetch info, record the error and stop here.
     if info is None:
@@ -1341,6 +1363,13 @@ def main():
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")
         sys.exit(1)
 
+    missing = [tool for tool in ("yt-dlp", "ffmpeg") if not shutil.which(tool)]
+    if missing:
+        print(f"\nERROR: not installed or not on PATH: {', '.join(missing)}")
+        print("  macOS:   brew install " + " ".join(missing))
+        print("  Windows: see requirements.txt")
+        sys.exit(1)
+
     if not os.path.exists(COOKIES_FILE):
         print("\nNOTE: no cookies.txt in the folder — that is fine for public "
               "videos.\n      Add one only for private / members-only / "
@@ -1376,21 +1405,31 @@ def main():
                 remaining.append(url)
         return remaining
 
-    failed = run(links, total)
+    stopped = False
+    try:
+        failed = run(links, total)
 
-    # A final sweep. Whatever was wrong earlier — a throttled stretch, a stale
-    # token, a stream that dropped — has usually passed by the end of a long
-    # batch, and these videos get a fresh set of attempts rather than none.
-    if failed:
-        print("\n" + "=" * 60)
-        print(f"  Final sweep: retrying {len(failed)} video(s) that failed.")
-        print("=" * 60)
-        time.sleep(RETRY_DELAYS[-1])
-        failed = run(failed, len(failed))
+        # A final sweep. Whatever was wrong earlier — a throttled stretch, a
+        # stale token, a stream that dropped — has usually passed by the end of
+        # a long batch, and these videos get a fresh set of attempts.
+        if failed:
+            print("\n" + "=" * 60)
+            print(f"  Final sweep: retrying {len(failed)} video(s) that failed.")
+            print("=" * 60)
+            time.sleep(RETRY_DELAYS[-1])
+            failed = run(failed, len(failed))
+    except KeyboardInterrupt:
+        # Ctrl+C should leave a readable summary, not a stack trace. Finished
+        # videos are already on disk, and the next run resumes from there.
+        stopped = True
+        print("\n\n  Stopped. Finished videos are saved; re-run to continue.")
 
     print("\n" + "=" * 60)
+    done = counts["ok"] + counts["skip"] + len(failed) + len(gone)
     print(f"  Summary: {counts['ok']} downloaded, {counts['skip']} skipped "
-          f"(already done), {len(failed) + len(gone)} failed  (of {total} links).")
+          f"(already done), {len(failed) + len(gone)} failed  (of "
+          f"{done if stopped else total} links"
+          f"{f'; stopped early, {total - done} not reached' if stopped else ''}).")
     if gone:
         print("  Unavailable (private, deleted — not retried):")
         for u in gone:

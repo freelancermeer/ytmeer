@@ -58,12 +58,17 @@ With `--channel`:
 ├── <Channel Name>/
 │   └── <Video Title>/
 │       ├── <Video Title>.mp4
+│       ├── <Video Title>.jpg
 │       ├── videoinfo.txt
+│       ├── description_<Video Title>.txt
 │       ├── trans_<Video Title>.txt
 │       └── words_<Video Title>.txt
 └── <Another Channel>/
     └── ...
 ```
+
+Everything works the same in both layouts — downloading, resume, backfill and
+the extras — so `--channel` is purely about where files land.
 
 `videoinfo.txt` (success):
 ```
@@ -241,7 +246,25 @@ stale, a fragment that 403s once. So a video is never given up on after one go:
 
 Private, deleted, and unavailable videos are the exception: nothing about those
 changes on a retry, so they fail immediately and are listed separately in the
-summary rather than burning attempts.
+summary rather than burning attempts. Each keeps its own folder and
+`videoinfo.txt` naming the reason, so two dead links never overwrite each
+other's record.
+
+### When something goes wrong
+
+Nothing in a batch takes the whole run down:
+
+| Situation | What happens |
+|---|---|
+| `yt-dlp` or `ffmpeg` missing | Checked at startup — one clear message with the install command, before anything downloads |
+| Directory or `links.txt` missing | Named directly, and the run stops there |
+| A folder cannot be created | That video fails with the reason; the batch continues |
+| A video is private or deleted | Failed immediately, listed under "Unavailable" |
+| A video has no English captions | `words_not_found_…` explains it; the video and everything else still download |
+| **Ctrl+C** | Stops cleanly with a summary — finished videos are on disk, and the next run resumes from there |
+
+Comments (`#`) and blank lines in `links.txt` are skipped, and a link repeated
+with a different tracking suffix is downloaded once.
 
 If a download still fails after all that, any media it left behind is renamed
 `INCOMPLETE_…`: a half-finished file is the right size and plays, so without the
@@ -289,7 +312,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-128 tests, no network and no downloads. Every test runs twice — once through the
+134 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.
