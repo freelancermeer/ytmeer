@@ -300,7 +300,7 @@ class ProgressLine:
         bar = "#" * filled + "." * (BAR_WIDTH - filled)
         left = f"{self.head} [{bar}] {pct:5.1f}% {speed:>11}  "
         room = max(0, shutil.get_terminal_size((80, 20)).columns - len(left) - 1)
-        title = self.title if len(self.title) <= room else self.title[:max(0, room - 1)] + "\u2026"
+        title = self.title if len(self.title) <= room else self.title[:max(0, room - 3)] + "..."
         self._write(left + title)
 
     def done(self, text):
@@ -1579,13 +1579,13 @@ def main():
     FORMAT        = build_format()
 
     print("=" * 60)
-    print(f"  YouTube Downloader (yt-dlp) — {MAX_HEIGHT}p priority / {MIN_HEIGHT}p floor")
+    print(f"  YouTube Downloader (yt-dlp) - {MAX_HEIGHT}p priority / {MIN_HEIGHT}p floor")
     print("=" * 60)
     print(f"  Folder  : {DOWNLOAD_DIR}")
     print(f"  Cookies : {COOKIES_FILE if os.path.exists(COOKIES_FILE) else 'none (optional)'}")
     print(f"  Links   : {LINKS_FILE}")
     print(f"  Speed   : {'aria2c, 16 connections' if ARIA2C else 'built-in (install aria2c for a big speedup)'}")
-    print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found — some videos may fail with 403'}")
+    print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found - some videos may fail with 403'}")
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
     print(f"  Transcript: {'yes (' + SUB_LANG + ', trans_ + words_ .txt)' if DOWNLOAD_SUBS else 'no'}")
     extras = [n for n, on in (("thumbnail", SAVE_THUMBNAIL),
@@ -1615,7 +1615,7 @@ def main():
         sys.exit(1)
 
     if not os.path.exists(COOKIES_FILE):
-        print("\nNOTE: no cookies.txt in the folder — that is fine for public "
+        print("\nNOTE: no cookies.txt in the folder - that is fine for public "
               "videos.\n      Add one only for private / members-only / "
               "age-restricted videos.")
 
@@ -1676,7 +1676,7 @@ def main():
           f"{done if stopped else total} links"
           f"{f'; stopped early, {total - done} not reached' if stopped else ''}).")
     if gone:
-        print("  Unavailable (private, deleted — not retried):")
+        print("  Unavailable (private, deleted - not retried):")
         for u in gone:
             print(f"    - {u}")
     if failed:

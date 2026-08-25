@@ -80,9 +80,28 @@ class PlatformCase:
     def test_channel_path_fits_windows_limit(self):
         base = r"C:\Users\someone\Desktop\A Project"
         name = d.sanitize("Z" * 300)
-        path = os.path.join(base, name, name, f"words_{name}.txt")
-        if self.WINDOWS:
-            self.assertLessEqual(len(path), 260, "path would exceed Windows MAX_PATH")
+        # Every file the tool writes, longest prefix first — the budget has to
+        # hold for all of them, not just the video.
+        for prefix, suffix in (("words_not_found_", ".txt"), ("description_", ".txt"),
+                               ("words_", ".txt"), ("trans_", ".txt"),
+                               ("", ".mp4"), ("", ".jpg")):
+            path = os.path.join(base, name, name, f"{prefix}{name}{suffix}")
+            if self.WINDOWS:
+                self.assertLessEqual(len(path), 260,
+                                     f"{prefix}<name>{suffix} exceeds Windows MAX_PATH")
+
+    def test_terminal_output_stays_ascii(self):
+        # A Windows console that is not in UTF-8 mode turns anything else into
+        # mojibake, and none of it earns its place on screen.
+        import re as _re
+        source = open("downloader.py", encoding="utf-8").read()
+        offenders = []
+        for number, line in enumerate(source.splitlines(), 1):
+            if not _re.search(r"\b(print|bar\.done|bar\.update|note)\s*\(", line):
+                continue
+            if [c for c in line if ord(c) > 127] or _re.findall(r"\\u[0-9a-fA-F]{4}", line):
+                offenders.append(number)
+        self.assertEqual(offenders, [], f"non-ASCII printed at lines {offenders}")
 
     def test_output_template_escapes_percent(self):
         tpl = d.output_template(os.path.join("base", "vid"), "100% Real")

@@ -349,7 +349,8 @@ differences are handled automatically, so the Mac path stays exactly as it is
 4. **Reserved names** — Windows refuses `CON`, `NUL`, `AUX`, `COM1`…`LPT9` as file or folder names, matching on the part before the first dot. A video titled one of those gets an underscore on the stem (`aux.txt` → `aux_.txt`).
 5. **260-character path limit** — name components are capped at 60 characters on Windows (150 on macOS), and the media file is named after its folder rather than left to yt-dlp's raw title, which keeps `<base>\<channel>\<video>\<file>` inside the limit.
 6. **Console encoding** — output is forced to UTF-8. Video titles routinely contain characters that Windows' default cp1252 cannot encode, which otherwise raises `UnicodeEncodeError` as soon as output is piped to a file.
-7. **Paths** — both `/` and `\` are handled throughout.
+7. **Paths** — both `/` and `\` are handled throughout, and the length budget covers the longest name the tool writes (`words_not_found_<title>.txt`), not just the video.
+8. **Terminal output is plain ASCII** — a console that is not in UTF-8 mode would otherwise render dashes and ellipses as mojibake.
 
 On Windows, install the requirements the same way, and make sure `node`,
 `ffmpeg`, and (optionally) `aria2c` are on `PATH`.
@@ -360,7 +361,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-148 tests, no network and no downloads. Every test runs twice — once through the
+150 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.
