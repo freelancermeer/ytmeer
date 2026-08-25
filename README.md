@@ -155,6 +155,25 @@ To get word timings for one of those, transcribe the downloaded `.mp4` locally �
 `../Transcript with timestamps/transcribe.py oneword` runs Whisper and produces
 the same `[hh:mm:ss.mmm] word` format.
 
+## What it reports
+
+Each video shows what it cost as it finishes, and the run ends with the totals:
+
+```
+    Done. Quality: 1080p  [46.7 MB in 0:34, 1.4 MB/s]  Transcript: ...
+    Done. Quality: 1080p  [37.1 MB in 0:52, 725 KB/s]  Transcript: ...
+
+  Summary: 2 downloaded, 0 skipped (already done), 0 failed  (of 2 links).
+  Downloaded 2 video(s), 83.9 MB in 1:26 of downloading  (996 KB/s average)
+  Total run time: 2:46
+```
+
+"in 1:26 of downloading" is the time actually spent moving bytes, so the rate
+next to it is the rate you got — waits between retries are not counted against
+it. **Total run time** is the whole wall clock, which also covers metadata
+lookups, PO tokens, transcripts and thumbnails; the gap between the two is
+where that work went.
+
 ## Speed
 
 YouTube throttles any single connection far below your line rate. When **aria2c**
@@ -312,7 +331,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-134 tests, no network and no downloads. Every test runs twice — once through the
+142 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.

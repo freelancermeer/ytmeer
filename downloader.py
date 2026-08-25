@@ -130,6 +130,43 @@ def sanitize(name: str) -> str:
     return name
 
 
+def human_size(num_bytes):
+    """Bytes as a readable size: 900 KB, 42.9 MB, 1.4 GB."""
+    size = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def human_time(seconds):
+    """Seconds as m:ss, or h:mm:ss once past an hour."""
+    total = int(round(seconds or 0))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def folder_size(folder):
+    """Total bytes of the files in a folder."""
+    total = 0
+    try:
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                total += os.path.getsize(path)
+    except OSError:
+        pass
+    return total
+
+
+# Totals for the run: bytes that landed on disk, and the seconds actually spent
+# downloading (waiting between retries is deliberately not counted, so the rate
+# reported is the rate you got, not an average dragged down by backoff).
+STATS = {"bytes": 0, "seconds": 0.0}
+
+
 def read_links(path: str):
     """Return a list of non-empty, non-comment links from the links file."""
     if not os.path.exists(path):
@@ -1249,7 +1286,9 @@ def download_one(url, index, total):
         return err.replace("ERROR:", "").strip()
 
     print(f"    Downloading (>= {MIN_HEIGHT}p, <= {MAX_HEIGHT}p) -> {rel(folder)}/\n")
+    started = time.monotonic()
     err = run_with_retries(attempt)
+    elapsed = time.monotonic() - started
 
     if err:
         print(f"\n    ! Download failed: {err}")
@@ -1277,7 +1316,12 @@ def download_one(url, index, total):
     extras_note = "".join(f"  {label}: {os.path.basename(path)}"
                           for label, path in (("Thumbnail", thumb), ("Description", desc))
                           if path)
-    print(f"\n    Done. Quality: {quality}{sub_note}{extras_note}")
+    size = folder_size(folder)
+    STATS["bytes"] += size
+    STATS["seconds"] += elapsed
+    rate = f", {human_size(size / elapsed)}/s" if elapsed > 0 else ""
+    print(f"\n    Done. Quality: {quality}  "
+          f"[{human_size(size)} in {human_time(elapsed)}{rate}]{sub_note}{extras_note}")
     write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
                thumbnail=thumb, description=desc)
     # Register it so a link repeated later in this same run is skipped too.
@@ -1387,6 +1431,7 @@ def main():
         print(f"  Resuming: {len(DONE_INDEX)} video(s) already downloaded here.")
 
     total = len(links)
+    run_started = time.monotonic()
     counts = {"ok": 0, "skip": 0}
     failed = []
 
@@ -1438,6 +1483,13 @@ def main():
         print("  Failed links (see each folder's videoinfo.txt for details):")
         for u in failed:
             print(f"    - {u}")
+
+    if counts["ok"]:
+        rate = (f"  ({human_size(STATS['bytes'] / STATS['seconds'])}/s average)"
+                if STATS["seconds"] > 0 else "")
+        print(f"  Downloaded {counts['ok']} video(s), {human_size(STATS['bytes'])} "
+              f"in {human_time(STATS['seconds'])} of downloading{rate}")
+    print(f"  Total run time: {human_time(time.monotonic() - run_started)}")
     print("=" * 60)
 
 

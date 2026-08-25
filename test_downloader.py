@@ -368,6 +368,32 @@ class PlatformCase:
                     for line in f:
                         self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}")
 
+    # ---------------------------------------------------------------- stats
+    def test_sizes_are_readable(self):
+        self.assertEqual(d.human_size(0), "0 B")
+        self.assertEqual(d.human_size(900), "900 B")
+        self.assertEqual(d.human_size(45_000_000), "42.9 MB")
+        self.assertEqual(d.human_size(1_400_000_000), "1.3 GB")
+
+    def test_durations_are_readable(self):
+        self.assertEqual(d.human_time(0), "0:00")
+        self.assertEqual(d.human_time(7), "0:07")
+        self.assertEqual(d.human_time(83), "1:23")
+        self.assertEqual(d.human_time(3725), "1:02:05",
+                         "past an hour it should not read as 62 minutes")
+
+    def test_folder_size_counts_every_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(d.folder_size(folder), 0)
+            for name, size in (("a.mp4", 1000), ("b.txt", 24)):
+                with open(os.path.join(folder, name), "wb") as f:
+                    f.write(b"x" * size)
+            os.makedirs(os.path.join(folder, "sub"))
+            self.assertEqual(d.folder_size(folder), 1024)
+
+    def test_folder_size_survives_a_missing_folder(self):
+        self.assertEqual(d.folder_size("/nope/not/here"), 0)
+
     # ------------------------------------------------------------- backfill
     def _record_runs(self):
         """Capture the yt-dlp command lines a backfill would run."""
