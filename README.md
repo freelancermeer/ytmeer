@@ -169,7 +169,7 @@ rewriting bar for the video in hand:
 and one line per video once it is done:
 
 ```
-[1/3] OK   1080p   46.7 MB   0:37   1.3 MB/s  [TWjd]  Chris Van Hollen presses…
+[1/3] OK   1080p   46.7 MB    1m 22s   1.3 MB/s  [TWjd]  Chris Van Hollen presses…
 [2/3] FAIL  [youtube] zzzzzDEADvi: Video unavailable
 [3/3] SKIP  already downloaded   Chris Van Hollen presses Kash Patel during…
 ```
@@ -180,11 +180,11 @@ The run ends with the totals:
 
 ```
   Summary: 1 downloaded, 1 skipped (already done), 1 failed  (of 3 links).
-  Downloaded 1 video(s), 46.7 MB in 0:33 of downloading  (1.4 MB/s average)
-  Total run time: 0:57
+  Downloaded 1 video(s), 46.7 MB in 1m 22s of downloading  (1.4 MB/s average)
+  Total run time: 2m 09s
 ```
 
-"in 0:33 of downloading" is the time actually spent moving bytes, so the rate
+"in 1m 22s of downloading" is the time actually spent moving bytes, so the rate
 beside it is the rate you got — waits between retries are not counted against
 it. **Total run time** is the whole wall clock, which also covers metadata
 lookups, PO tokens, transcripts and thumbnails.
@@ -360,7 +360,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-142 tests, no network and no downloads. Every test runs twice — once through the
+148 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.

@@ -81,7 +81,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # this is the difference between a few hundred KB/s and saturating the link.
 ARIA2C = shutil.which("aria2c")
 ARIA2C_ARGS = ("-x16 -s16 -k1M -c --file-allocation=none "
-               "--console-log-level=warn --summary-interval=0")
+               "--console-log-level=warn --summary-interval=1")
 
 
 def build_format():
@@ -142,11 +142,15 @@ def human_size(num_bytes):
 
 
 def human_time(seconds):
-    """Seconds as m:ss, or h:mm:ss once past an hour."""
+    """Seconds with their units: 45s, 1m 22s, 2h 05m 09s."""
     total = int(round(seconds or 0))
     hours, rest = divmod(total, 3600)
     minutes, secs = divmod(rest, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def folder_size(folder):
@@ -196,9 +200,14 @@ LOG_RECORDS = []           # one structured record per video
 #   yt-dlp:  [download]  45.2% of  38.76MiB at  1.50MiB/s ETA 00:25
 #   aria2c:  [#06bc5a 3.1MiB/4.0MiB(79%) CN:16 DL:1.7MiB ETA:12s]
 PROGRESS_PATTERNS = (
-    re.compile(r"\[download\]\s+(?P<pct>[\d.]+)% of.*?at\s+(?P<speed>[\d.]+\s*\S+/s)"),
+    re.compile(r"\[download\]\s+(?P<pct>[\d.]+)% of.*?at\s+(?P<speed>[\d.]+\s*\S+/s)"
+               r"\s+ETA"),
     re.compile(r"\((?P<pct>\d+)%\).*?DL:\s*(?P<speed>[\d.]+\s*\S+?)\s"),
 )
+
+# yt-dlp announces each new file it starts. The bar goes back to zero there, so
+# a video that follows a finished subtitle does not appear to start at 100%.
+NEW_FILE_RE = re.compile(r"\[download\] Destination:|\[Merger\]")
 
 
 def parse_progress(line):
@@ -276,6 +285,12 @@ class ProgressLine:
         sys.stdout.flush()
         self.width = len(text)
 
+    def restart(self):
+        """A new file is starting: show it from zero rather than where the last
+        one finished."""
+        self.painted = 0.0
+        self.update(0.0, "")
+
     def update(self, pct, speed):
         now = time.monotonic()
         if not sys.stdout.isatty() or now - self.painted < REPAINT_SECONDS:
@@ -341,6 +356,8 @@ def run_streaming(cmd, progress=None):
             if not line.strip():
                 continue
             log_line(line)
+            if progress and NEW_FILE_RE.search(line):
+                progress.restart()
             found = parse_progress(line)
             if found and progress:
                 progress.update(*found)
@@ -1482,7 +1499,7 @@ def download_one(url, index, total):
     got = "".join(c for c, path in (("T", trans), ("W", words and "not_found" not in words),
                                     ("j", thumb), ("d", desc)) if path)
     speed = f"{human_size(size / elapsed)}/s" if elapsed > 0 else "-"
-    bar.done(f"OK  {quality:>6} {human_size(size):>9} {human_time(elapsed):>6} "
+    bar.done(f"OK  {quality:>6} {human_size(size):>9} {human_time(elapsed):>9} "
              f"{speed:>10}  [{got}]  {title}")
     log_record(url=url, title=title, status="ok", quality=quality, folder=rel(folder),
                bytes=size, seconds=round(elapsed, 1),

@@ -376,11 +376,35 @@ class PlatformCase:
         self.assertEqual(d.human_size(1_400_000_000), "1.3 GB")
 
     def test_durations_are_readable(self):
-        self.assertEqual(d.human_time(0), "0:00")
-        self.assertEqual(d.human_time(7), "0:07")
-        self.assertEqual(d.human_time(83), "1:23")
-        self.assertEqual(d.human_time(3725), "1:02:05",
+        self.assertEqual(d.human_time(0), "0s")
+        self.assertEqual(d.human_time(7), "7s")
+        self.assertEqual(d.human_time(83), "1m 23s")
+        self.assertEqual(d.human_time(3725), "1h 02m 05s",
                          "past an hour it should not read as 62 minutes")
+
+    def test_progress_follows_the_download_in_hand(self):
+        # yt-dlp prints a "100% of ... at ..." line as each file finishes, and
+        # the subtitle and thumbnail finish first. Following those pinned the
+        # bar to 100% for the whole video.
+        started = "[download]  45.2% of   38.76MiB at    1.50MiB/s ETA 00:25"
+        finished = "[download] 100% of   85.89KiB in 00:00:00 at 175.56KiB/s"
+        aria = "[#613b59 2.5MiB/7.6MiB(33%) CN:16 DL:3.8MiB ETA:1s]"
+        self.assertEqual(d.parse_progress(started), (45.2, "1.50MiB/s"))
+        self.assertIsNone(d.parse_progress(finished),
+                          "a finished side file must not drive the bar")
+        self.assertEqual(d.parse_progress(aria), (33.0, "3.8MiB/s"))
+        self.assertIsNone(d.parse_progress("[youtube] Extracting URL: ..."))
+
+    def test_a_new_file_resets_the_bar(self):
+        self.assertTrue(d.NEW_FILE_RE.search("[download] Destination: video.f137.mp4"))
+        self.assertTrue(d.NEW_FILE_RE.search('[Merger] Merging formats into "out.mp4"'))
+        self.assertIsNone(d.NEW_FILE_RE.search("[download]  45.2% of 38.76MiB"))
+
+    def test_aria2c_is_asked_to_report_progress(self):
+        # With --summary-interval=0 aria2c says nothing while it works, and the
+        # bar has nothing to follow.
+        self.assertNotIn("--summary-interval=0", d.ARIA2C_ARGS)
+        self.assertIn("--summary-interval=1", d.ARIA2C_ARGS)
 
     def test_folder_size_counts_every_file(self):
         with tempfile.TemporaryDirectory() as folder:
