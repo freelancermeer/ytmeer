@@ -39,16 +39,20 @@ class PlatformCase:
 
     def setUp(self):
         self._saved = (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
-                       d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR)
+                       d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
+                       d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
         d.SUB_LANG = "en"
         d.DOWNLOAD_SUBS = True
+        d.SAVE_THUMBNAIL = True
+        d.SAVE_DESCRIPTION = True
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
-         d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR) = self._saved
+         d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
+         d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION) = self._saved
 
     # ---------------------------------------------------------------- naming
     def test_forbidden_characters_replaced(self):
@@ -363,6 +367,71 @@ class PlatformCase:
                 with open(out, encoding="utf-8") as f:
                     for line in f:
                         self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}")
+
+    # ------------------------------------------------ thumbnail & description
+    def test_thumbnail_is_converted_to_jpg(self):
+        flags = d.thumb_flags()
+        self.assertIn("--write-thumbnail", flags)
+        self.assertEqual(flags[flags.index("--convert-thumbnails") + 1], "jpg",
+                         "YouTube serves .webp, which many editors will not open")
+        d.SAVE_THUMBNAIL = False
+        self.assertEqual(d.thumb_flags(), [])
+
+    def test_description_file_keeps_the_details_and_the_text(self):
+        info = {"description": "Line one.\nLine two.", "title": "My Video",
+                "channel": "Some Channel", "upload_date": "20260512",
+                "duration": 337, "view_count": 8904,
+                "webpage_url": "https://www.youtube.com/watch?v=x"}
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "My Video")
+            os.makedirs(folder)
+            path = d.write_description(folder, info)
+            self.assertEqual(os.path.basename(path), "description_My Video.txt")
+            body = open(path, encoding="utf-8").read()
+            self.assertIn("Channel:  Some Channel", body)
+            self.assertIn("Uploaded: 2026-05-12", body, "the date should be readable")
+            self.assertIn("Line one.\nLine two.", body, "the description itself is kept")
+
+    def test_no_description_file_when_the_video_has_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertIsNone(d.write_description(folder, {"description": "   "}))
+            self.assertIsNone(d.find_description(folder))
+
+    def test_existing_extras_are_not_fetched_again(self):
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "My Video")
+            os.makedirs(folder)
+            open(os.path.join(folder, "My Video.jpg"), "w").close()
+            d.write_description(folder, {"description": "text"})
+
+            called = []
+            real = d.subprocess.run
+            d.subprocess.run = lambda *a, **k: called.append(a) or real(["true"], **k)
+            try:
+                thumb, desc = d.build_extras(folder, "u", {"description": "text"})
+            finally:
+                d.subprocess.run = real
+            self.assertEqual(called, [], "nothing to fetch, so no yt-dlp call")
+            self.assertTrue(thumb.endswith("My Video.jpg"))
+            self.assertTrue(os.path.basename(desc).startswith("description_"))
+
+    def test_videoinfo_records_the_extras(self):
+        with tempfile.TemporaryDirectory() as folder:
+            d.write_info(folder, "T", "u", "1080p", "OK",
+                         thumbnail=os.path.join(folder, "T.jpg"),
+                         description=os.path.join(folder, "description_T.txt"))
+            fields = d.read_info(folder)
+            self.assertEqual(fields["Thumbnail"], "T.jpg")
+            self.assertEqual(fields["Description"], "description_T.txt")
+
+    def test_extras_can_be_turned_off(self):
+        d.SAVE_THUMBNAIL = False
+        d.SAVE_DESCRIPTION = False
+        with tempfile.TemporaryDirectory() as folder:
+            thumb, desc = d.build_extras(folder, "u", {"description": "text"})
+            self.assertIsNone(thumb)
+            self.assertIsNone(desc)
+            self.assertEqual(os.listdir(folder), [])
 
     # ------------------------------------------------------------- retrying
     def _no_sleep(self):

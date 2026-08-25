@@ -16,6 +16,8 @@ Optional flags:
     --max-height N       Quality ceiling (default: 1080)
     --no-subs            Do NOT build transcripts (built by default)
     --sub-lang CODE      Transcript language code (default: en)
+    --no-thumbnail       Do NOT save the thumbnail (saved by default)
+    --no-description     Do NOT save the description (saved by default)
 
 Examples:
     python3 downloader.py "/Users/me/Videos/YT"
@@ -28,9 +30,11 @@ LAYOUT
 
 Inside every video folder:
     <Video Title>.mp4    1080p (priority) down to 720p (floor) — never lower
-    videoinfo.txt        title, link, quality, status/error, transcript names
+    <Video Title>.jpg    the video's thumbnail
+    videoinfo.txt        title, link, quality, status/error, what else was saved
     trans_<name>.txt     English transcript, grouped lines  -> [hh:mm:ss] text
     words_<name>.txt     word-level transcript              -> [hh:mm:ss.mmm] word
+    description_<name>.txt  the video's description, with channel/date/views
   (transcript formatting adapted from ../Transcript with timestamps/transcribe.py)
 
 RESUME
@@ -66,6 +70,8 @@ DOWNLOAD_SUBS  = True      # also write an English auto-transcript .txt
 SUB_LANG       = "en"      # transcript language code
 TRANSCRIPT_WRAP = 40       # max chars per line before wrapping (transcribe.py default)
 CHANNEL_MODE   = False     # True = group videos into <Channel Name>/ folders
+SAVE_THUMBNAIL = True      # also save the video thumbnail as .jpg
+SAVE_DESCRIPTION = True    # also save the video description as .txt
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -486,6 +492,97 @@ def write_words_not_found(out_txt, entries):
         )
 
 
+# ======================== thumbnail & description ==========================
+def thumb_flags():
+    """yt-dlp flags to save the thumbnail as a .jpg next to the video."""
+    if not SAVE_THUMBNAIL:
+        return []
+    # YouTube serves .webp; converting keeps it openable everywhere.
+    return ["--write-thumbnail", "--convert-thumbnails", "jpg"]
+
+
+def find_thumbnail(folder):
+    """Path to the saved thumbnail, if there is one."""
+    try:
+        for name in sorted(os.listdir(folder)):
+            if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
+
+def find_description(folder):
+    """Path to the saved description file, if there is one."""
+    try:
+        for name in sorted(os.listdir(folder)):
+            if name.startswith("description_") and name.endswith(".txt"):
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
+
+def write_description(folder, info):
+    """Save the video's own description, with the details worth keeping on top.
+
+    The description comes from the metadata already fetched, so this costs no
+    extra request. A video with an empty description gets no file.
+    """
+    if not SAVE_DESCRIPTION:
+        return None
+    text = ((info or {}).get("description") or "").strip()
+    if not text:
+        return None
+    base = os.path.basename(folder.rstrip("/\\"))
+    path = os.path.join(folder, f"description_{base}.txt")
+
+    date = (info.get("upload_date") or "")
+    if len(date) == 8:
+        date = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+    header = [
+        f"Title:    {info.get('title') or ''}",
+        f"Channel:  {info.get('channel') or info.get('uploader') or ''}",
+        f"Uploaded: {date}",
+        f"Duration: {info.get('duration') or ''}s",
+        f"Views:    {info.get('view_count') or ''}",
+        f"Link:     {info.get('webpage_url') or ''}",
+        "",
+        "-" * 60,
+        "",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(header) + text + "\n")
+    return path
+
+
+def build_extras(folder, url, info):
+    """Make sure the thumbnail and description are present. Returns their paths.
+
+    The thumbnail normally arrives with the video; it is only fetched here when
+    it is missing, which is what happens for videos downloaded before these were
+    switched on.
+    """
+    thumb = find_thumbnail(folder) if SAVE_THUMBNAIL else None
+    if SAVE_THUMBNAIL and not thumb:
+        name = os.path.basename(folder.rstrip("/\\"))
+        # Fetching a thumbnail on its own runs into the same bot check the video
+        # does, so it gets the same escalation to the PO-token client.
+        routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
+        for extra in routes:
+            cmd = base_cmd() + ["--skip-download", "--no-warnings"] + thumb_flags() \
+                + list(extra) + ["-o", output_template(folder, name), url]
+            subprocess.run(cmd, capture_output=True, text=True)
+            thumb = find_thumbnail(folder)
+            if thumb:
+                break
+
+    desc = find_description(folder) if SAVE_DESCRIPTION else None
+    if SAVE_DESCRIPTION and not desc:
+        desc = write_description(folder, info)
+    return thumb, desc
+
+
 # ============================ transcript helpers ===========================
 def best_track_in(tracks):
     """The closest match to SUB_LANG among one set of caption tracks.
@@ -734,6 +831,25 @@ def build_transcripts(folder, url, info):
     return write_transcripts(folder, fallback)
 
 
+def update_info_extras(folder, thumbnail, description):
+    """Add/refresh the Thumbnail: and Description: lines in an existing videoinfo.txt."""
+    info = os.path.join(folder, "videoinfo.txt")
+    if not os.path.exists(info):
+        return
+    try:
+        with open(info, "r", encoding="utf-8") as f:
+            kept = [ln for ln in f.read().splitlines()
+                    if not ln.startswith(("Thumbnail:", "Description:"))]
+    except OSError:
+        return
+    if SAVE_THUMBNAIL:
+        kept.append(f"Thumbnail:  {os.path.basename(thumbnail) if thumbnail else 'none'}")
+    if SAVE_DESCRIPTION:
+        kept.append(f"Description: {os.path.basename(description) if description else 'none'}")
+    with open(info, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + "\n")
+
+
 def download_subs(folder, url):
     """Backfill: build the transcripts for an already-downloaded video."""
     if not DOWNLOAD_SUBS:
@@ -929,7 +1045,7 @@ def index_downloaded(base):
 
 
 def write_info(folder, title, url, quality, status, error=None,
-               transcript=None, words=None):
+               transcript=None, words=None, thumbnail=None, description=None):
     """Write videoinfo.txt inside the video's folder."""
     lines = [
         f"Title:   {title}",
@@ -940,6 +1056,10 @@ def write_info(folder, title, url, quality, status, error=None,
     if DOWNLOAD_SUBS:
         lines.append(f"Transcript: {os.path.basename(transcript) if transcript else 'none'}")
         lines.append(f"Words:      {os.path.basename(words) if words else 'none'}")
+    if SAVE_THUMBNAIL:
+        lines.append(f"Thumbnail:  {os.path.basename(thumbnail) if thumbnail else 'none'}")
+    if SAVE_DESCRIPTION:
+        lines.append(f"Description: {os.path.basename(description) if description else 'none'}")
     if error:
         lines.append(f"Error:   {error}")
     with open(os.path.join(folder, "videoinfo.txt"), "w", encoding="utf-8") as f:
@@ -959,7 +1079,11 @@ def output_template(folder, folder_name):
 
 
 def skip_finished(folder, url):
-    """Report an already-finished video and backfill its transcripts if missing."""
+    """Report an already-finished video, and fill in anything it is missing.
+
+    A video downloaded before transcripts, thumbnails or descriptions were
+    switched on gets them here — without fetching the video again.
+    """
     print(f"    Already downloaded -> {rel(folder)}/  (skipping)")
     if DOWNLOAD_SUBS and not find_transcript_file(folder):
         trans, words = download_subs(folder, url)
@@ -969,6 +1093,16 @@ def skip_finished(folder, url):
                   f"{os.path.basename(words) if words else 'words_*.txt'}")
         else:
             print("      (no transcript available)")
+
+    wants_thumb = SAVE_THUMBNAIL and not find_thumbnail(folder)
+    wants_desc = SAVE_DESCRIPTION and not find_description(folder)
+    if wants_thumb or wants_desc:
+        info, _ = fetch_info(url) if wants_desc else (None, None)
+        thumb, desc = build_extras(folder, url, info)
+        for path in (thumb, desc):
+            if path:
+                print(f"      + {os.path.basename(path)}")
+        update_info_extras(folder, thumb, desc)
 
 
 def rel(path):
@@ -1083,7 +1217,7 @@ def download_one(url, index, total):
             "-o", out_template,
             url,
         ] + (speed_flags() if fast else ["--concurrent-fragments", "8"]) \
-          + sub_flags(sub_lang, sub_source) + extra_flags
+          + sub_flags(sub_lang, sub_source) + thumb_flags() + extra_flags
         text = run_streaming(cmd)
         if last_returncode[0] == 0:
             return None
@@ -1117,8 +1251,13 @@ def download_one(url, index, total):
         sub_note = (f"  Transcript: {os.path.basename(trans)} + "
                     f"{os.path.basename(words)}" if trans
                     else "  Transcript: none available")
-    print(f"\n    Done. Quality: {quality}{sub_note}")
-    write_info(folder, title, url, quality, "OK", transcript=trans, words=words)
+    thumb, desc = build_extras(folder, url, info)
+    extras_note = "".join(f"  {label}: {os.path.basename(path)}"
+                          for label, path in (("Thumbnail", thumb), ("Description", desc))
+                          if path)
+    print(f"\n    Done. Quality: {quality}{sub_note}{extras_note}")
+    write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
+               thumbnail=thumb, description=desc)
     # Register it so a link repeated later in this same run is skipped too.
     if vid:
         DONE_INDEX[vid] = folder
@@ -1140,6 +1279,10 @@ def parse_args():
                    help="Do NOT build transcripts (transcripts are built by default).")
     p.add_argument("--sub-lang", default="en",
                    help="Transcript language code (default en).")
+    p.add_argument("--no-thumbnail", action="store_true",
+                   help="Do NOT save the thumbnail (saved by default).")
+    p.add_argument("--no-description", action="store_true",
+                   help="Do NOT save the description (saved by default).")
     return p.parse_args()
 
 
@@ -1164,6 +1307,7 @@ def use_utf8_output():
 def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
+    global SAVE_THUMBNAIL, SAVE_DESCRIPTION
 
     use_utf8_output()
     args = parse_args()
@@ -1175,6 +1319,8 @@ def main():
     DOWNLOAD_SUBS = not args.no_subs
     SUB_LANG      = args.sub_lang
     CHANNEL_MODE  = args.channel
+    SAVE_THUMBNAIL = not args.no_thumbnail
+    SAVE_DESCRIPTION = not args.no_description
     FORMAT        = build_format()
 
     print("=" * 60)
@@ -1187,6 +1333,9 @@ def main():
     print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found — some videos may fail with 403'}")
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
     print(f"  Transcript: {'yes (' + SUB_LANG + ', trans_ + words_ .txt)' if DOWNLOAD_SUBS else 'no'}")
+    extras = [n for n, on in (("thumbnail", SAVE_THUMBNAIL),
+                              ("description", SAVE_DESCRIPTION)) if on]
+    print(f"  Extras  : {', '.join(extras) if extras else 'none'}")
 
     if not os.path.isdir(DOWNLOAD_DIR):
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")

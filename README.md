@@ -33,6 +33,8 @@ python3 downloader.py "/path/to/your folder" --channel
 | `--max-height N` | Quality ceiling | `1080` |
 | `--no-subs` | Skip the transcripts | transcripts on |
 | `--sub-lang CODE` | Transcript language | `en` |
+| `--no-thumbnail` | Skip the thumbnail | thumbnail on |
+| `--no-description` | Skip the description | description on |
 
 ## Output
 
@@ -42,7 +44,9 @@ Default layout:
 <your folder>/
 └── <Video Title>/
     ├── <Video Title>.mp4
+    ├── <Video Title>.jpg              the thumbnail
     ├── videoinfo.txt
+    ├── description_<Video Title>.txt
     ├── trans_<Video Title>.txt
     └── words_<Video Title>.txt        (or words_not_found_<Video Title>.txt)
 ```
@@ -69,7 +73,24 @@ Quality: 1080p
 Status:  OK
 Transcript: trans_My Video.txt
 Words:      words_My Video.txt
+Thumbnail:  My Video.jpg
+Description: description_My Video.txt
 ```
+
+## Thumbnail and description
+
+Both are saved by default, next to the video.
+
+- **`<Video Title>.jpg`** — the thumbnail, converted from YouTube's `.webp` so it
+  opens anywhere.
+- **`description_<Video Title>.txt`** — the video's description, with the channel,
+  upload date, duration, views and link on top. It comes from metadata already
+  fetched, so it costs no extra request.
+
+Turn either off with `--no-thumbnail` / `--no-description`.
+
+**Backfill:** videos downloaded before these existed pick them up on the next
+run, without the video being fetched again.
 
 `videoinfo.txt` (failure — e.g. no 720p+ stream, private/deleted video):
 ```
@@ -268,7 +289,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-116 tests, no network and no downloads. Every test runs twice — once through the
+128 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.
