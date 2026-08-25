@@ -72,6 +72,7 @@ TRANSCRIPT_WRAP = 40       # max chars per line before wrapping (transcribe.py d
 CHANNEL_MODE   = False     # True = group videos into <Channel Name>/ folders
 SAVE_THUMBNAIL = True      # also save the video thumbnail as .jpg
 SAVE_DESCRIPTION = True    # also save the video description as .txt
+VERBOSE        = False     # True = show yt-dlp's full output instead of a bar
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -181,31 +182,171 @@ def read_links(path: str):
     return links
 
 
+# ============================== output =====================================
+# yt-dlp's own output is a wall of text — several lines per video, plus a
+# progress bar that repaints constantly. By default it all goes to a log file
+# and the terminal shows one rewriting line per video instead. --verbose puts
+# the raw output back on screen.
+
+LOG_FILE = [None]          # path to the run's text log, once main() sets it
+LOG_JSON = [None]          # path to the run's JSON log
+LOG_RECORDS = []           # one structured record per video
+
+# Both downloaders report progress, in their own shapes:
+#   yt-dlp:  [download]  45.2% of  38.76MiB at  1.50MiB/s ETA 00:25
+#   aria2c:  [#06bc5a 3.1MiB/4.0MiB(79%) CN:16 DL:1.7MiB ETA:12s]
+PROGRESS_PATTERNS = (
+    re.compile(r"\[download\]\s+(?P<pct>[\d.]+)% of.*?at\s+(?P<speed>[\d.]+\s*\S+/s)"),
+    re.compile(r"\((?P<pct>\d+)%\).*?DL:\s*(?P<speed>[\d.]+\s*\S+?)\s"),
+)
+
+
+def parse_progress(line):
+    """(percent, speed) from a downloader's progress line, or None."""
+    for pattern in PROGRESS_PATTERNS:
+        m = pattern.search(line)
+        if m:
+            speed = m.group("speed").strip()
+            return float(m.group("pct")), (speed if speed.endswith("/s") else speed + "/s")
+    return None
+
+
+def log_line(text):
+    """Append a line to the run's text log; silent if logging is not set up."""
+    if not LOG_FILE[0] or not text:
+        return
+    try:
+        with open(LOG_FILE[0], "a", encoding="utf-8") as f:
+            f.write(text.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def note(text):
+    """Detail that belongs in the log; on screen only with --verbose."""
+    log_line(text)
+    if VERBOSE:
+        print(text)
+
+
+def log_record(**fields):
+    """Keep one structured record for the JSON log."""
+    LOG_RECORDS.append(fields)
+
+
+def write_json_log(summary):
+    """Write the JSON log: the run's totals, then a record per video."""
+    if not LOG_JSON[0]:
+        return
+    try:
+        with open(LOG_JSON[0], "w", encoding="utf-8") as f:
+            json.dump({"run": summary, "videos": LOG_RECORDS}, f,
+                      indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"  (could not write {os.path.basename(LOG_JSON[0])}: {e})")
+
+
+BAR_WIDTH = 20
+
+
+# Repaint at most this often. Faster adds nothing a person can read, and on a
+# slow terminal the redraws start costing more than the download.
+REPAINT_SECONDS = 0.12
+
+
+class ProgressLine:
+    """One rewriting terminal line for the video being downloaded.
+
+    The bar is drawn only when stdout is a terminal. Redirected to a file or a
+    pipe there is nothing to rewrite, and every repaint would land as another
+    line, so the video's final line is all that gets written.
+    """
+
+    def __init__(self, index, total, title):
+        self.head = f"[{index}/{total}]"
+        self.title = title
+        self.width = 0
+        self.painted = 0.0
+
+    def _write(self, text):
+        columns = shutil.get_terminal_size((80, 20)).columns
+        text = text[:columns - 1]
+        # Pad over whatever the previous, possibly longer, line left behind.
+        sys.stdout.write("\r" + text.ljust(self.width))
+        sys.stdout.flush()
+        self.width = len(text)
+
+    def update(self, pct, speed):
+        now = time.monotonic()
+        if not sys.stdout.isatty() or now - self.painted < REPAINT_SECONDS:
+            return
+        self.painted = now
+        filled = int(BAR_WIDTH * max(0.0, min(100.0, pct)) / 100)
+        bar = "#" * filled + "." * (BAR_WIDTH - filled)
+        left = f"{self.head} [{bar}] {pct:5.1f}% {speed:>11}  "
+        room = max(0, shutil.get_terminal_size((80, 20)).columns - len(left) - 1)
+        title = self.title if len(self.title) <= room else self.title[:max(0, room - 1)] + "\u2026"
+        self._write(left + title)
+
+    def done(self, text):
+        """Replace the bar with the video's final line, and keep it."""
+        line = f"{self.head} {text}"
+        if sys.stdout.isatty():
+            self._write(line)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        else:
+            print(line)
+        log_line(line)
+        self.width = 0
+
+
 # Holds the exit code of the most recent run_streaming() call.
 last_returncode = [0]
 
 
-def run_streaming(cmd):
-    """Run a command, streaming its output live to the terminal (so yt-dlp's
-    native progress bar — %, size, speed, ETA — updates in place) while also
-    capturing all output as text for error reporting. Returns the captured text."""
+def run_streaming(cmd, progress=None):
+    """Run a command and capture its output. Returns the captured text.
+
+    With --verbose the raw output goes straight to the terminal, so yt-dlp's own
+    progress bar behaves as usual. Otherwise every line is written to the log
+    file and only the percentage and speed are lifted out, to drive the compact
+    one-line display.
+    """
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except OSError as e:
         last_returncode[0] = 1
         return f"ERROR: could not start yt-dlp: {e}"
 
-    # read1() returns as soon as any bytes are available (so the progress bar
-    # stays live) and is safe on Windows too — a low-level os.read() on the raw
-    # file descriptor crashes there with "Bad file descriptor" or hangs.
-    chunks = []
+    # read1() returns as soon as any bytes are available (so progress stays
+    # live) and is safe on Windows too — a low-level os.read() on the raw file
+    # descriptor crashes there with "Bad file descriptor" or hangs.
+    chunks, pending = [], ""
     while True:
         data = proc.stdout.read1(4096)
         if not data:
             break
-        sys.stdout.buffer.write(data)  # write raw bytes -> preserves \r progress bar
-        sys.stdout.buffer.flush()
         chunks.append(data)
+        if VERBOSE:
+            sys.stdout.buffer.write(data)   # raw bytes -> keeps the \r bar intact
+            sys.stdout.buffer.flush()
+            continue
+        # Progress repaints with \r rather than \n, so split on both and hold
+        # back the unfinished tail until more arrives.
+        pending += data.decode("utf-8", "replace")
+        parts = re.split(r"[\r\n]", pending)
+        pending = parts.pop()
+        for line in parts:
+            if not line.strip():
+                continue
+            log_line(line)
+            found = parse_progress(line)
+            if found and progress:
+                progress.update(*found)
+    if pending.strip():
+        log_line(pending)
+
     proc.wait()
     last_returncode[0] = proc.returncode
     return b"".join(chunks).decode("utf-8", "replace")
@@ -960,8 +1101,8 @@ def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
         if attempt < attempts:
             if attempt == attempts - 1 and not extra_flags:
                 flags = list(PO_TOKEN_FLAGS)
-            print(f"      info lookup failed ({(err or '').strip()[:70]}); "
-                  f"retry {attempt + 1}/{attempts}...")
+            note(f"      info lookup failed ({(err or '').strip()[:70]}); "
+                 f"retry {attempt + 1}/{attempts}...")
             time.sleep(INFO_RETRY_DELAY)
     return None, err
 
@@ -1130,21 +1271,26 @@ def output_template(folder, folder_name):
     return os.path.join(folder, folder_name.replace("%", "%%") + ".%(ext)s")
 
 
-def skip_finished(folder, url):
+def skip_finished(folder, url, bar=None):
     """Report an already-finished video, and fill in anything it is missing.
 
     A video downloaded before transcripts, thumbnails or descriptions were
     switched on gets them here — without fetching the video again.
     """
-    print(f"    Already downloaded -> {rel(folder)}/  (skipping)")
+    name = os.path.basename(folder.rstrip("/\\"))
+    if bar:
+        bar.done(f"SKIP  already downloaded   {name}")
+    else:
+        print(f"    Already downloaded -> {rel(folder)}/  (skipping)")
+    log_record(url=url, status="skipped", folder=rel(folder))
     if DOWNLOAD_SUBS and not find_transcript_file(folder):
         trans, words = download_subs(folder, url)
         update_info_transcripts(folder, trans, words)
         if trans:
-            print(f"      + {os.path.basename(trans)} + "
-                  f"{os.path.basename(words) if words else 'words_*.txt'}")
+            note(f"      + {os.path.basename(trans)} + "
+                 f"{os.path.basename(words) if words else 'words_*.txt'}")
         else:
-            print("      (no transcript available)")
+            note("      (no transcript available)")
 
     wants_thumb = SAVE_THUMBNAIL and not find_thumbnail(folder)
     wants_desc = SAVE_DESCRIPTION and not find_description(folder)
@@ -1153,7 +1299,7 @@ def skip_finished(folder, url):
         thumb, desc = build_extras(folder, url, info)
         for path in (thumb, desc):
             if path:
-                print(f"      + {os.path.basename(path)}")
+                note(f"      + {os.path.basename(path)}")
         update_info_extras(folder, thumb, desc)
 
 
@@ -1194,8 +1340,8 @@ def run_with_retries(attempt):
     for round_no in range(1, MAX_ATTEMPTS + 1):
         for label, flags, fast in download_routes():
             if err:
-                print(f"\n    ! {err}\n    Attempt {round_no}/{MAX_ATTEMPTS} "
-                      f"via {label}...\n")
+                note(f"    ! {err}")
+                note(f"    Attempt {round_no}/{MAX_ATTEMPTS} via {label}...")
             err = attempt(flags, fast)
             if not err:
                 if flags:
@@ -1205,8 +1351,9 @@ def run_with_retries(attempt):
                 return err                     # retrying cannot help
         if round_no < MAX_ATTEMPTS:
             delay = RETRY_DELAYS[min(round_no - 1, len(RETRY_DELAYS) - 1)]
-            print(f"\n    ! {err}\n    Every route failed; waiting {delay}s before "
-                  f"attempt {round_no + 1} of {MAX_ATTEMPTS}...\n")
+            note(f"    ! {err}")
+            note(f"    Every route failed; waiting {delay}s before "
+                 f"attempt {round_no + 1} of {MAX_ATTEMPTS}...")
             time.sleep(delay)
     return err
 
@@ -1217,13 +1364,14 @@ def download_one(url, index, total):
     Returns "ok", "skip", "fail" (worth another go later), or "gone" (private,
     deleted, or otherwise never coming back — retrying it would be pointless).
     """
-    print(f"\n[{index}/{total}] {url}")
+    note(f"\n[{index}/{total}] {url}")
+    bar = ProgressLine(index, total, url)
 
     # 0) Skip if this video is already finished — matched by video id, so a link
     #    repeated with a different tracking suffix is recognised. No network call.
     vid = video_id_from_url(url)
     if vid and vid in DONE_INDEX:
-        skip_finished(DONE_INDEX[vid], url)
+        skip_finished(DONE_INDEX[vid], url, bar)
         return "skip"
 
     # 1) Get the metadata first: it names the folder (title) and, in --channel
@@ -1238,24 +1386,29 @@ def download_one(url, index, total):
 
     # The id was unknown until now (unusual URL form) — re-check the index.
     if vid and vid in DONE_INDEX:
-        skip_finished(DONE_INDEX[vid], url)
+        skip_finished(DONE_INDEX[vid], url, bar)
         return "skip"
 
     # Folder = video title, under the channel folder when --channel is on.
+    bar.title = title
     parent = channel_dir(info)
     folder_name = safe_title or (f"video_{vid}" if vid else "video")
     folder = choose_folder(parent, folder_name, vid)
     try:
         os.makedirs(folder, exist_ok=True)
     except OSError as e:
-        print(f"    ! Cannot create {rel(folder)}/: {e}")
+        bar.done(f"FAIL  cannot create folder: {e}")
+        log_record(url=url, status="failed", error=str(e))
         return "fail"
 
     # If we couldn't even fetch info, record the error and stop here.
     if info is None:
         err = (err or "Failed to fetch video info").replace("ERROR:", "").strip()
-        print(f"    ! Failed to fetch info: {err}")
+        note(f"    ! Failed to fetch info: {err}")
+        bar.done(f"FAIL  {err}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
+        log_record(url=url, status="unavailable" if is_permanent(err) else "failed",
+                   error=err, folder=rel(folder))
         return "gone" if is_permanent(err) else "fail"
 
     # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
@@ -1277,7 +1430,7 @@ def download_one(url, index, total):
             url,
         ] + (speed_flags() if fast else ["--concurrent-fragments", "8"]) \
           + sub_flags(sub_lang, sub_source) + thumb_flags() + extra_flags
-        text = run_streaming(cmd)
+        text = run_streaming(cmd, bar)
         if last_returncode[0] == 0:
             return None
         lines = re.split(r"[\r\n]+", text or "")
@@ -1285,16 +1438,20 @@ def download_one(url, index, total):
                    next((l for l in reversed(lines) if l.strip()), "Download failed"))
         return err.replace("ERROR:", "").strip()
 
-    print(f"    Downloading (>= {MIN_HEIGHT}p, <= {MAX_HEIGHT}p) -> {rel(folder)}/\n")
+    note(f"    Downloading (>= {MIN_HEIGHT}p, <= {MAX_HEIGHT}p) -> {rel(folder)}/")
+    bar.update(0.0, "")
     started = time.monotonic()
     err = run_with_retries(attempt)
     elapsed = time.monotonic() - started
 
     if err:
-        print(f"\n    ! Download failed: {err}")
+        note(f"    ! Download failed: {err}")
+        bar.done(f"FAIL  {err}")
         leftovers = mark_incomplete(folder)
         for name in leftovers:
-            print(f"      partial file kept as {name}")
+            note(f"      partial file kept as {name}")
+        log_record(url=url, title=title, status="unavailable" if is_permanent(err) else "failed",
+                   error=err, folder=rel(folder), partial=leftovers or None)
         write_info(folder, title, url, "FAILED", "ERROR", err)
         return "gone" if is_permanent(err) else "fail"
 
@@ -1320,8 +1477,20 @@ def download_one(url, index, total):
     STATS["bytes"] += size
     STATS["seconds"] += elapsed
     rate = f", {human_size(size / elapsed)}/s" if elapsed > 0 else ""
-    print(f"\n    Done. Quality: {quality}  "
-          f"[{human_size(size)} in {human_time(elapsed)}{rate}]{sub_note}{extras_note}")
+    note(f"    Done. Quality: {quality}  "
+         f"[{human_size(size)} in {human_time(elapsed)}{rate}]{sub_note}{extras_note}")
+    got = "".join(c for c, path in (("T", trans), ("W", words and "not_found" not in words),
+                                    ("j", thumb), ("d", desc)) if path)
+    speed = f"{human_size(size / elapsed)}/s" if elapsed > 0 else "-"
+    bar.done(f"OK  {quality:>6} {human_size(size):>9} {human_time(elapsed):>6} "
+             f"{speed:>10}  [{got}]  {title}")
+    log_record(url=url, title=title, status="ok", quality=quality, folder=rel(folder),
+               bytes=size, seconds=round(elapsed, 1),
+               files={"video": os.path.basename(vfile) if vfile else None,
+                      "transcript": os.path.basename(trans) if trans else None,
+                      "words": os.path.basename(words) if words else None,
+                      "thumbnail": os.path.basename(thumb) if thumb else None,
+                      "description": os.path.basename(desc) if desc else None})
     write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
                thumbnail=thumb, description=desc)
     # Register it so a link repeated later in this same run is skipped too.
@@ -1349,6 +1518,8 @@ def parse_args():
                    help="Do NOT save the thumbnail (saved by default).")
     p.add_argument("--no-description", action="store_true",
                    help="Do NOT save the description (saved by default).")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Show yt-dlp's full output instead of the progress bar.")
     return p.parse_args()
 
 
@@ -1373,7 +1544,7 @@ def use_utf8_output():
 def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
-    global SAVE_THUMBNAIL, SAVE_DESCRIPTION
+    global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
 
     use_utf8_output()
     args = parse_args()
@@ -1387,6 +1558,7 @@ def main():
     CHANNEL_MODE  = args.channel
     SAVE_THUMBNAIL = not args.no_thumbnail
     SAVE_DESCRIPTION = not args.no_description
+    VERBOSE       = args.verbose
     FORMAT        = build_format()
 
     print("=" * 60)
@@ -1402,10 +1574,21 @@ def main():
     extras = [n for n, on in (("thumbnail", SAVE_THUMBNAIL),
                               ("description", SAVE_DESCRIPTION)) if on]
     print(f"  Extras  : {', '.join(extras) if extras else 'none'}")
+    print(f"  Log     : download_log.txt + download_log.json"
+          f"{'  (--verbose: full output on screen)' if VERBOSE else ''}")
 
     if not os.path.isdir(DOWNLOAD_DIR):
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")
         sys.exit(1)
+
+    LOG_FILE[0] = os.path.join(DOWNLOAD_DIR, "download_log.txt")
+    LOG_JSON[0] = os.path.join(DOWNLOAD_DIR, "download_log.json")
+    try:
+        with open(LOG_FILE[0], "w", encoding="utf-8") as f:
+            f.write(f"# run started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except OSError as e:
+        print(f"\nNOTE: could not open the log file ({e}); continuing without it.")
+        LOG_FILE[0] = None
 
     missing = [tool for tool in ("yt-dlp", "ffmpeg") if not shutil.which(tool)]
     if missing:
@@ -1489,8 +1672,25 @@ def main():
                 if STATS["seconds"] > 0 else "")
         print(f"  Downloaded {counts['ok']} video(s), {human_size(STATS['bytes'])} "
               f"in {human_time(STATS['seconds'])} of downloading{rate}")
-    print(f"  Total run time: {human_time(time.monotonic() - run_started)}")
+    run_seconds = time.monotonic() - run_started
+    print(f"  Total run time: {human_time(run_seconds)}")
     print("=" * 60)
+
+    write_json_log({
+        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "layout": "channel" if CHANNEL_MODE else "flat",
+        "links": total,
+        "downloaded": counts["ok"],
+        "skipped": counts["skip"],
+        "failed": len(failed) + len(gone),
+        "stopped_early": stopped,
+        "bytes": STATS["bytes"],
+        "size": human_size(STATS["bytes"]),
+        "download_seconds": round(STATS["seconds"], 1),
+        "run_seconds": round(run_seconds, 1),
+        "average_speed": (f"{human_size(STATS['bytes'] / STATS['seconds'])}/s"
+                          if STATS["seconds"] > 0 else None),
+    })
 
 
 if __name__ == "__main__":

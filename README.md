@@ -35,6 +35,7 @@ python3 downloader.py "/path/to/your folder" --channel
 | `--sub-lang CODE` | Transcript language | `en` |
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
 | `--no-description` | Skip the description | description on |
+| `-v`, `--verbose` | Show yt-dlp's full output instead of the bar | quiet |
 
 ## Output
 
@@ -155,24 +156,52 @@ To get word timings for one of those, transcribe the downloaded `.mp4` locally �
 `../Transcript with timestamps/transcribe.py oneword` runs Whisper and produces
 the same `[hh:mm:ss.mmm] word` format.
 
-## What it reports
+## What you see while it runs
 
-Each video shows what it cost as it finishes, and the run ends with the totals:
+yt-dlp is loud — many lines per video, plus a progress bar that repaints
+constantly. All of that goes to a log file instead. The terminal shows one
+rewriting bar for the video in hand:
 
 ```
-    Done. Quality: 1080p  [46.7 MB in 0:34, 1.4 MB/s]  Transcript: ...
-    Done. Quality: 1080p  [37.1 MB in 0:52, 725 KB/s]  Transcript: ...
-
-  Summary: 2 downloaded, 0 skipped (already done), 0 failed  (of 2 links).
-  Downloaded 2 video(s), 83.9 MB in 1:26 of downloading  (996 KB/s average)
-  Total run time: 2:46
+[3/22] [############........]  61.4%   1.4 MB/s  Kash Patel Throws Tantrum Aft…
 ```
 
-"in 1:26 of downloading" is the time actually spent moving bytes, so the rate
-next to it is the rate you got — waits between retries are not counted against
+and one line per video once it is done:
+
+```
+[1/3] OK   1080p   46.7 MB   0:37   1.3 MB/s  [TWjd]  Chris Van Hollen presses…
+[2/3] FAIL  [youtube] zzzzzDEADvi: Video unavailable
+[3/3] SKIP  already downloaded   Chris Van Hollen presses Kash Patel during…
+```
+
+`[TWjd]` is what was saved: **T**ranscript, **W**ords, **j**pg, **d**escription.
+
+The run ends with the totals:
+
+```
+  Summary: 1 downloaded, 1 skipped (already done), 1 failed  (of 3 links).
+  Downloaded 1 video(s), 46.7 MB in 0:33 of downloading  (1.4 MB/s average)
+  Total run time: 0:57
+```
+
+"in 0:33 of downloading" is the time actually spent moving bytes, so the rate
+beside it is the rate you got — waits between retries are not counted against
 it. **Total run time** is the whole wall clock, which also covers metadata
-lookups, PO tokens, transcripts and thumbnails; the gap between the two is
-where that work went.
+lookups, PO tokens, transcripts and thumbnails.
+
+### Logs
+
+Two files are written into the folder you point at:
+
+- **`download_log.txt`** — everything yt-dlp said, for when a failure needs
+  looking into.
+- **`download_log.json`** — the run's totals, then a record per video: url,
+  title, status, quality, bytes, seconds, folder, the files written, and the
+  error if there was one. Easy to read from another script.
+
+Redirecting the output to a file gives you the per-video lines and nothing else
+— the bar is only drawn when there is a terminal to rewrite. `--verbose` puts
+yt-dlp's raw output back on screen.
 
 ## Speed
 
