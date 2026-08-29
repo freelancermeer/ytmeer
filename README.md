@@ -78,6 +78,8 @@ Link:    https://www.youtube.com/watch?v=xxxx
 Channel: Some Channel
 Views:   8,920
 Subscribers: 7,550,000
+Uploaded: 13 May 2026, 02:45:02 AM PKT
+Category: News & Politics
 Quality: 1080p
 Status:  OK
 Transcript: trans_My Video.txt
@@ -86,10 +88,15 @@ Thumbnail:  My Video.jpg
 Description: description_My Video.txt
 ```
 
-Views and the subscriber count come from metadata already fetched, so they cost
-nothing. Either reads **NA** when YouTube does not report it — some channels
-hide their subscriber count. Videos downloaded before this existed pick the
-lines up on the next run.
+Channel, views, subscribers, upload time and category all come from metadata
+that is fetched anyway, so they cost nothing. **Uploaded** is the exact moment
+in Pakistan time (UTC+5) on a 12-hour clock; when YouTube only reports the day
+it says `12 May 2026 (time NA)` rather than implying a time it does not know.
+
+Every one of these fields is always written, reading **NA** when YouTube does
+not report it — some channels hide their subscriber count — so anything reading
+the file finds the same shape each time. Videos downloaded before these existed
+pick the lines up on the next run.
 
 ## Thumbnail and description
 
@@ -369,7 +376,7 @@ On Windows, install the requirements the same way, and make sure `node`,
 python3 test_downloader.py
 ```
 
-150 tests, no network and no downloads. Every test runs twice — once through the
+162 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, caption-track selection, and transcript formatting.

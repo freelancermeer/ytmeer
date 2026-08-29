@@ -50,6 +50,7 @@ WINDOWS
 """
 
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -164,6 +165,40 @@ def count_or_na(value):
         return f"{int(value):,}"
     except (TypeError, ValueError):
         return "NA"
+
+
+# Pakistan Standard Time is a flat UTC+5 with no daylight saving, so a fixed
+# offset is exactly right and needs no timezone database.
+PKT = datetime.timezone(datetime.timedelta(hours=5), "PKT")
+
+
+def upload_time_pkt(info):
+    """When the video went up, in Pakistan time on a 12-hour clock.
+
+    YouTube's `timestamp` carries the exact moment; `upload_date` only has the
+    day, so it is the fallback and says so rather than implying a time.
+    """
+    stamp = (info or {}).get("timestamp")
+    if stamp:
+        try:
+            moment = datetime.datetime.fromtimestamp(int(stamp), PKT)
+            return moment.strftime("%d %b %Y, %I:%M:%S %p PKT")
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    date = str((info or {}).get("upload_date") or "")
+    if len(date) == 8 and date.isdigit():
+        try:
+            day = datetime.datetime.strptime(date, "%Y%m%d")
+            return day.strftime("%d %b %Y") + " (time NA)"
+        except ValueError:
+            pass
+    return "NA"
+
+
+def category_or_na(info):
+    """The video's YouTube category, or NA."""
+    names = [str(c).strip() for c in ((info or {}).get("categories") or []) if c]
+    return ", ".join(names) or "NA"
 
 
 def folder_size(folder):
@@ -1066,6 +1101,8 @@ def update_info_counts(folder, info):
         "Channel:": f"Channel: {(info or {}).get('channel') or (info or {}).get('uploader') or 'NA'}",
         "Views:": f"Views:   {count_or_na((info or {}).get('view_count'))}",
         "Subscribers:": f"Subscribers: {count_or_na((info or {}).get('channel_follower_count'))}",
+        "Uploaded:": f"Uploaded: {upload_time_pkt(info)}",
+        "Category:": f"Category: {category_or_na(info)}",
     }
     kept, seen = [], set()
     for line in lines:
@@ -1310,6 +1347,8 @@ def write_info(folder, title, url, quality, status, error=None,
         f"Channel: {(info or {}).get('channel') or (info or {}).get('uploader') or 'NA'}",
         f"Views:   {count_or_na((info or {}).get('view_count'))}",
         f"Subscribers: {count_or_na((info or {}).get('channel_follower_count'))}",
+        f"Uploaded: {upload_time_pkt(info)}",
+        f"Category: {category_or_na(info)}",
         f"Quality: {quality}",
         f"Status:  {status}",
     ]
@@ -1362,7 +1401,8 @@ def skip_finished(folder, url, bar=None):
     fields = read_info(folder)
     wants_thumb = SAVE_THUMBNAIL and not find_thumbnail(folder)
     wants_desc = SAVE_DESCRIPTION and not find_description(folder)
-    wants_counts = "Views" not in fields or "Subscribers" not in fields
+    wants_counts = any(k not in fields for k in ("Views", "Subscribers",
+                                                 "Uploaded", "Category"))
     if wants_thumb or wants_desc or wants_counts:
         info = None
         if wants_desc or wants_counts:
@@ -1562,6 +1602,7 @@ def download_one(url, index, total):
                channel=info.get("channel") or info.get("uploader"),
                views=info.get("view_count"),
                subscribers=info.get("channel_follower_count"),
+               uploaded=upload_time_pkt(info), category=category_or_na(info),
                bytes=size, seconds=round(elapsed, 1),
                files={"video": os.path.basename(vfile) if vfile else None,
                       "transcript": os.path.basename(trans) if trans else None,

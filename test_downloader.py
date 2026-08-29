@@ -425,6 +425,44 @@ class PlatformCase:
         self.assertNotIn("--summary-interval=0", d.ARIA2C_ARGS)
         self.assertIn("--summary-interval=1", d.ARIA2C_ARGS)
 
+    def test_counts_fall_back_to_na(self):
+        self.assertEqual(d.count_or_na(8920), "8,920")
+        self.assertEqual(d.count_or_na(7550000), "7,550,000")
+        self.assertEqual(d.count_or_na(0), "0")
+        for missing in (None, "", "abc"):
+            self.assertEqual(d.count_or_na(missing), "NA")
+
+    def test_upload_time_is_pakistan_time_on_a_12_hour_clock(self):
+        # 1778622302 is 2026-05-12 21:45:02 UTC, which is the 13th in PKT.
+        self.assertEqual(d.upload_time_pkt({"timestamp": 1778622302}),
+                         "13 May 2026, 02:45:02 AM PKT")
+
+    def test_upload_time_says_so_when_only_the_day_is_known(self):
+        stamped = d.upload_time_pkt({"upload_date": "20260512"})
+        self.assertEqual(stamped, "12 May 2026 (time NA)",
+                         "a date-only field must not imply a time")
+
+    def test_upload_time_falls_back_to_na(self):
+        for info in ({}, {"timestamp": "abc"}, {"upload_date": "nope"}, None):
+            self.assertEqual(d.upload_time_pkt(info), "NA")
+
+    def test_category_falls_back_to_na(self):
+        self.assertEqual(d.category_or_na({"categories": ["News & Politics"]}),
+                         "News & Politics")
+        self.assertEqual(d.category_or_na({"categories": ["Music", "Comedy"]}),
+                         "Music, Comedy")
+        for info in ({"categories": []}, {}, None):
+            self.assertEqual(d.category_or_na(info), "NA")
+
+    def test_videoinfo_always_has_every_field(self):
+        # Written even for a video whose metadata came back empty, so anything
+        # reading the file finds the same shape every time.
+        with tempfile.TemporaryDirectory() as folder:
+            d.write_info(folder, "T", "u", "FAILED", "ERROR", "boom", info=None)
+            fields = d.read_info(folder)
+            for key in ("Channel", "Views", "Subscribers", "Uploaded", "Category"):
+                self.assertEqual(fields[key], "NA", f"{key} should read NA")
+
     def test_folder_size_counts_every_file(self):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(d.folder_size(folder), 0)
