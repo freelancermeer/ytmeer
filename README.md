@@ -75,6 +75,9 @@ the extras — so `--channel` is purely about where files land.
 ```
 Title:   My Video
 Link:    https://www.youtube.com/watch?v=xxxx
+Channel: Some Channel
+Views:   8,920
+Subscribers: 7,550,000
 Quality: 1080p
 Status:  OK
 Transcript: trans_My Video.txt
@@ -82,6 +85,11 @@ Words:      words_My Video.txt
 Thumbnail:  My Video.jpg
 Description: description_My Video.txt
 ```
+
+Views and the subscriber count come from metadata already fetched, so they cost
+nothing. Either reads **NA** when YouTube does not report it — some channels
+hide their subscriber count. Videos downloaded before this existed pick the
+lines up on the next run.
 
 ## Thumbnail and description
 

@@ -153,6 +153,19 @@ def human_time(seconds):
     return f"{secs}s"
 
 
+def count_or_na(value):
+    """A count with thousands separators, or NA when YouTube did not report it.
+
+    Views and subscriber counts are usually present but not guaranteed — some
+    channels hide their subscriber count, and a video can come back without a
+    view count — so the field is always written, with NA standing in.
+    """
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "NA"
+
+
 def folder_size(folder):
     """Total bytes of the files in a folder."""
     total = 0
@@ -1039,6 +1052,39 @@ def build_transcripts(folder, url, info):
     return write_transcripts(folder, fallback)
 
 
+def update_info_counts(folder, info):
+    """Add/refresh Channel, Views and Subscribers in an existing videoinfo.txt."""
+    path = os.path.join(folder, "videoinfo.txt")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    fresh = {
+        "Channel:": f"Channel: {(info or {}).get('channel') or (info or {}).get('uploader') or 'NA'}",
+        "Views:": f"Views:   {count_or_na((info or {}).get('view_count'))}",
+        "Subscribers:": f"Subscribers: {count_or_na((info or {}).get('channel_follower_count'))}",
+    }
+    kept, seen = [], set()
+    for line in lines:
+        key = next((k for k in fresh if line.startswith(k)), None)
+        if key:
+            if key not in seen:      # replace in place, keeping the file's order
+                kept.append(fresh[key])
+                seen.add(key)
+        else:
+            kept.append(line)
+    # Anything the file did not have yet goes after the Link line.
+    missing = [fresh[k] for k in fresh if k not in seen]
+    if missing:
+        at = next((i for i, l in enumerate(kept) if l.startswith("Link:")), 0) + 1
+        kept[at:at] = missing
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + "\n")
+
+
 def update_info_extras(folder, thumbnail, description):
     """Add/refresh the Thumbnail: and Description: lines in an existing videoinfo.txt."""
     info = os.path.join(folder, "videoinfo.txt")
@@ -1255,11 +1301,15 @@ def index_downloaded(base):
 
 
 def write_info(folder, title, url, quality, status, error=None,
-               transcript=None, words=None, thumbnail=None, description=None):
+               transcript=None, words=None, thumbnail=None, description=None,
+               info=None):
     """Write videoinfo.txt inside the video's folder."""
     lines = [
         f"Title:   {title}",
         f"Link:    {url}",
+        f"Channel: {(info or {}).get('channel') or (info or {}).get('uploader') or 'NA'}",
+        f"Views:   {count_or_na((info or {}).get('view_count'))}",
+        f"Subscribers: {count_or_na((info or {}).get('channel_follower_count'))}",
         f"Quality: {quality}",
         f"Status:  {status}",
     ]
@@ -1309,15 +1359,22 @@ def skip_finished(folder, url, bar=None):
         else:
             note("      (no transcript available)")
 
+    fields = read_info(folder)
     wants_thumb = SAVE_THUMBNAIL and not find_thumbnail(folder)
     wants_desc = SAVE_DESCRIPTION and not find_description(folder)
-    if wants_thumb or wants_desc:
-        info, _ = fetch_info(url) if wants_desc else (None, None)
+    wants_counts = "Views" not in fields or "Subscribers" not in fields
+    if wants_thumb or wants_desc or wants_counts:
+        info = None
+        if wants_desc or wants_counts:
+            info, _ = fetch_info(url)
         thumb, desc = build_extras(folder, url, info)
         for path in (thumb, desc):
             if path:
                 note(f"      + {os.path.basename(path)}")
         update_info_extras(folder, thumb, desc)
+        if wants_counts and info:
+            update_info_counts(folder, info)
+            note("      + views and subscriber count")
 
 
 def rel(path):
@@ -1502,6 +1559,9 @@ def download_one(url, index, total):
     bar.done(f"OK  {quality:>6} {human_size(size):>9} {human_time(elapsed):>9} "
              f"{speed:>10}  [{got}]  {title}")
     log_record(url=url, title=title, status="ok", quality=quality, folder=rel(folder),
+               channel=info.get("channel") or info.get("uploader"),
+               views=info.get("view_count"),
+               subscribers=info.get("channel_follower_count"),
                bytes=size, seconds=round(elapsed, 1),
                files={"video": os.path.basename(vfile) if vfile else None,
                       "transcript": os.path.basename(trans) if trans else None,
@@ -1509,7 +1569,7 @@ def download_one(url, index, total):
                       "thumbnail": os.path.basename(thumb) if thumb else None,
                       "description": os.path.basename(desc) if desc else None})
     write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
-               thumbnail=thumb, description=desc)
+               thumbnail=thumb, description=desc, info=info)
     # Register it so a link repeated later in this same run is skipped too.
     if vid:
         DONE_INDEX[vid] = folder
