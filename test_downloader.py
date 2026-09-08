@@ -40,7 +40,8 @@ class PlatformCase:
     def setUp(self):
         self._saved = (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
                        d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
-                       d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION)
+                       d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
+                       d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -48,11 +49,16 @@ class PlatformCase:
         d.DOWNLOAD_SUBS = True
         d.SAVE_THUMBNAIL = True
         d.SAVE_DESCRIPTION = True
+        d.MIN_VIEWS = 0
+        d.LIMIT = 0
+        d.SKIP_IDS = set()
+        d.skipped_by_list[0] = 0
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
          d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
-         d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION) = self._saved
+         d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
+         d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE) = self._saved
 
     # ---------------------------------------------------------------- naming
     def test_forbidden_characters_replaced(self):
@@ -784,6 +790,233 @@ class PlatformCase:
         if d.ARIA2C:
             self.assertIn("aria2c", flags)
             self.assertTrue(any("-x16" in f for f in flags), "16 connections expected")
+
+
+    # ------------------------------------------------- channel links & skips
+    def listing(self, *pages):
+        """Install a channel_page() serving prepared pages; return the ranges asked."""
+        asked = []
+
+        def page(url, start, end):
+            asked.append((start, end))
+            i = (start - 1) // d.CHANNEL_PAGE
+            return ({"channel": "Test Channel",
+                     "entries": list(pages[i]) if i < len(pages) else []}, None)
+
+        original = d.channel_page
+        d.channel_page = page
+        self.addCleanup(setattr, d, "channel_page", original)
+        return asked
+
+    @staticmethod
+    def entry(vid, views=5000, **extra):
+        e = {"id": vid, "title": f"video {vid}", "view_count": views}
+        e.update(extra)
+        return e
+
+    def test_channel_links_are_recognised(self):
+        for url in ("https://www.youtube.com/@SomeChannel",
+                    "https://www.youtube.com/@SomeChannel/videos",
+                    "https://youtube.com/c/SomeChannel",
+                    "https://www.youtube.com/channel/UCBJycsmduvYEL83R_U4JriQ",
+                    "https://www.youtube.com/user/SomeChannel"):
+            self.assertTrue(d.is_channel_url(url), url)
+
+    def test_video_links_are_never_treated_as_channels(self):
+        for url in ("https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    "https://youtu.be/dQw4w9WgXcQ",
+                    "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+                    "https://www.youtube.com/@SomeChannel/live/dQw4w9WgXcQ"):
+            self.assertFalse(d.is_channel_url(url), url)
+
+    def test_channel_link_is_read_from_its_videos_tab(self):
+        # A bare channel link resolves to the list of TABS, not to any videos.
+        self.assertEqual(d.channel_videos_url("https://www.youtube.com/@X"),
+                         "https://www.youtube.com/@X/videos")
+        self.assertEqual(d.channel_videos_url("https://www.youtube.com/@X/"),
+                         "https://www.youtube.com/@X/videos")
+        self.assertEqual(d.channel_videos_url("https://www.youtube.com/@X/featured"),
+                         "https://www.youtube.com/@X/videos")
+        self.assertEqual(d.channel_videos_url("https://www.youtube.com/@X/videos?x=1"),
+                         "https://www.youtube.com/@X/videos")
+
+    def test_an_explicitly_asked_for_tab_is_kept(self):
+        self.assertEqual(d.channel_videos_url("https://www.youtube.com/@X/shorts"),
+                         "https://www.youtube.com/@X/shorts")
+
+    def test_view_floor_drops_the_quiet_videos(self):
+        d.MIN_VIEWS = 1000
+        self.listing([self.entry("aaaaaaaaaaa", 5000),
+                      self.entry("bbbbbbbbbbb", 999),
+                      self.entry("ccccccccccc", 1000)])
+        links, name, err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertIsNone(err)
+        self.assertEqual(name, "Test Channel")
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                                 "https://www.youtube.com/watch?v=ccccccccccc"])
+
+    def test_no_view_floor_takes_every_video(self):
+        self.listing([self.entry("aaaaaaaaaaa", 1), self.entry("bbbbbbbbbbb", 0)])
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(len(links), 2)
+
+    def test_limit_keeps_only_the_newest_matches(self):
+        d.MIN_VIEWS, d.LIMIT = 1000, 2
+        self.listing([self.entry("aaaaaaaaaaa", 5000),
+                      self.entry("bbbbbbbbbbb", 10),      # under the floor
+                      self.entry("ccccccccccc", 2000),
+                      self.entry("ddddddddddd", 9000)])   # never reached
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                                 "https://www.youtube.com/watch?v=ccccccccccc"])
+
+    def test_a_skipped_video_does_not_use_up_a_limit_slot(self):
+        d.LIMIT = 2
+        d.SKIP_IDS = {"aaaaaaaaaaa"}
+        self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb"),
+                      self.entry("ccccccccccc")])
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                                 "https://www.youtube.com/watch?v=ccccccccccc"])
+
+    def test_the_summary_counts_videos_skip_txt_kept_out_of_a_listing(self):
+        # skip.txt is applied inside the listing (before --limit), so those
+        # videos never reach drop_skipped and must be counted where they happen.
+        d.LIMIT = 1
+        d.SKIP_IDS = {"aaaaaaaaaaa", "bbbbbbbbbbb"}
+        self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb"),
+                      self.entry("ccccccccccc")])
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=ccccccccccc"])
+        self.assertEqual(d.skipped_by_list[0], 2)
+
+    def test_live_and_upcoming_videos_are_left_out(self):
+        self.listing([self.entry("aaaaaaaaaaa", live_status="is_upcoming"),
+                      self.entry("bbbbbbbbbbb", live_status="is_live"),
+                      self.entry("ccccccccccc")])
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=ccccccccccc"])
+
+    def test_a_video_with_no_view_count_cannot_clear_the_floor(self):
+        d.MIN_VIEWS = 1000
+        self.listing([self.entry("aaaaaaaaaaa", None), self.entry("bbbbbbbbbbb", 2000)])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=bbbbbbbbbbb"])
+        self.assertIn("no view count", out.getvalue())   # never dropped silently
+
+    def test_listing_pages_until_the_channel_runs_out(self):
+        d.CHANNEL_PAGE = 2
+        asked = self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb")],
+                             [self.entry("ccccccccccc")])
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(len(links), 3)
+        self.assertEqual(asked, [(1, 2), (3, 4)])        # stopped on a short page
+
+    def test_a_small_limit_costs_one_listing_request(self):
+        d.CHANNEL_PAGE, d.LIMIT = 2, 1
+        asked = self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb")],
+                             [self.entry("ccccccccccc")])
+        links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(len(links), 1)
+        self.assertEqual(asked, [(1, 2)])                # the second page is never read
+
+    def test_a_channel_that_cannot_be_listed_is_reported(self):
+        original = d.channel_page
+        d.channel_page = lambda url, start, end: ({}, "Channel not found")
+        self.addCleanup(setattr, d, "channel_page", original)
+        links, _name, err = d.list_channel_videos("https://www.youtube.com/@Nope")
+        self.assertEqual(links, [])
+        self.assertEqual(err, "Channel not found")
+
+    def test_video_links_pass_through_expansion_untouched(self):
+        links = d.expand_sources(["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                  "https://youtu.be/aaaaaaaaaaa"])
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                 "https://youtu.be/aaaaaaaaaaa"])
+
+    def test_channels_and_videos_mix_in_one_links_file(self):
+        self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            links = d.expand_sources(["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                      "https://www.youtube.com/@X"])
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                 "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                                 "https://www.youtube.com/watch?v=bbbbbbbbbbb"])
+
+    def test_a_video_reached_twice_is_downloaded_once(self):
+        self.listing([self.entry("dQw4w9WgXcQ"), self.entry("bbbbbbbbbbb")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            links = d.expand_sources(["https://youtu.be/dQw4w9WgXcQ",
+                                      "https://www.youtube.com/@X"])
+        self.assertEqual(links, ["https://youtu.be/dQw4w9WgXcQ",
+                                 "https://www.youtube.com/watch?v=bbbbbbbbbbb"])
+
+    def test_a_listing_that_breaks_partway_keeps_what_it_found(self):
+        # Part of a channel is still real; it just must not look like all of it.
+        d.CHANNEL_PAGE = 2
+        pages = [({"channel": "Test Channel",
+                   "entries": [self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb")]}, None),
+                 ({}, "Unable to download API page: HTTP Error 500")]
+        calls = [0]
+
+        def page(url, start, end):
+            calls[0] += 1
+            return pages[min(calls[0] - 1, 1)]
+
+        original = d.channel_page
+        d.channel_page = page
+        self.addCleanup(setattr, d, "channel_page", original)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            links = d.expand_sources(["https://www.youtube.com/@X"])
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                                 "https://www.youtube.com/watch?v=bbbbbbbbbbb"])
+        self.assertIn("stopped early", out.getvalue())
+
+    def test_the_same_video_listed_twice_is_downloaded_once(self):
+        # links.txt routinely repeats a video with a different tracking suffix.
+        links = d.expand_sources([
+            "https://www.youtube.com/watch?v=8e6xIpf7qpk&pp=ygULa2FzaA%3D%3D",
+            "https://www.youtube.com/watch?v=8e6xIpf7qpk",
+            "https://youtu.be/8e6xIpf7qpk?t=12",
+        ])
+        self.assertEqual(
+            links, ["https://www.youtube.com/watch?v=8e6xIpf7qpk&pp=ygULa2FzaA%3D%3D"])
+
+    def test_a_link_that_is_not_a_youtube_video_is_left_alone(self):
+        links = d.expand_sources(["https://example.com/whatever"])
+        self.assertEqual(links, ["https://example.com/whatever"])
+
+    def test_skip_list_reads_links_comments_and_bare_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "skip.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# already made these\n"
+                        "\n"
+                        "https://www.youtube.com/watch?v=aaaaaaaaaaa\n"
+                        "https://youtu.be/bbbbbbbbbbb?t=30\n"
+                        "ccccccccccc\n"
+                        "not a link at all\n")
+            self.assertEqual(d.read_skips(path),
+                             {"aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"})
+
+    def test_a_missing_skip_file_excludes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(d.read_skips(os.path.join(tmp, "skip.txt")), set())
+
+    def test_skipped_video_links_are_dropped(self):
+        d.SKIP_IDS = {"aaaaaaaaaaa"}
+        kept, gone = d.drop_skipped(["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                                     "https://youtu.be/bbbbbbbbbbb"])
+        self.assertEqual(kept, ["https://youtu.be/bbbbbbbbbbb"])
+        self.assertEqual(gone, 1)
+
+    def test_the_view_and_limit_flags_are_spelled_either_way(self):
+        for flag in ("--views", "--view", "--min-views"):
+            args = d.parse_args(["/tmp/x", flag, "1000", "--limit", "3"])
+            self.assertEqual((args.views, args.limit), (1000, 3))
+
 
 
 class TestMacOS(PlatformCase, unittest.TestCase):

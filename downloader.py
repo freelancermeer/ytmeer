@@ -12,6 +12,8 @@ Usage:
 
 Optional flags:
     --channel            Group videos by channel (see LAYOUT below)
+    --views N            Channel links: only videos with at least N views
+    --limit N            Channel links: stop after the newest N matches
     --min-height N       Quality floor   (default: 720)
     --max-height N       Quality ceiling (default: 1080)
     --no-subs            Do NOT build transcripts (built by default)
@@ -23,6 +25,7 @@ Examples:
     python3 downloader.py "/Users/me/Videos/YT"
     python3 downloader.py "/Users/me/Videos/YT" --channel
     python3 downloader.py ~/Downloads/batch --max-height 1080 --min-height 720
+    python3 downloader.py ~/yt --channel --views 1000 --limit 3   (channel links)
 
 LAYOUT
     default     <dir>/<Video Title>/
@@ -36,6 +39,19 @@ Inside every video folder:
     words_<name>.txt     word-level transcript              -> [hh:mm:ss.mmm] word
     description_<name>.txt  the video's description, with channel/date/views
   (transcript formatting adapted from ../Transcript with timestamps/transcribe.py)
+
+CHANNEL LINKS
+    links.txt may hold channel links as well as video links, mixed freely. A
+    channel link is expanded into its videos, newest first:
+        --views N   keep only videos with at least N views
+        --limit N   stop after the newest N that match (default: the whole channel)
+    Only long-form videos are listed: YouTube keeps Shorts and streams in
+    separate tabs, and the channel's /videos tab is the one read.
+
+SKIP LIST
+    skip.txt next to links.txt lists videos to leave alone - one link (or bare
+    11-character id) per line, # for comments. They are never downloaded, and a
+    skipped video does not use up a --limit slot. A run says how many it left out.
 
 RESUME
     Finished videos are indexed by video id at startup — in BOTH layouts — so a
@@ -74,6 +90,10 @@ CHANNEL_MODE   = False     # True = group videos into <Channel Name>/ folders
 SAVE_THUMBNAIL = True      # also save the video thumbnail as .jpg
 SAVE_DESCRIPTION = True    # also save the video description as .txt
 VERBOSE        = False     # True = show yt-dlp's full output instead of a bar
+MIN_VIEWS      = 0         # channel links: view floor (0 = take every video)
+LIMIT          = 0         # channel links: newest N matches each (0 = no cap)
+SKIP_FILE      = "skip.txt"
+SKIP_IDS       = set()     # video ids listed in skip.txt - never downloaded
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1617,7 +1637,270 @@ def download_one(url, index, total):
     return "ok"
 
 
-def parse_args():
+# ====================== channel links & the skip list ======================
+# links.txt may name a whole channel instead of a single video. Those links are
+# expanded here - into the video links that clear --views, newest first, cut off
+# by --limit - so everything downstream still deals with one video at a time and
+# none of the download logic has to know the difference.
+
+CHANNEL_URL_RE = re.compile(
+    r"youtube\.com/(?:@[^/?#]+|c/[^/?#]+|channel/[^/?#]+|user/[^/?#]+)", re.I)
+
+# Tabs that are themselves a list of videos: a link pointing at one is honoured
+# as given. Anything else is redirected to /videos, because a bare channel link
+# resolves to the channel's list of TABS rather than to any videos, and because
+# YouTube files long-form videos, Shorts and streams under separate tabs - so
+# /videos is what "the channel's long videos" means.
+VIDEO_TABS = ("videos", "shorts", "streams", "live")
+OTHER_TABS = ("featured", "playlists", "community", "posts", "about", "shop",
+              "podcasts", "releases", "channels", "store")
+
+# Videos per listing request. --flat-playlist keeps a page to the listing alone
+# (no per-video extraction), so this is one cheap request whatever the videos are.
+CHANNEL_PAGE = 100
+
+# How many videos skip.txt kept out of the channel listings this run. Counted
+# here because a listing applies skip.txt itself, before --limit, so those
+# videos never reach drop_skipped() and the run summary would report none.
+skipped_by_list = [0]
+
+# Width of the scan line currently on screen, so the next one can paint over it.
+scan_width = [0]
+
+
+def scan_progress(label, scanned, kept):
+    """Rewriting progress while a channel is paged through.
+
+    A --views floor that little clears means every page of a big channel gets
+    read before the answer is known, and silence through that is impossible to
+    tell from a hang. Only drawn on a terminal: redirected, each repaint would
+    land as another line.
+    """
+    if not sys.stdout.isatty():
+        return
+    text = f"    {label}: scanned {scanned}, kept {kept}..."
+    text = text[:shutil.get_terminal_size((80, 20)).columns - 1]
+    sys.stdout.write("\r" + text.ljust(scan_width[0]))
+    sys.stdout.flush()
+    scan_width[0] = len(text)
+
+
+def scan_done():
+    """Wipe the scan line so the channel's result prints on a clean one."""
+    if sys.stdout.isatty() and scan_width[0]:
+        sys.stdout.write("\r" + " " * scan_width[0] + "\r")
+        sys.stdout.flush()
+    scan_width[0] = 0
+
+
+def is_channel_url(url):
+    """True for a link that names a channel rather than one video.
+
+    The video check comes second and wins: a channel link can carry a video in
+    its path (/@handle/live/<id>), and that is a video, not a channel.
+    """
+    return bool(CHANNEL_URL_RE.search(url or "")) and not video_id_from_url(url)
+
+
+def channel_videos_url(url):
+    """The channel tab to list: the one asked for, else long-form /videos."""
+    base = (url or "").split("?")[0].split("#")[0].rstrip("/")
+    tail = base.rsplit("/", 1)[-1].lower()
+    if tail in VIDEO_TABS:
+        return base                      # an explicit tab is taken as given
+    if tail in OTHER_TABS:
+        base = base.rsplit("/", 1)[0]    # a non-video tab is swapped for /videos
+    return base + "/videos"
+
+
+def channel_page(url, start, end):
+    """One page of a channel's video list, newest first. Returns (data, error)."""
+    cmd = base_cmd() + ["--flat-playlist", "--dump-single-json", "--no-warnings",
+                        "--playlist-start", str(start),
+                        "--playlist-end", str(end), url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return {}, "Timed out while listing the channel"
+    except OSError as e:
+        return {}, f"Could not run yt-dlp: {e}"
+    if out.returncode != 0:
+        msg = out.stderr.strip().splitlines()
+        return {}, (msg[-1] if msg else "Failed to list the channel")
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return {}, "Could not read the channel listing (invalid JSON from yt-dlp)"
+    # A channel that does not exist answers with a bare `null`.
+    return (data, None) if isinstance(data, dict) else ({}, "Channel not found")
+
+
+def wanted_entry(entry):
+    """Whether a listed video should be downloaded: (yes, reason-if-not).
+
+    "unknown" is kept apart from "too few views": a video YouTube listed without
+    a view count cannot be shown to clear the floor, so it is left out - but
+    quietly dropping it would look the same as a video that genuinely fell short.
+    """
+    entry = entry or {}
+    if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
+        return False, "live"          # nothing finished to download yet
+    if not MIN_VIEWS:
+        return True, ""
+    views = entry.get("view_count")
+    if not isinstance(views, (int, float)):
+        return False, "unknown"
+    return (True, "") if views >= MIN_VIEWS else (False, "views")
+
+
+def list_channel_videos(url):
+    """A channel's videos worth downloading. Returns (links, channel name, error).
+
+    Pages through the channel's video tab newest-first and stops as soon as
+    --limit is satisfied, so a small --limit costs one listing request even on a
+    channel with thousands of videos. With no --limit the whole channel is read.
+    """
+    tab = channel_videos_url(url)
+    links, seen, name = [], set(), ""
+    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0}
+    start = 1
+    while True:
+        data, err = channel_page(tab, start, start + CHANNEL_PAGE - 1)
+        if err:
+            scan_done()
+            return links, name, err
+        name = name or data.get("channel") or data.get("uploader") or ""
+        entries = data.get("entries") or []
+        for entry in entries:
+            counts["scanned"] += 1
+            vid = (entry or {}).get("id")
+            if not vid or vid in seen:
+                continue
+            keep, reason = wanted_entry(entry)
+            if not keep:
+                counts[reason] += 1
+                continue
+            # skip.txt is applied here, before --limit, so a video you asked to
+            # leave alone does not use up one of the N slots.
+            if vid in SKIP_IDS:
+                counts["skipped"] += 1
+                continue
+            seen.add(vid)
+            links.append(f"https://www.youtube.com/watch?v={vid}")
+            if LIMIT and len(links) >= LIMIT:
+                break
+        if LIMIT and len(links) >= LIMIT:
+            break
+        scan_progress(name or url, counts["scanned"], len(links))
+        if len(entries) < CHANNEL_PAGE:
+            break                        # the channel has no more videos
+        start += CHANNEL_PAGE
+    scan_done()
+    note(f"      listed {counts['scanned']} video(s): kept {len(links)}"
+         + (f", {counts['views']} under {MIN_VIEWS} views" if counts["views"] else "")
+         + (f", {counts['skipped']} in skip.txt" if counts["skipped"] else "")
+         + (f", {counts['live']} live/upcoming" if counts["live"] else ""))
+    skipped_by_list[0] += counts["skipped"]
+    if counts["unknown"]:
+        print(f"      NOTE: {counts['unknown']} video(s) had no view count and "
+              f"were left out (could not be shown to clear --views).")
+    return links, name, None
+
+
+def expand_sources(links):
+    """Replace every channel link with the video links it stands for.
+
+    A video link passes straight through, so links.txt can mix the two. Repeats
+    are dropped by video id - so a video reached through both a channel and its
+    own link is downloaded once, and --limit keeps meaning N videos.
+    """
+    channels = [u for u in links if is_channel_url(u)]
+    if channels:
+        criteria = ", ".join(filter(None, [
+            f">= {MIN_VIEWS:,} views" if MIN_VIEWS else "every video",
+            f"newest {LIMIT} each" if LIMIT else "",
+        ]))
+        print(f"\n  Reading {len(channels)} channel link(s) ({criteria})...")
+    elif MIN_VIEWS or LIMIT:
+        print("\n  NOTE: --views/--limit only apply to channel links, and "
+              "links.txt has none.")
+
+    out, seen = [], set()
+
+    def add(url):
+        """Keep a link, unless that video is in the list already."""
+        vid = video_id_from_url(url)
+        if vid:
+            if vid in seen:
+                return
+            seen.add(vid)
+        out.append(url)          # not a video link: left alone, as before
+
+    for url in links:
+        if not is_channel_url(url):
+            add(url)
+            continue
+        found, name, err = list_channel_videos(url)
+        label = name or url
+        before = len(out)
+        for u in found:
+            add(u)
+        kept = len(out) - before
+        if err:
+            # Whatever the listing reached before it broke is still real, so it
+            # is used rather than thrown away - and said out loud, because a
+            # part of a channel must never look like the whole of one.
+            print(f"    ! {label}: {err}")
+            if kept:
+                print(f"      (listing stopped early; using the {kept} "
+                      f"video(s) found before it failed)")
+            log_record(url=url, status="channel_failed", channel=name,
+                       error=err, videos=kept)
+        else:
+            print(f"    {label}: {kept} video(s)")
+            log_record(url=url, status="channel", channel=name, videos=kept)
+    return out
+
+
+# A line in skip.txt may be a link or just the id on its own.
+BARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def read_skips(path):
+    """Video ids from skip.txt: videos to leave alone whatever else asks for them.
+
+    One link - or bare 11-character id - per line; blanks and # comments are
+    ignored, exactly as in links.txt. A missing file simply means nothing.
+    """
+    ids = set()
+    if not os.path.exists(path):
+        return ids
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        print(f"  NOTE: could not read {os.path.basename(path)} ({e}); "
+              f"nothing will be excluded.")
+        return ids
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        vid = video_id_from_url(line) or (line if BARE_ID_RE.match(line) else None)
+        if vid:
+            ids.add(vid)
+    return ids
+
+
+def drop_skipped(links):
+    """Drop the links named in skip.txt. Returns (kept, how many went)."""
+    if not SKIP_IDS:
+        return links, 0
+    kept = [u for u in links if video_id_from_url(u) not in SKIP_IDS]
+    return kept, len(links) - len(kept)
+
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="YouTube batch downloader (yt-dlp) — 1080p priority, 720p floor.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1628,6 +1911,12 @@ def parse_args():
                    help="Group videos by channel: <dir>/<Channel Name>/<Video Title>/")
     p.add_argument("--min-height", type=int, default=720, help="Quality floor (default 720).")
     p.add_argument("--max-height", type=int, default=1080, help="Quality ceiling (default 1080).")
+    p.add_argument("--views", "--view", "--min-views", type=int, default=0,
+                   dest="views", metavar="N",
+                   help="Channel links: only videos with at least N views.")
+    p.add_argument("--limit", type=int, default=0, metavar="N",
+                   help="Channel links: stop after the newest N matching "
+                        "videos (default: the whole channel).")
     p.add_argument("--no-subs", action="store_true",
                    help="Do NOT build transcripts (transcripts are built by default).")
     p.add_argument("--sub-lang", default="en",
@@ -1638,7 +1927,7 @@ def parse_args():
                    help="Do NOT save the description (saved by default).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Show yt-dlp's full output instead of the progress bar.")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def use_utf8_output():
@@ -1663,6 +1952,7 @@ def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
+    global MIN_VIEWS, LIMIT, SKIP_FILE, SKIP_IDS
 
     use_utf8_output()
     args = parse_args()
@@ -1677,7 +1967,11 @@ def main():
     SAVE_THUMBNAIL = not args.no_thumbnail
     SAVE_DESCRIPTION = not args.no_description
     VERBOSE       = args.verbose
+    MIN_VIEWS     = args.views
+    LIMIT         = args.limit
     FORMAT        = build_format()
+    SKIP_FILE     = os.path.join(DOWNLOAD_DIR, "skip.txt")
+    SKIP_IDS      = read_skips(SKIP_FILE)
 
     print("=" * 60)
     print(f"  YouTube Downloader (yt-dlp) - {MAX_HEIGHT}p priority / {MIN_HEIGHT}p floor")
@@ -1688,6 +1982,10 @@ def main():
     print(f"  Speed   : {'aria2c, 16 connections' if ARIA2C else 'built-in (install aria2c for a big speedup)'}")
     print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found - some videos may fail with 403'}")
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
+    if MIN_VIEWS or LIMIT:
+        print(f"  Channels: {f'>= {MIN_VIEWS:,} views' if MIN_VIEWS else 'every video'}"
+              f"{f', newest {LIMIT} each' if LIMIT else ''}")
+    print(f"  Skip    : {f'skip.txt ({len(SKIP_IDS)} video(s))' if SKIP_IDS else 'none'}")
     print(f"  Transcript: {'yes (' + SUB_LANG + ', trans_ + words_ .txt)' if DOWNLOAD_SUBS else 'no'}")
     extras = [n for n, on in (("thumbnail", SAVE_THUMBNAIL),
                               ("description", SAVE_DESCRIPTION)) if on]
@@ -1723,6 +2021,23 @@ def main():
     links = read_links(LINKS_FILE)
     if not links:
         print(f"No links found in {LINKS_FILE}. Add one link per line.")
+        return
+
+    # A channel link stands for many videos, so it is expanded before anything
+    # else counts links. skip.txt is applied to what comes out (channel listings
+    # already leave those videos out, so this catches the plain video links).
+    try:
+        links = expand_sources(links)
+    except KeyboardInterrupt:
+        scan_done()
+        print("\n\n  Stopped while reading the channel list; nothing was downloaded.")
+        return
+    links, excluded = drop_skipped(links)
+    excluded += skipped_by_list[0]      # the channel listings applied it too
+    if excluded:
+        print(f"  Excluded {excluded} video(s) listed in skip.txt.")
+    if not links:
+        print("\nNothing left to download.")
         return
 
     # Resume: one scan of what is already finished (either layout), keyed by
@@ -1797,6 +2112,9 @@ def main():
     write_json_log({
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
         "layout": "channel" if CHANNEL_MODE else "flat",
+        "min_views": MIN_VIEWS or None,
+        "limit": LIMIT or None,
+        "excluded_by_skip_list": excluded,
         "links": total,
         "downloaded": counts["ok"],
         "skipped": counts["skip"],

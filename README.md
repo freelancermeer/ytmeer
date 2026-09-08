@@ -31,11 +31,77 @@ python3 downloader.py "/path/to/your folder" --channel
 | `--channel` | Group videos into `<Channel Name>/` folders | off (flat) |
 | `--min-height N` | Quality floor — never download below this | `720` |
 | `--max-height N` | Quality ceiling | `1080` |
+| `--views N` | Channel links only: skip videos under N views | no floor |
+| `--limit N` | Channel links only: stop after the newest N matches | whole channel |
 | `--no-subs` | Skip the transcripts | transcripts on |
 | `--sub-lang CODE` | Transcript language | `en` |
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
 | `--no-description` | Skip the description | description on |
 | `-v`, `--verbose` | Show yt-dlp's full output instead of the bar | quiet |
+
+## Channel links
+
+`links.txt` takes **channel links as well as video links**, mixed in any order. A
+channel link is expanded into its videos, newest first, before anything is
+downloaded:
+
+```
+https://www.youtube.com/@SomeChannel
+https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+```bash
+python3 downloader.py "/path/to/your folder" --channel --views 1000 --limit 3
+```
+
+That reads `@SomeChannel`, keeps the videos with **at least 1000 views**, takes
+the **newest 3** of them, and downloads those — plus the plain video link, which
+passes straight through untouched.
+
+| | |
+|---|---|
+| `--views N` | Keep only videos with at least N views. No `--views` keeps every video. |
+| `--limit N` | Stop after the newest N videos that match. **No `--limit` means the whole channel.** |
+
+Details worth knowing:
+
+- **Long videos only.** YouTube files long-form videos, Shorts and streams under
+  separate tabs, and the channel's `/videos` tab is the one read — so Shorts are
+  never picked up. Point a link straight at `/shorts` or `/streams` if you do
+  want one of those instead; an explicit tab is taken as given.
+- **Any channel link form works** — `@handle`, `/c/Name`, `/channel/UC…`,
+  `/user/Name`, with or without a `/videos` on the end.
+- `--limit` counts **per channel**, not per run.
+- `--limit` counts videos that match the criteria, whether or not you already
+  have them. So `--limit 3` means the same 3 videos every run: the ones already
+  downloaded are then skipped by [Resume](#resume) rather than replaced by older
+  ones. Use `skip.txt` to move the window on.
+- A high `--views` on a large channel has to read every page before it can know
+  the answer, so it prints its progress as it scans. Ctrl+C stops it cleanly.
+- Videos still counting down (premieres) or currently live are left out, and so
+  is any video YouTube listed without a view count when `--views` is set — that
+  one is reported, never dropped silently.
+- Live-streamed and Shorts links you paste **directly** are still downloaded as
+  normal; the tab rule only decides what a *channel* link expands to.
+
+## Skip list
+
+Put a `skip.txt` next to `links.txt` with the videos you want left alone — the
+ones you have already made something from:
+
+```
+# already made videos on these
+https://www.youtube.com/watch?v=8e6xIpf7qpk
+dQw4w9WgXcQ
+```
+
+One link per line, or just the bare 11-character id. Blank lines and `#`
+comments are ignored, exactly as in `links.txt`.
+
+Those videos are never downloaded, whether they arrived from a channel link or
+were listed directly. A skipped video **does not use up a `--limit` slot**: ask
+for the newest 3 and put the newest one in `skip.txt`, and you get the next 3
+down instead of 2. The run reports how many it left out.
 
 ## Output
 
@@ -290,7 +356,9 @@ Finished videos are indexed **by video id** at startup, so a re-run:
 
 See [Retrying](#retrying) for what happens when a download does fail.
 
-Delete a video's folder if you want a genuinely fresh pull.
+Delete a video's folder if you want a genuinely fresh pull. To stop a video
+being downloaded at all — rather than merely recognising that it already was —
+list it in [`skip.txt`](#skip-list).
 
 ### Retrying
 
