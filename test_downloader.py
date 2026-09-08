@@ -96,18 +96,43 @@ class PlatformCase:
                 self.assertLessEqual(len(path), 260,
                                      f"{prefix}<name>{suffix} exceeds Windows MAX_PATH")
 
+    # Writes a .txt with an explicit utf-8 encoding, so non-ASCII is fine there.
+    FILE_WRITERS = {"write_words_not_found"}
+
     def test_terminal_output_stays_ascii(self):
-        # A Windows console that is not in UTF-8 mode turns anything else into
-        # mojibake, and none of it earns its place on screen.
-        import re as _re
-        source = open("downloader.py", encoding="utf-8").read()
+        """No non-ASCII text can reach the console.
+
+        A Windows console that is not in UTF-8 mode turns anything else into
+        mojibake, and none of it earns its place on screen. This walks the
+        whole module rather than matching print( line by line, because a
+        message is regularly built on one line and written on the next -
+        scan_progress does exactly that, and a line-based check cannot see it.
+        """
+        import ast as _ast
+        with open("downloader.py", encoding="utf-8") as f:
+            tree = _ast.parse(f.read())
+
+        skip = set()
+        for node in _ast.walk(tree):
+            # Docstrings are never printed.
+            if isinstance(node, (_ast.Module, _ast.FunctionDef, _ast.ClassDef)):
+                first = node.body[0] if node.body else None
+                if isinstance(first, _ast.Expr) and isinstance(first.value, _ast.Constant) \
+                        and isinstance(first.value.value, str):
+                    skip.add(id(first.value))
+            if isinstance(node, _ast.FunctionDef) and node.name in self.FILE_WRITERS:
+                skip.update(id(n) for n in _ast.walk(node))
+
         offenders = []
-        for number, line in enumerate(source.splitlines(), 1):
-            if not _re.search(r"\b(print|bar\.done|bar\.update|note)\s*\(", line):
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Constant) or not isinstance(node.value, str):
                 continue
-            if [c for c in line if ord(c) > 127] or _re.findall(r"\\u[0-9a-fA-F]{4}", line):
-                offenders.append(number)
-        self.assertEqual(offenders, [], f"non-ASCII printed at lines {offenders}")
+            if id(node) in skip:
+                continue
+            if any(ord(c) > 127 for c in node.value):
+                offenders.append(node.lineno)
+        self.assertEqual(sorted(offenders), [],
+                         f"non-ASCII text reaching the console at lines {sorted(offenders)}")
 
     def test_output_template_escapes_percent(self):
         tpl = d.output_template(os.path.join("base", "vid"), "100% Real")

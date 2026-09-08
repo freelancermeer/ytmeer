@@ -1814,6 +1814,7 @@ def expand_sources(links):
     are dropped by video id - so a video reached through both a channel and its
     own link is downloaded once, and --limit keeps meaning N videos.
     """
+    skipped_by_list[0] = 0            # one expansion, one count
     channels = [u for u in links if is_channel_url(u)]
     if channels:
         criteria = ", ".join(filter(None, [
@@ -1902,7 +1903,7 @@ def drop_skipped(links):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="YouTube batch downloader (yt-dlp) — 1080p priority, 720p floor.",
+        description="YouTube batch downloader (yt-dlp) - 1080p priority, 720p floor.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("directory",
