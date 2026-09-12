@@ -438,16 +438,81 @@ differences are handled automatically, so the Mac path stays exactly as it is
 On Windows, install the requirements the same way, and make sure `node`,
 `ffmpeg`, and (optionally) `aria2c` are on `PATH`.
 
+## Google Colab
+
+There is a 2-cell notebook that runs the whole thing in Colab behind a Gradio UI
+and an HTTP API, for when you want to fire off a bulk run without tying up your
+own machine.
+
+**[Open in Colab](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/Youtube_Downloader_Colab.ipynb)**
+
+1. **Setup** — installs yt-dlp, ffmpeg, aria2c and gradio, and clones this repo.
+2. **Run** — starts the UI and prints a public link plus the snippet to drive it
+   from code.
+
+### Read this before you rely on it
+
+**YouTube gates datacenter IPs, and Colab is one.** Without a `cookies.txt` most
+videos fail with *"Sign in to confirm you're not a bot"*. The downloader now
+recognises that error and gives up on the video immediately instead of working
+through all nine retries, but only a cookies.txt actually lifts the gate — export
+one from your browser and upload it in the UI under *Extras, skip list, cookies*.
+The odd public video goes through without one; a bulk run generally will not.
+
+Two more things worth knowing. `/content/downloads` is **wiped when the runtime
+disconnects** — for a bulk run, uncomment the `drive.mount` line in cell 1 and set
+the output folder to `/content/drive/MyDrive/yt-downloads`. And pulling finished
+videos from Colab down to your own machine runs at *your* connection speed, so
+for video files it is no faster than downloading them here directly; where Colab
+genuinely wins is the small stuff — transcripts, descriptions and `videoinfo.txt`
+are kilobytes next to a 160 MB `.mp4`.
+
+### The API
+
+`share=True` gives the notebook a public URL, and everything in the UI is on it:
+
+```python
+from gradio_client import Client
+c = Client("https://xxxxxxxx.gradio.live")
+
+# what would a channel give me? one listing request, no downloads
+c.predict("https://www.youtube.com/@SomeChannel", 1000, 3, "", api_name="/preview")
+
+# run a batch — same order as the UI fields
+c.predict("https://www.youtube.com/@SomeChannel", "", None, "/content/downloads",
+          True, 1000, 3, 720, 1080, True, "en", True, True, False, False,
+          api_name="/download")
+
+c.predict(api_name="/stop")     # Ctrl+C the run; finished videos are kept
+```
+
+`/download` streams its log and ends with the run summary, so a long batch can be
+watched rather than waited on. `/preview` is worth a call before a big run: it
+costs one listing request per 100 videos and tells you exactly what `--views` and
+`--limit` selected.
+
+`colab_app.py` drives `downloader.py` as a subprocess, exactly as a terminal
+does — the retry ladder, the resume index, the folder layout and both logs are
+the same. It runs locally too, if you want the UI here:
+
+```bash
+pip install gradio && python3 colab_app.py --no-share
+```
+
 ## Tests
 
 ```bash
 python3 test_downloader.py
+python3 test_colab_app.py     # skips itself unless gradio is installed
 ```
 
-162 tests, no network and no downloads. Every test runs twice — once through the
+210 tests, no network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
-both layouts, caption-track selection, and transcript formatting.
+both layouts, channel-link expansion, the skip list, caption-track selection, and
+transcript formatting. A further 18 in `test_colab_app.py` cover the Gradio
+layer — UI values to a command line, and which paths it may hand back — and skip
+themselves when gradio is absent, so the CLI-only machine stays green.
 
 ## Notes
 

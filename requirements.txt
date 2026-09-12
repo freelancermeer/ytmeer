@@ -16,3 +16,8 @@ curl_cffi>=0.10,<0.16
 #             YouTube's "n" challenge (macOS: deno also works, auto-detected)
 #   aria2c  — optional but strongly recommended: 16-connection downloads, which
 #             measured ~4x faster than the built-in downloader (brew install aria2)
+
+# Optional — only for the Colab / Gradio front-end (colab_app.py). Left
+# commented so a terminal-only install does not pull it in; the Colab notebook
+# installs it itself in its setup cell.
+#   gradio>=6,<7

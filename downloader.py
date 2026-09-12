@@ -540,11 +540,23 @@ def is_transient(error_text):
 
 # Nothing about these changes on a retry, so a video that reports one is failed
 # immediately instead of spending three rounds proving it.
+# YouTube gates requests it thinks are automated, which is what a datacenter IP
+# looks like from its side. The apostrophe in "you're not a bot" comes back as a
+# curly U+2019 as often as a plain one, so the marker avoids it entirely.
+BOT_GATE_ERRORS = ("not a bot", "this helps protect our community")
+
+
+def is_bot_gated(error_text):
+    """True when the failure is YouTube refusing the IP, not refusing the video."""
+    low = (error_text or "").lower()
+    return any(hint in low for hint in BOT_GATE_ERRORS)
+
+
 PERMANENT_ERRORS = ("private video", "video is unavailable", "video unavailable",
                     "removed by the uploader", "has been terminated",
                     "sign in to confirm your age", "members-only",
                     "is not a valid url", "unsupported url",
-                    "video has been removed", "copyright claim")
+                    "video has been removed", "copyright claim") + BOT_GATE_ERRORS
 
 
 def is_permanent(error_text):
@@ -2093,9 +2105,13 @@ def main():
           f"{done if stopped else total} links"
           f"{f'; stopped early, {total - done} not reached' if stopped else ''}).")
     if gone:
-        print("  Unavailable (private, deleted - not retried):")
+        print("  Not retried (unavailable, or YouTube refused this IP):")
         for u in gone:
             print(f"    - {u}")
+    if any(is_bot_gated(r.get("error")) for r in LOG_RECORDS):
+        print("  NOTE: YouTube bot-gated this IP. That is what a datacenter IP")
+        print("        (Colab, a VPS) looks like to it. Put a cookies.txt in the")
+        print("        folder, or run from a home connection.")
     if failed:
         print("  Failed links (see each folder's videoinfo.txt for details):")
         for u in failed:
