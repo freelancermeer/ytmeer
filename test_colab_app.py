@@ -168,6 +168,45 @@ class TestPrepare(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_GRADIO, "gradio is not installed")
+class TestFailures(unittest.TestCase):
+    """Whatever did not come down has to reach the caller, with its reason.
+
+    An API caller sees only what the summary carries, so a failure missing from
+    here is a failure nobody finds out about.
+    """
+
+    def test_every_kind_of_failure_is_reported(self):
+        logged = {"videos": [
+            {"url": "u1", "status": "failed", "error": "stream died", "title": "A"},
+            {"url": "u2", "status": "unavailable", "error": "private video"},
+            {"url": "u3", "status": "channel_failed", "error": "404"},
+        ]}
+        out = c.failures_in(logged)
+        self.assertEqual([f["status"] for f in out],
+                         ["failed", "unavailable", "channel_failed"])
+        self.assertEqual(out[0]["error"], "stream died")
+        self.assertEqual(out[0]["title"], "A")
+
+    def test_successes_and_skips_are_not_failures(self):
+        logged = {"videos": [
+            {"url": "u1", "status": "ok"},
+            {"url": "u2", "status": "skipped"},
+            {"url": "u3", "status": "channel", "channel": "X", "videos": 4},
+        ]}
+        self.assertEqual(c.failures_in(logged), [])
+
+    def test_a_missing_or_empty_log_is_not_an_error(self):
+        for logged in ({}, {"videos": []}, {"videos": None}, None):
+            self.assertEqual(c.failures_in(logged), [])
+
+    def test_a_failure_with_no_error_text_still_comes_through(self):
+        # Better a failure with no reason than a failure nobody hears about.
+        out = c.failures_in({"videos": [{"url": "u1", "status": "failed"}]})
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["error"])
+
+
+@unittest.skipUnless(HAVE_GRADIO, "gradio is not installed")
 class TestZip(unittest.TestCase):
     def test_nothing_to_zip_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:

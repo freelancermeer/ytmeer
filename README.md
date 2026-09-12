@@ -450,22 +450,21 @@ own machine.
 2. **Run** — starts the UI and prints a public link plus the snippet to drive it
    from code.
 
-### Read this before you rely on it
+### Worth knowing
 
-**YouTube gates datacenter IPs, and Colab is one.** Without a `cookies.txt` most
-videos fail with *"Sign in to confirm you're not a bot"*. The downloader now
-recognises that error and gives up on the video immediately instead of working
-through all nine retries, but only a cookies.txt actually lifts the gate — export
-one from your browser and upload it in the UI under *Extras, skip list, cookies*.
-The odd public video goes through without one; a bulk run generally will not.
+**Cookies are optional.** Public videos come down on Colab without an account.
+Upload a `cookies.txt` under *Extras, skip list, cookies* only for private,
+members-only or age-restricted videos — or if YouTube starts asking the runtime to
+confirm it is not a bot, which can happen on a datacenter IP. If it ever does, the
+downloader recognises that error, gives up on the video at once rather than
+working through all nine retries, and says so in the summary.
 
-Two more things worth knowing. `/content/downloads` is **wiped when the runtime
-disconnects** — for a bulk run, uncomment the `drive.mount` line in cell 1 and set
-the output folder to `/content/drive/MyDrive/yt-downloads`. And pulling finished
-videos from Colab down to your own machine runs at *your* connection speed, so
-for video files it is no faster than downloading them here directly; where Colab
-genuinely wins is the small stuff — transcripts, descriptions and `videoinfo.txt`
-are kilobytes next to a 160 MB `.mp4`.
+**`/content/downloads` is wiped when the runtime disconnects.** For a long run,
+uncomment the `drive.mount` line in cell 1 and set the output folder to
+`/content/drive/MyDrive/yt-downloads`.
+
+**Nothing is swallowed.** Anything that fails is listed at the end of the log and
+in the API's `failures`, with the reason — see below.
 
 ### The API
 
@@ -490,6 +489,25 @@ c.predict(api_name="/stop")     # Ctrl+C the run; finished videos are kept
 watched rather than waited on. `/preview` is worth a call before a big run: it
 costs one listing request per 100 videos and tells you exactly what `--views` and
 `--limit` selected.
+
+The summary names whatever did not come down, so a script never has to go and
+read `download_log.json` to find out:
+
+```jsonc
+{
+  "state": "finished",
+  "folder": "/content/downloads",
+  "run": { "downloaded": 12, "skipped": 3, "failed": 2, "size": "1.9 GB" },
+  "failures": [
+    { "url": "...", "status": "unavailable",
+      "error": "[youtube] xxx: This video is unavailable" },
+    { "url": "...", "status": "channel_failed",
+      "error": "ERROR: [youtube:tab] ...: HTTP Error 404: Not Found" }
+  ]
+}
+```
+
+An empty `failures` means everything asked for arrived.
 
 `colab_app.py` drives `downloader.py` as a subprocess, exactly as a terminal
 does — the retry ladder, the resume index, the folder layout and both logs are

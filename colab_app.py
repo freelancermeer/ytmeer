@@ -10,11 +10,10 @@ Two entry points, both on the one URL Gradio prints:
   - the web UI
   - the HTTP API, callable with gradio_client — see api_help()
 
-A WORD ABOUT COLAB. YouTube gates datacenter IPs, which is what Colab is, so
-without a cookies.txt most videos fail with "Sign in to confirm you're not a
-bot". downloader.py now recognises that and gives up on a video immediately
-instead of working through every retry, but only a cookies.txt (or a home
-connection) actually lifts it. Upload one in the UI.
+COOKIES are optional. Public videos download on Colab without an account. If
+YouTube ever does gate the runtime ("Sign in to confirm you're not a bot"),
+downloader.py recognises it, gives up on that video at once instead of working
+through every retry, and says so in the summary — upload a cookies.txt then.
 """
 
 import json
@@ -111,6 +110,19 @@ def build_argv(outdir, channel, views, limit, min_h, max_h, subs, sub_lang,
     return argv
 
 
+# What downloader.py records for something it could not fetch. "skipped" and "ok"
+# are deliberately absent: a video already on disk is not a failure.
+FAILED_STATUSES = ("failed", "unavailable", "channel_failed")
+
+
+def failures_in(logged):
+    """The entries in a parsed download_log.json that did not come down."""
+    return [{"url": r.get("url"), "status": r.get("status"),
+             "title": r.get("title"), "error": r.get("error")}
+            for r in ((logged or {}).get("videos") or [])
+            if r.get("status") in FAILED_STATUSES]
+
+
 def zip_results(outdir):
     """Zip the finished folders. Returns the path, or None if there is nothing."""
     folders = [n for n in sorted(os.listdir(outdir))
@@ -157,14 +169,26 @@ def download(links, skips, cookies, outdir, channel, views, limit, min_h, max_h,
     finally:
         current["proc"] = None
 
-    summary = {"state": "finished", "exit_code": proc.returncode, "folder": outdir}
+    summary = {"state": "finished", "exit_code": proc.returncode, "folder": outdir,
+               "failures": []}
     log_json = os.path.join(outdir, "download_log.json")
     if os.path.exists(log_json):
         try:
             with open(log_json, encoding="utf-8") as f:
-                summary["run"] = json.load(f).get("run")
-        except (OSError, json.JSONDecodeError):
-            pass
+                logged = json.load(f)
+            summary["run"] = logged.get("run")
+            # Named and explained here rather than left for whoever thinks to go
+            # and open download_log.json.
+            summary["failures"] = failures_in(logged)
+        except (OSError, json.JSONDecodeError) as e:
+            summary["log_error"] = f"could not read download_log.json: {e}"
+
+    if summary["failures"]:
+        lines.append("")
+        lines.append(f"{len(summary['failures'])} did not come down:")
+        for bad in summary["failures"]:
+            lines.append(f"  [{bad['status']}] {bad.get('title') or bad['url']}")
+            lines.append(f"      {bad.get('error') or 'no error recorded'}")
 
     archive = None
     if make_zip:
@@ -241,10 +265,11 @@ def build_ui():
     with gr.Blocks(title="YouTube Downloader") as demo:
         gr.Markdown(
             "# YouTube Downloader\n"
-            "Channel links and video links, mixed. `--views` / `--limit` apply to "
-            "channel links only.\n\n"
-            "**On Colab, upload a `cookies.txt`** — YouTube gates datacenter IPs, "
-            "and without one most videos fail the bot check."
+            "Channel links and video links, mixed freely. **Min views** and "
+            "**limit** apply to channel links only.\n\n"
+            "Everything here is on the API too — the snippet is printed under the "
+            "notebook cell. `cookies.txt` is optional: add one only if YouTube "
+            "starts asking the runtime to confirm it is not a bot."
         )
         with gr.Row():
             with gr.Column(scale=2):
@@ -318,12 +343,21 @@ def launch(share=True, **kwargs):
     demo.queue()
     kwargs.setdefault("allowed_paths", ALLOWED_ROOTS)
     kwargs.setdefault("prevent_thread_lock", True)
+    # Without this, anything that goes wrong reaches an API caller as "the
+    # upstream Gradio app has raised an exception but has not enabled verbose
+    # error reporting", which says nothing about what actually broke.
+    kwargs.setdefault("show_error", True)
     demo.launch(share=share, **kwargs)
     url = (getattr(demo, "share_url", None) or getattr(demo, "local_url", "") or "")
+    url = url.rstrip("/")
     print("\n" + "=" * 68)
-    print("  API - drive this from code")
+    print("  URL (the UI and the API are both here)")
     print("=" * 68)
-    print(api_help(url.rstrip("/") if url else "<the URL above>"), flush=True)
+    print(f"\n    {url or '<see the link above>'}\n")
+    print("=" * 68)
+    print("  Drive it from code")
+    print("=" * 68)
+    print(api_help(url or "<the URL above>"), flush=True)
     return demo
 
 
