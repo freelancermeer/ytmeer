@@ -17,7 +17,9 @@ curl_cffi>=0.10,<0.16
 #   aria2c  — optional but strongly recommended: 16-connection downloads, which
 #             measured ~4x faster than the built-in downloader (brew install aria2)
 
-# Optional — only for the Colab / Gradio front-end (colab_app.py). Left
-# commented so a terminal-only install does not pull it in; the Colab notebook
-# installs it itself in its setup cell.
-#   gradio>=6,<7
+# Optional — only for the web UI and the REST API. Left commented so a
+# terminal-only install does not pull them in; the Colab notebook installs what
+# it needs in its setup cell.
+#   gradio>=6,<7          # the UI (colab_app.py); brings fastapi + uvicorn with it
+#   fastapi               # just the REST API (api.py), without the UI
+#   uvicorn

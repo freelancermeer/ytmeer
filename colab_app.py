@@ -1,36 +1,38 @@
 #!/usr/bin/env python3
-"""Gradio front-end for downloader.py — built for Google Colab.
+"""Gradio front-end for downloader.py - built for Google Colab.
 
-This is a separate way in, not a change to how downloading works. The engine is
-driven as a subprocess exactly as it is from a terminal, so the retry ladder, the
-resume index, the folder layout and both logs behave identically; this file only
-collects the arguments, streams the output back, and hands the files over.
+Another way in, not a change to how downloading works: the engine is driven as a
+subprocess exactly as it is from a terminal, so the retry ladder, the resume
+index, the folder layout and both logs behave identically.
 
-Two entry points, both on the one URL Gradio prints:
+One URL carries three things:
   - the web UI
-  - the HTTP API, callable with gradio_client — see api_help()
+  - the REST API on /api (the same routes api.py serves on its own; see api.py)
+  - Gradio's own predict API, for gradio_client
+
+The shared machinery - writing links.txt, building the command line, reading the
+run's JSON log - lives in api.py, so the UI and the REST API cannot drift apart.
 
 COOKIES are optional. Public videos download on Colab without an account. If
 YouTube ever does gate the runtime ("Sign in to confirm you're not a bot"),
 downloader.py recognises it, gives up on that video at once instead of working
-through every retry, and says so in the summary — upload a cookies.txt then.
+through every retry, and says so in the summary - upload a cookies.txt then.
 """
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
 import time
-import zipfile
 
 import gradio as gr
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DOWNLOADER = os.path.join(HERE, "downloader.py")
-ON_COLAB = os.path.isdir("/content")
-DEFAULT_OUT = "/content/downloads" if ON_COLAB else os.path.join(HERE, "downloads")
+import api
+
+HERE = api.HERE
+DEFAULT_OUT = api.DEFAULT_OUT
+ON_COLAB = api.ON_COLAB
 
 # Gradio hands a file to the browser only if it sits under one of these, so they
 # are passed to launch() as allowed_paths. On Colab "/content" covers both the
@@ -58,109 +60,43 @@ def servable(path):
     return None
 
 
-def _write(path, text):
-    """Write one of the downloader's input files, or remove it if empty."""
-    text = (text or "").strip()
-    if not text:
-        if os.path.exists(path):
-            os.remove(path)
-        return False
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text + "\n")
-    return True
-
-
-def prepare(outdir, links, skips, cookies):
-    """Lay out the folder downloader.py expects: links.txt, skip.txt, cookies.txt."""
-    os.makedirs(outdir, exist_ok=True)
-    if not _write(os.path.join(outdir, "links.txt"), links):
-        raise gr.Error("No links given. Put one link per line — video links, "
-                       "channel links, or both.")
-    _write(os.path.join(outdir, "skip.txt"), skips)
-    # A cookies.txt is uploaded as a temp file; it has to sit in the folder under
-    # that exact name, because that is where base_cmd() looks for it.
-    target = os.path.join(outdir, "cookies.txt")
-    if cookies:
-        shutil.copyfile(cookies, target)
-    elif os.path.exists(target):
-        os.remove(target)
-
-
-def build_argv(outdir, channel, views, limit, min_h, max_h, subs, sub_lang,
-               thumbnail, description, verbose):
-    """The command line a person would have typed."""
-    argv = [sys.executable, "-u", DOWNLOADER, outdir]
-    if channel:
-        argv.append("--channel")
-    if views and int(views) > 0:
-        argv += ["--views", str(int(views))]
-    if limit and int(limit) > 0:
-        argv += ["--limit", str(int(limit))]
-    argv += ["--min-height", str(int(min_h)), "--max-height", str(int(max_h))]
-    if not subs:
-        argv.append("--no-subs")
-    else:
-        argv += ["--sub-lang", sub_lang or "en"]
-    if not thumbnail:
-        argv.append("--no-thumbnail")
-    if not description:
-        argv.append("--no-description")
-    if verbose:
-        argv.append("--verbose")
-    return argv
-
-
-# What downloader.py records for something it could not fetch. "skipped" and "ok"
-# are deliberately absent: a video already on disk is not a failure.
-FAILED_STATUSES = ("failed", "unavailable", "channel_failed")
-
-
-def failures_in(logged):
-    """The entries in a parsed download_log.json that did not come down."""
-    return [{"url": r.get("url"), "status": r.get("status"),
-             "title": r.get("title"), "error": r.get("error")}
-            for r in ((logged or {}).get("videos") or [])
-            if r.get("status") in FAILED_STATUSES]
-
-
-def zip_results(outdir):
-    """Zip the finished folders. Returns the path, or None if there is nothing."""
-    folders = [n for n in sorted(os.listdir(outdir))
-               if os.path.isdir(os.path.join(outdir, n))]
-    if not folders:
-        return None
-    path = os.path.join(outdir, "downloads.zip")
-    if os.path.exists(path):
-        os.remove(path)
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        for folder in folders:
-            for root, _dirs, files in os.walk(os.path.join(outdir, folder)):
-                for name in files:
-                    full = os.path.join(root, name)
-                    z.write(full, os.path.relpath(full, outdir))
-    return path
-
-
 def download(links, skips, cookies, outdir, channel, views, limit, min_h, max_h,
              subs, sub_lang, thumbnail, description, verbose, make_zip):
     """Run a batch, streaming the log. Yields (log, summary, zip, json file)."""
-    outdir = (outdir or DEFAULT_OUT).strip()
-    prepare(outdir, links, skips, cookies)
-    argv = build_argv(outdir, channel, views, limit, min_h, max_h, subs,
-                      sub_lang, thumbnail, description, verbose)
+    try:
+        opts = api.normalize_request({
+            "links": links, "skip": skips, "outdir": outdir or DEFAULT_OUT,
+            "channel": channel, "views": views, "limit": limit,
+            "min_height": min_h, "max_height": max_h, "subs": subs,
+            "sub_lang": sub_lang, "thumbnail": thumbnail,
+            "description": description, "verbose": verbose, "zip": make_zip,
+        })
+    except ValueError as e:
+        raise gr.Error(str(e))
+
+    outdir = opts["outdir"]
+    try:
+        api.write_inputs(outdir, opts["links"], opts["skip"], cookies)
+    except OSError as e:
+        raise gr.Error(f"could not prepare {outdir}: {e}")
+    argv = api.build_argv(outdir, opts)
 
     lines = ["$ " + " ".join(argv[2:]), ""]
     yield "\n".join(lines), {"state": "running"}, None, None
 
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise gr.Error(f"could not start the downloader: {e}")
     current["proc"] = proc
     painted = 0.0
     try:
         for line in proc.stdout:
             lines.append(line.rstrip("\n"))
-            # Repainting on every line makes a long batch crawl; a person cannot
-            # read faster than this anyway.
+            # Repainting on every line makes a long batch crawl, and nobody reads
+            # faster than this anyway.
             now = time.monotonic()
             if now - painted > 0.3:
                 painted = now
@@ -169,17 +105,15 @@ def download(links, skips, cookies, outdir, channel, views, limit, min_h, max_h,
     finally:
         current["proc"] = None
 
-    summary = {"state": "finished", "exit_code": proc.returncode, "folder": outdir,
-               "failures": []}
+    summary = {"state": "finished", "exit_code": proc.returncode,
+               "folder": outdir, "failures": []}
     log_json = os.path.join(outdir, "download_log.json")
     if os.path.exists(log_json):
         try:
             with open(log_json, encoding="utf-8") as f:
                 logged = json.load(f)
             summary["run"] = logged.get("run")
-            # Named and explained here rather than left for whoever thinks to go
-            # and open download_log.json.
-            summary["failures"] = failures_in(logged)
+            summary["failures"] = api.failures_in(logged)
         except (OSError, json.JSONDecodeError) as e:
             summary["log_error"] = f"could not read download_log.json: {e}"
 
@@ -191,13 +125,13 @@ def download(links, skips, cookies, outdir, channel, views, limit, min_h, max_h,
             lines.append(f"      {bad.get('error') or 'no error recorded'}")
 
     archive = None
-    if make_zip:
+    if opts["zip"]:
         lines += ["", "Zipping..."]
         yield "\n".join(lines), summary, None, None
-        archive = zip_results(outdir)
+        archive = api.zip_results(outdir)
         if archive:
-            size = os.path.getsize(archive) / (1024 * 1024)
-            lines.append(f"Zipped -> {archive}  ({size:.1f} MB)")
+            lines.append(f"Zipped -> {archive}  "
+                         f"({os.path.getsize(archive) / (1024 * 1024):.1f} MB)")
         else:
             lines.append("Nothing to zip.")
 
@@ -206,7 +140,6 @@ def download(links, skips, cookies, outdir, channel, views, limit, min_h, max_h,
         if path and os.path.exists(path) and not got:
             lines.append(f"({os.path.basename(path)} is at {path} - outside the "
                          f"folders this app may serve, so open it from there.)")
-    summary["served_from"] = ALLOWED_ROOTS
     yield "\n".join(lines), summary, zip_out, json_out
 
 
@@ -216,49 +149,15 @@ def stop():
     if not proc or proc.poll() is not None:
         return "Nothing is running."
     proc.send_signal(signal.SIGINT)
-    return "Sent Ctrl+C — finished videos are kept; it will print its summary."
+    return "Sent Ctrl+C - finished videos are kept; it will print its summary."
 
 
 def preview(channel_url, views, limit, skips):
-    """What a channel link expands to, without downloading anything.
-
-    Worth doing before a bulk run: it is one cheap listing request per 100
-    videos and it tells you exactly what the criteria selected.
-    """
-    if not (channel_url or "").strip():
-        raise gr.Error("Give a channel link to preview.")
-    sys.path.insert(0, HERE)
-    import downloader as d
-    d.MIN_VIEWS = int(views or 0)
-    d.LIMIT = int(limit or 0)
-    d.SKIP_IDS = {v for v in (d.video_id_from_url(l) or
-                              (l if d.BARE_ID_RE.match(l) else None)
-                              for l in (skips or "").split())
-                  if v}
-    url = channel_url.strip().splitlines()[0].strip()
-    if not d.is_channel_url(url):
-        return {"error": "That is not a channel link.", "url": url}
-    found, name, err = d.list_channel_videos(url)
-    return {"channel": name or None, "tab_read": d.channel_videos_url(url),
-            "error": err, "matched": len(found), "videos": found}
-
-
-def api_help(url):
-    """The snippet to drive this from code."""
-    return (
-        "from gradio_client import Client\n"
-        f'c = Client("{url}")\n'
-        "\n"
-        "# preview what a channel would give you\n"
-        'print(c.predict("https://www.youtube.com/@SomeChannel", 1000, 3, "",\n'
-        '                api_name="/preview"))\n'
-        "\n"
-        "# run a batch (same order as the UI fields)\n"
-        'print(c.predict("https://www.youtube.com/@SomeChannel", "", None,\n'
-        f'                "{DEFAULT_OUT}", True, 1000, 3, 720, 1080,\n'
-        '                True, "en", True, True, False, False,\n'
-        '                api_name="/download"))\n'
-    )
+    """What a channel link expands to, without downloading anything."""
+    try:
+        return api.preview_channel(channel_url, views, limit, skips)
+    except ValueError as e:
+        raise gr.Error(str(e))
 
 
 def build_ui():
@@ -267,18 +166,18 @@ def build_ui():
             "# YouTube Downloader\n"
             "Channel links and video links, mixed freely. **Min views** and "
             "**limit** apply to channel links only.\n\n"
-            "Everything here is on the API too — the snippet is printed under the "
-            "notebook cell. `cookies.txt` is optional: add one only if YouTube "
-            "starts asking the runtime to confirm it is not a bot."
+            "Everything here is on the REST API too - the base URL, the key and "
+            "some curl to copy are printed under the notebook cell. "
+            "`cookies.txt` is optional: add one only for private / members-only "
+            "videos, or if YouTube starts asking this runtime to confirm it is "
+            "not a bot."
         )
         with gr.Row():
             with gr.Column(scale=2):
                 links = gr.Textbox(
-                    label="links.txt — one per line",
-                    lines=8,
+                    label="links.txt - one per line", lines=8,
                     placeholder="https://www.youtube.com/@SomeChannel\n"
-                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                )
+                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
                 with gr.Row():
                     views = gr.Number(label="Min views (0 = any)", value=0, precision=0)
                     limit = gr.Number(label="Limit per channel (0 = all)", value=0,
@@ -286,13 +185,11 @@ def build_ui():
                 with gr.Row():
                     min_h = gr.Number(label="Min height", value=720, precision=0)
                     max_h = gr.Number(label="Max height", value=1080, precision=0)
-                channel = gr.Checkbox(label="Group into <Channel>/ folders (--channel)",
-                                      value=True)
+                channel = gr.Checkbox(label="Group into <Channel>/ folders", value=True)
                 with gr.Accordion("Extras, skip list, cookies", open=False):
                     skips = gr.Textbox(
-                        label="skip.txt — links or bare ids never to download",
-                        lines=4)
-                    cookies = gr.File(label="cookies.txt (Netscape format)",
+                        label="skip.txt - links or bare ids never to download", lines=4)
+                    cookies = gr.File(label="cookies.txt (optional, Netscape format)",
                                       type="filepath", file_types=[".txt"])
                     outdir = gr.Textbox(label="Output folder", value=DEFAULT_OUT)
                     with gr.Row():
@@ -320,25 +217,38 @@ def build_ui():
             download,
             inputs=[links, skips, cookies, outdir, channel, views, limit, min_h,
                     max_h, subs, sub_lang, thumbnail, description, verbose, make_zip],
-            outputs=[log, summary, archive, jsonlog],
-            api_name="download",
-        )
+            outputs=[log, summary, archive, jsonlog], api_name="download")
         halt.click(stop, outputs=[log], api_name="stop", cancels=[run])
         peek.click(preview, inputs=[links, views, limit, skips], outputs=[summary],
                    api_name="preview")
     return demo
 
 
-def launch(share=True, **kwargs):
-    """Start the UI and the API, and print the snippet to drive it from code.
+def gradio_client_help(url):
+    """The snippet for Gradio's own predict API, for people already using it."""
+    return (
+        "from gradio_client import Client\n"
+        f'c = Client("{url}")\n'
+        'c.predict("https://www.youtube.com/@SomeChannel", 1000, 3, "",\n'
+        '          api_name="/preview")\n'
+        'c.predict("https://www.youtube.com/@SomeChannel", "", None,\n'
+        f'          "{DEFAULT_OUT}", True, 1000, 3, 720, 1080,\n'
+        '          True, "en", True, True, False, False, api_name="/download")\n'
+    )
 
-    Returns without blocking, so the API help below actually gets printed: a
-    plain launch() blocks the thread outside a notebook, which would make every
-    line after it dead code. __main__ blocks explicitly instead.
+
+def launch(share=True, key=None, auth=True, **kwargs):
+    """Start the UI, mount the REST API on the same URL, and print how to use it.
+
+    Returns without blocking, so everything printed below actually runs: a plain
+    launch() blocks the thread outside a notebook, which would make it all dead
+    code. __main__ blocks explicitly instead.
     """
-    for tool in ("yt-dlp", "ffmpeg"):
-        if not shutil.which(tool):
-            print(f"WARNING: {tool} is not on PATH - run the setup cell first.")
+    missing = [t for t, p in api.tools_present().items() if not p and t != "aria2c"]
+    if missing:
+        print(f"WARNING: not on PATH - run the setup cell first: {', '.join(missing)}")
+
+    api.configure_key(key, enabled=auth)
     demo = build_ui()
     demo.queue()
     kwargs.setdefault("allowed_paths", ALLOWED_ROOTS)
@@ -348,18 +258,25 @@ def launch(share=True, **kwargs):
     # error reporting", which says nothing about what actually broke.
     kwargs.setdefault("show_error", True)
     demo.launch(share=share, **kwargs)
+
+    # Gradio's app only exists once it has launched; its own routes live under
+    # /gradio_api, so /api is free for ours.
+    api.attach(demo.app)
+
     url = (getattr(demo, "share_url", None) or getattr(demo, "local_url", "") or "")
     url = url.rstrip("/")
-    print("\n" + "=" * 68)
-    print("  URL (the UI and the API are both here)")
-    print("=" * 68)
+    print("\n" + "=" * 70)
+    print("  URL - the UI, the REST API and gradio_client all live here")
+    print("=" * 70)
     print(f"\n    {url or '<see the link above>'}\n")
-    print("=" * 68)
-    print("  Drive it from code")
-    print("=" * 68)
-    print(api_help(url or "<the URL above>"), flush=True)
+    print(api.banner(url))
+    print("=" * 70)
+    print("  ...or with gradio_client")
+    print("=" * 70)
+    print(gradio_client_help(url or "<the URL above>"), flush=True)
     return demo
 
 
 if __name__ == "__main__":
-    launch(share="--no-share" not in sys.argv).block_thread()
+    launch(share="--no-share" not in sys.argv,
+           auth="--no-key" not in sys.argv).block_thread()

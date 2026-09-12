@@ -447,8 +447,9 @@ own machine.
 **[Open in Colab](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/Youtube_Downloader_Colab.ipynb)**
 
 1. **Setup** — installs yt-dlp, ffmpeg, aria2c and gradio, and clones this repo.
-2. **Run** — starts the UI and prints a public link plus the snippet to drive it
-   from code.
+   Three optional boxes: **use_drive** (off by default), the Drive folder name,
+   and your own **api_key** if you would rather not use a generated one.
+2. **Run** — starts the UI and prints one public URL plus the key.
 
 ### Worth knowing
 
@@ -460,77 +461,128 @@ downloader recognises that error, gives up on the video at once rather than
 working through all nine retries, and says so in the summary.
 
 **`/content/downloads` is wiped when the runtime disconnects.** For a long run,
-uncomment the `drive.mount` line in cell 1 and set the output folder to
-`/content/drive/MyDrive/yt-downloads`.
+tick **use_drive** in cell 1 and the files go to
+`/content/drive/MyDrive/yt-downloads` instead, which survives. Leave it off and
+nothing touches your Drive — Colab only asks you to sign in if you tick it.
 
 **Nothing is swallowed.** Anything that fails is listed at the end of the log and
 in the API's `failures`, with the reason — see below.
 
 ### The API
 
-`share=True` gives the notebook a public URL, and everything in the UI is on it:
+`share=True` gives the notebook a public URL, and **three things live on it**: the
+web UI, the REST API under `/api`, and Gradio's own predict API. The URL and the
+key are printed under cell 2.
 
-```python
-from gradio_client import Client
-c = Client("https://xxxxxxxx.gradio.live")
+A download is a **job**, not a request — a bulk run outlasts any sensible HTTP
+timeout — so `POST /api/download` hands back an id straight away and the work
+carries on in the background.
 
-# what would a channel give me? one listing request, no downloads
-c.predict("https://www.youtube.com/@SomeChannel", 1000, 3, "", api_name="/preview")
+```bash
+BASE=https://xxxxxxxx.gradio.live/api
+KEY=the-key-cell-2-printed
 
-# run a batch — same order as the UI fields
-c.predict("https://www.youtube.com/@SomeChannel", "", None, "/content/downloads",
-          True, 1000, 3, 720, 1080, True, "en", True, True, False, False,
-          api_name="/download")
+# alive? (the one route that needs no key)
+curl $BASE/ping
 
-c.predict(api_name="/stop")     # Ctrl+C the run; finished videos are kept
+# what would this channel give me? no downloads, one listing request
+curl -H "X-API-Key: $KEY" \
+  "$BASE/preview?channel=https://www.youtube.com/@SomeChannel&views=1000&limit=3"
+
+# start it
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  $BASE/download -d '{"links": "https://www.youtube.com/@SomeChannel",
+                      "views": 1000, "limit": 3, "channel": true}'
+# -> {"job_id": "job_a1b2c3d4", "state": "queued", ...}
+
+# follow it, stop it, fetch the lot
+curl -H "X-API-Key: $KEY" "$BASE/jobs/job_a1b2c3d4?tail=20"
+curl -X POST -H "X-API-Key: $KEY" $BASE/jobs/job_a1b2c3d4/stop
+curl -H "X-API-Key: $KEY" -OJ $BASE/jobs/job_a1b2c3d4/zip
 ```
 
-`/download` streams its log and ends with the run summary, so a long batch can be
-watched rather than waited on. `/preview` is worth a call before a big run: it
-costs one listing request per 100 videos and tells you exactly what `--views` and
-`--limit` selected.
+| | |
+|---|---|
+| `GET /api/ping` | alive, and whether a key is wanted. No key needed. |
+| `GET /api/health` | tools on PATH, default folder, job counts |
+| `GET` `POST /api/preview` | what a channel link expands to. No downloads. |
+| `POST /api/download` | start a job → `job_id` |
+| `GET /api/jobs` | every job |
+| `GET /api/jobs/{id}?tail=N` | state, log tail, summary, failures |
+| `GET /api/jobs/{id}/zip` | the finished folders as one file |
+| `POST /api/jobs/{id}/stop` | Ctrl+C it; finished videos are kept |
+| `DELETE /api/jobs/{id}` | forget a finished job |
 
-The summary names whatever did not come down, so a script never has to go and
-read `download_log.json` to find out:
+The key goes in an `X-API-Key` header or a `?key=` parameter. Set your own in
+cell 1, or let it generate one. `python3 api.py --no-key` turns it off entirely,
+which is only sensible on localhost.
+
+**`POST /api/download` body** — `links` is the only required field, as a string or
+a list. Everything else matches the CLI: `skip`, `outdir`, `channel`, `views`,
+`limit`, `min_height`, `max_height`, `subs`, `sub_lang`, `thumbnail`,
+`description`, `verbose`, `zip`. An unknown field is **rejected**, not ignored, so
+`"view"` for `"views"` fails loudly instead of quietly fetching the whole channel.
+
+**The job tells you what failed**, so nothing has to go and read
+`download_log.json`:
 
 ```jsonc
 {
-  "state": "finished",
-  "folder": "/content/downloads",
-  "run": { "downloaded": 12, "skipped": 3, "failed": 2, "size": "1.9 GB" },
+  "job_id": "job_a1b2c3d4", "state": "finished", "returncode": 0,
+  "summary": { "downloaded": 12, "skipped": 3, "failed": 2, "size": "1.9 GB" },
   "failures": [
     { "url": "...", "status": "unavailable",
-      "error": "[youtube] xxx: This video is unavailable" },
-    { "url": "...", "status": "channel_failed",
-      "error": "ERROR: [youtube:tab] ...: HTTP Error 404: Not Found" }
+      "error": "[youtube] xxx: This video is unavailable" }
   ]
 }
 ```
 
-An empty `failures` means everything asked for arrived.
+An empty `failures` means everything asked for arrived. One thing worth knowing
+while a job runs: the progress bar is suppressed when output is not a terminal, so
+the log gains a line per finished video rather than a live percentage. Pass
+`"verbose": true` if you want yt-dlp's own progress in the job log.
 
-`colab_app.py` drives `downloader.py` as a subprocess, exactly as a terminal
-does — the retry ladder, the resume index, the folder layout and both logs are
-the same. It runs locally too, if you want the UI here:
+### Running the API locally
+
+The same routes, no Colab and no Gradio:
 
 ```bash
-pip install gradio && python3 colab_app.py --no-share
+pip install fastapi uvicorn
+python3 api.py                        # http://127.0.0.1:8000, prints a key
+python3 api.py --port 9000 --key mysecret --outdir ~/Videos/YT
+python3 api.py --host 0.0.0.0         # reachable from your network
+```
+
+`api.py` holds the shared core — writing `links.txt`, building the command line,
+reading the run's JSON log — and `colab_app.py` imports it, so the UI and the API
+cannot drift apart. fastapi is only imported when routes are actually served, so
+`import api` works with nothing but the standard library.
+
+### ...or with gradio_client
+
+```python
+from gradio_client import Client
+c = Client("https://xxxxxxxx.gradio.live")
+c.predict("https://www.youtube.com/@SomeChannel", 1000, 3, "", api_name="/preview")
 ```
 
 ## Tests
 
 ```bash
-python3 test_downloader.py
-python3 test_colab_app.py     # skips itself unless gradio is installed
+python3 test_downloader.py    # 210 - the engine
+python3 test_api.py           # 34  - the API layer, stdlib only
+python3 test_colab_app.py     # 5   - skips itself unless gradio is installed
 ```
 
-210 tests, no network and no downloads. Every test runs twice — once through the
+No network and no downloads. Every test runs twice — once through the
 macOS code path and once through the Windows one — so you can check both from
 either machine. They cover naming rules, video-id matching, the resume index in
 both layouts, channel-link expansion, the skip list, caption-track selection, and
-transcript formatting. A further 18 in `test_colab_app.py` cover the Gradio
-layer — UI values to a command line, and which paths it may hand back — and skip
-themselves when gradio is absent, so the CLI-only machine stays green.
+transcript formatting. `test_api.py` covers the API layer — a request
+normalised and validated, the command line it becomes, the key check, the input
+files, and the failure list — and needs nothing but the standard library, so it
+runs anywhere. `test_colab_app.py` is only what is genuinely Gradio's (which paths
+it may hand back) and skips itself when gradio is absent.
 
 ## Notes
 
