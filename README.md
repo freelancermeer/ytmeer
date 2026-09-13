@@ -524,34 +524,42 @@ the server stops its jobs the same way, so no download is left running unseen.
 
 ## Google Colab
 
-**[Open the notebook](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/Youtube_Downloader_Colab.ipynb)** - two cells:
+**[Open the notebook](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/YouTube_Downloader_API.ipynb)** - two cells:
 
-1. **Setup** installs yt-dlp, ffmpeg, aria2c and gradio, and clones this
-   repo. Tick `use_drive` to keep downloads in Drive; otherwise they go to
+Open it and do **Runtime > Run all**. If Colab warns that the notebook was not
+authored by Google, click **Run anyway**.
+
+1. **Setup** installs yt-dlp, ffmpeg, aria2c and gradio, and clones this repo.
+   Tick `use_drive` to keep downloads in Drive; otherwise they go to
    `/content/downloads`, which is wiped with the runtime. `api_key` is optional:
    leave it blank to keep the saved key. A new key takes effect when cell 2 next
    starts a server, so a server that is still downloading keeps its own.
-2. **Start the API** runs `api.py --share` in the background and prints what to
-   use - nothing is rendered in the cell:
+2. **Start the API** runs `api.py --share` in the background, checks the public
+   link from outside, and prints what to use - nothing is rendered in the cell:
 
    ```
-     public  https://xxxxxxxx.gradio.live/api
-     docs    https://xxxxxxxx.gradio.live/api/docs      (Authorize, then paste the key)
+     public  https://xxxxxxxx.gradio.live/api      (reachable from the internet)
+     docs    https://xxxxxxxx.gradio.live/api/docs      (open it, click Authorize, paste the key)
      local   http://127.0.0.1:8000/api      (for cells in this notebook)
      key     ...
      folder  /content/downloads
    ```
 
-   Give the public URL and the key to code running anywhere else. A cell below it
-   in the notebook can use the example it prints, which uses the `API_URL` and
-   `HEADERS` it sets. The public link lasts as long as the runtime.
+   Below that it prints the example from [API](#api) with your public URL and key
+   already filled in, between copy markers, ready to paste into code anywhere. In a
+   cell of the notebook, `API_URL`, `PUBLIC_URL`, `API_KEY` and `HEADERS` are set too.
+
+   Keep the tab open: the link and the server stop when the runtime disconnects,
+   and the next Run all gives a new URL. The file paths the API returns are on the
+   Colab machine, so code running elsewhere cannot open them - do that part in a
+   cell of the notebook, or tick `use_drive` and read the files from your Drive.
 
    It is safe to re-run. The folder, key and port are saved beside the code, so
    after a runtime restart it finds the server that is still downloading. It
-   replaces the server only when cell 1 pulled newer code or changed the folder or
-   key - and never while that server is still downloading, unless you tick
-   `force_restart`, which stops its jobs first. If the saved port has been taken
-   by something else, it picks another.
+   replaces the server when cell 1 pulled newer code or changed the folder or key,
+   or when the public link has stopped answering - never while that server is
+   still downloading, unless you tick `force_restart`, which stops its jobs first.
+   If the saved port has been taken by something else, it picks another.
 
 Cookies are optional: public videos download without an account.
 
