@@ -3,8 +3,9 @@
 
     python3 api.py                          # http://127.0.0.1:8000
     python3 api.py --port 9000 --outdir ~/Videos/YT
+    python3 api.py --share                  # also a public link, through Gradio (Colab)
 
-Every endpoint, with a form to try each one, is on one page: /docs
+Every endpoint, with a form to try each one, is on one page: /api/docs
 
     GET    /api/ping                        alive?  (no key)
     GET    /api/health                      tools found, default folder, jobs
@@ -69,6 +70,7 @@ DONE = ("ok", "skipped")
 FAILED = ("failed", "unavailable", "channel_failed")
 
 API_KEY = [None]
+PUBLIC_URL = [None]                    # the Gradio share link, when served with --share
 JOBS = {}
 LOCK = threading.RLock()               # the job table and every job's fields
 PREVIEW_LOCK = threading.Lock()        # downloader's module globals, which /preview sets
@@ -600,7 +602,10 @@ def build_app():
             raise HTTPException(404, f"no such job: {job_id}")
         return job
 
+    # Docs live under /api too, so they come along wherever these routes are
+    # mounted - including onto Gradio's app, which has its own /openapi.json.
     app = FastAPI(title="YouTube Downloader API", version=VERSION,
+                  docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None,
                   description="Start downloads, then collect each video as it finishes. "
                               "Click **Authorize** and paste your key to try the endpoints.")
     keyed = [Depends(auth)]
@@ -619,6 +624,7 @@ def build_app():
         with LOCK:
             states = collections.Counter(j["state"] for j in JOBS.values())
         return {"ok": True, "version": VERSION, "code": CODE_VERSION,
+                "public_url": PUBLIC_URL[0],
                 "default_folder": DEFAULT_OUT, "tools": tools_present(),
                 "jobs": dict(states)}
 
@@ -689,17 +695,45 @@ def build_app():
     return app
 
 
-def banner(base, key):
+def banner(base, key, public=None):
     """The details another program needs, and nothing else."""
-    return "\n".join([
+    lines = []
+    if public:
+        lines += [f"  public {public}/api",
+                  f"  docs   {public}/api/docs      (Authorize, then paste the key)"]
+    lines += [
         f"  API    {base}/api",
         f"  key    {key or '(none - authentication is off)'}      header: X-API-Key",
-        f"  docs   {base}/docs",
+    ]
+    if not public:
+        lines.append(f"  docs   {base}/api/docs")
+    lines += [
         "",
         "  POST /api/jobs                       {\"links\": [...], \"views\": 1000, \"limit\": 3}",
         "  GET  /api/jobs/{id}                  progress",
         "  GET  /api/jobs/{id}/videos?since=0   finished videos, as they finish",
-    ])
+    ]
+    return "\n".join(lines)
+
+
+def serve_public(host, port, share=True):
+    """Serve the API on Gradio's server, whose share tunnel gives it a public URL.
+
+    Nothing but a one-line page is Gradio's; the routes and their docs are this
+    module's, added to Gradio's app once it is up (its own endpoints live under
+    /gradio_api, so /api is free). Returns the launched Blocks.
+    """
+    import gradio as gr
+
+    with gr.Blocks(title="YouTube Downloader API") as demo:
+        gr.Markdown("# YouTube Downloader API\n"
+                    "Everything is at [/api/docs](/api/docs): click **Authorize**, "
+                    "paste the key.")
+    demo.launch(share=share, server_name=host, server_port=port, quiet=True,
+                prevent_thread_lock=True)
+    demo.app.include_router(build_app().router)
+    PUBLIC_URL[0] = (getattr(demo, "share_url", None) or "").rstrip("/") or None
+    return demo
 
 
 def main(argv=None):
@@ -714,19 +748,40 @@ def main(argv=None):
     p.add_argument("--new-key", action="store_true", help="replace the saved key")
     p.add_argument("--no-key", action="store_true",
                    help="turn authentication off - only sensible on 127.0.0.1")
+    p.add_argument("--share", action="store_true",
+                   help="also give it a public URL through Gradio's share tunnel (needs gradio)")
     args = p.parse_args(argv)
     if args.outdir:
         DEFAULT_OUT = os.path.abspath(os.path.expanduser(args.outdir))
 
-    import uvicorn
     key = configure_key(args.key, enabled=not args.no_key, rotate=args.new_key)
     missing = [t for t in ("yt-dlp", "ffmpeg", "ffprobe") if not tools_present()[t]]
     if missing:
         print(f"WARNING: not on PATH: {', '.join(missing)}")
-    print(banner(f"http://{args.host}:{args.port}", key), flush=True)
 
     def _terminate(signum, frame):
         raise SystemExit(0)
+
+    if args.share:
+        demo = serve_public(args.host, args.port)
+        print(banner(f"http://{args.host}:{args.port}", key, PUBLIC_URL[0]), flush=True)
+        if not PUBLIC_URL[0]:
+            print("WARNING: Gradio could not open a share link; only the local URL works.")
+        signal.signal(signal.SIGTERM, _terminate)
+        try:
+            demo.block_thread()           # returns on Ctrl+C; SIGTERM raises SystemExit
+        finally:
+            shutdown_jobs()
+            demo.close()
+            # close() leaves the share tunnel process running; only Gradio's own
+            # Ctrl+C handler kills it, and SIGTERM does not go through that.
+            from gradio.tunneling import CURRENT_TUNNELS
+            for tunnel in CURRENT_TUNNELS:
+                tunnel.kill()
+        return
+
+    import uvicorn
+    print(banner(f"http://{args.host}:{args.port}", key), flush=True)
 
     # uvicorn handles SIGTERM itself, then re-raises it once it has shut down; with
     # this as the handler it restores, that becomes SystemExit and the finally runs.

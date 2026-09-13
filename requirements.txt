@@ -18,6 +18,7 @@ curl_cffi>=0.10,<0.16
 #             measured ~4x faster than the built-in downloader (brew install aria2)
 
 # Optional - only for the REST API (api.py). Left commented so a terminal-only
-# install does not pull them in; the Colab notebook installs them itself.
+# install does not pull them in; the Colab notebook installs what it needs.
 #   fastapi
 #   uvicorn
+#   gradio>=6,<7          # only for `api.py --share`, the public link (brings the two above)

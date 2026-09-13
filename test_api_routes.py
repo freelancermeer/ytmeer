@@ -8,6 +8,7 @@ video folders and stream lines on a timer, the way downloader.py does, so the
 tests can watch videos arrive while a job is still running.
 """
 
+import importlib.util
 import json
 import os
 import signal
@@ -18,6 +19,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+import urllib.error
 import urllib.request
 
 try:
@@ -141,12 +143,12 @@ class TestRoutes(unittest.TestCase):
             self.assertEqual(bad.status_code, 401, path)
 
     def test_docs_list_every_endpoint(self):
-        paths = self.c.get("/openapi.json").json()["paths"]
+        paths = self.c.get("/api/openapi.json").json()["paths"]
         self.assertEqual(sorted(paths), sorted([
             "/api/ping", "/api/health", "/api/preview", "/api/jobs",
             "/api/jobs/{job_id}", "/api/jobs/{job_id}/videos",
             "/api/jobs/{job_id}/stop"]))
-        self.assertEqual(self.c.get("/docs").status_code, 200)
+        self.assertEqual(self.c.get("/api/docs").status_code, 200)
 
     # ------------------------------------------------------------ validation
     def test_bad_requests_are_refused_with_the_reason(self):
@@ -396,6 +398,9 @@ class TestRoutes(unittest.TestCase):
     def test_health_reports_the_code_version(self):
         body = self.c.get("/api/health", headers=self.h).json()
         self.assertEqual(body["code"], api.code_version())
+        self.assertIsNone(body["public_url"])                  # not served with --share
+
+
 
     def test_preview_rejects_a_non_channel_link(self):
         r = self.c.get("/api/preview?channel=https://youtu.be/aaaaaaaaaaa", headers=self.h)
@@ -420,6 +425,107 @@ class TestRoutes(unittest.TestCase):
         body = self.c.get("/api/health", headers=self.h).json()
         self.assertEqual(body["default_folder"], api.DEFAULT_OUT)
         self.assertIn("yt-dlp", body["tools"])
+
+
+@unittest.skipUnless(importlib.util.find_spec("gradio"), "gradio is not installed")
+class TestPublicServer(unittest.TestCase):
+    """--share: the same API and docs, on Gradio's server (here without the tunnel)."""
+
+    def test_the_api_and_its_docs_ride_on_gradio(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        api.configure_key("k", persist=False)
+        demo = api.serve_public("127.0.0.1", port, share=False)
+        base = f"http://127.0.0.1:{port}"
+
+        def get(path, key=None):
+            req = urllib.request.Request(base + path, headers={"X-API-Key": key} if key else {})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, r.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                e.close()
+                return e.code, ""
+
+        try:
+            self.assertEqual(get("/api/ping")[0], 200)
+            self.assertEqual(get("/api/health")[0], 401)
+            status, body = get("/api/health", key="k")
+            self.assertEqual(status, 200)
+            self.assertIn("public_url", json.loads(body))
+            status, body = get("/api/openapi.json")
+            paths = json.loads(body)["paths"]
+            self.assertIn("/api/jobs/{job_id}/videos", paths)    # this API's schema,
+            self.assertFalse(any(p.startswith("/gradio_api") for p in paths))  # not Gradio's
+            status, body = get("/api/docs")
+            self.assertEqual(status, 200)
+            self.assertIn("/api/openapi.json", body)
+            self.assertEqual(get("/")[0], 200)                   # Gradio's page is still there
+        finally:
+            demo.close()
+            api.API_KEY[0] = None
+
+    @unittest.skipUnless(os.name == "posix", "process groups")
+    def test_share_mode_serves_then_stops_its_downloads_on_sigterm(self):
+        # The process cell 2 starts: python3 api.py --share. The tunnel is left out
+        # here (nothing public is opened); everything else is the real path.
+        here = os.path.dirname(os.path.abspath(__file__))
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "fake_downloader.py")
+            with open(fake, "w") as f:
+                f.write(FAKE)
+            out = os.path.join(tmp, "out")
+            runner = os.path.join(tmp, "runner.py")
+            with open(runner, "w") as f:
+                f.write(f"import functools, sys\nsys.path.insert(0, {here!r})\nimport api\n"
+                        f"api.DOWNLOADER = {fake!r}\n"
+                        "api.serve_public = functools.partial(api.serve_public, share=False)\n"
+                        f"api.main(['--share', '--port', '{port}', '--no-key', '--outdir', {out!r}])\n")
+            env = dict(os.environ, FAKE_MODE="child", FAKE_N="100", FAKE_DELAY="0.2")
+            server = subprocess.Popen([sys.executable, runner], env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                base = f"http://127.0.0.1:{port}/api"
+                for _ in range(300):
+                    try:
+                        urllib.request.urlopen(base + "/health", timeout=1).close()
+                        break
+                    except urllib.error.HTTPError as e:   # 404 until the routes are added
+                        e.close()
+                        time.sleep(0.1)
+                    except OSError:
+                        time.sleep(0.1)
+                with urllib.request.urlopen(base + "/health", timeout=5) as r:
+                    self.assertIsNone(json.load(r)["public_url"])
+                urllib.request.urlopen(urllib.request.Request(
+                    base + "/jobs", method="POST", data=b'{"links": ["x"]}',
+                    headers={"Content-Type": "application/json"}), timeout=5).close()
+                pid_file = os.path.join(out, "child.pid")
+                for _ in range(100):
+                    if os.path.exists(pid_file):
+                        break
+                    time.sleep(0.1)
+                with open(pid_file) as f:
+                    child = int(f.read())
+                server.send_signal(signal.SIGTERM)
+                server.wait(timeout=40)
+                for _ in range(50):
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    os.kill(child, 9)
+                    self.fail("a download kept running after the share server got SIGTERM")
+                self.assertTrue(os.path.exists(os.path.join(out, "download_log.json")))
+            finally:
+                if server.poll() is None:
+                    server.kill()
 
 
 if __name__ == "__main__":

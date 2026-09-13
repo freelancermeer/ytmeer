@@ -449,10 +449,13 @@ collect each video the moment it finishes while the rest keep downloading.
 ```bash
 python3 api.py                                  # http://127.0.0.1:8000
 python3 api.py --port 9000 --outdir ~/Videos/YT
+python3 api.py --share                          # also a public URL, through Gradio
 ```
 
 It prints the URL and the key. Every endpoint, with a form to try it, is on one
-page: **`/docs`** (click *Authorize* and paste the key).
+page: **`/api/docs`** (click *Authorize* and paste the key). `--share` needs
+`pip install gradio`; it serves the same API and docs on a public `gradio.live`
+link as well - nothing else, no UI.
 
 | | |
 |---|---|
@@ -523,14 +526,25 @@ the server stops its jobs the same way, so no download is left running unseen.
 
 **[Open the notebook](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/Youtube_Downloader_Colab.ipynb)** - two cells:
 
-1. **Setup** installs yt-dlp, ffmpeg, aria2c, fastapi and uvicorn, and clones this
+1. **Setup** installs yt-dlp, ffmpeg, aria2c and gradio, and clones this
    repo. Tick `use_drive` to keep downloads in Drive; otherwise they go to
    `/content/downloads`, which is wiped with the runtime. `api_key` is optional:
    leave it blank to keep the saved key. A new key takes effect when cell 2 next
    starts a server, so a server that is still downloading keeps its own.
-2. **Start the API** runs `api.py` in the background and prints its URL, key and
-   folder. In a cell after it, use the example it prints: that already uses the
-   `API_URL` and `HEADERS` it sets.
+2. **Start the API** runs `api.py --share` in the background and prints what to
+   use - nothing is rendered in the cell:
+
+   ```
+     public  https://xxxxxxxx.gradio.live/api
+     docs    https://xxxxxxxx.gradio.live/api/docs      (Authorize, then paste the key)
+     local   http://127.0.0.1:8000/api      (for cells in this notebook)
+     key     ...
+     folder  /content/downloads
+   ```
+
+   Give the public URL and the key to code running anywhere else. A cell below it
+   in the notebook can use the example it prints, which uses the `API_URL` and
+   `HEADERS` it sets. The public link lasts as long as the runtime.
 
    It is safe to re-run. The folder, key and port are saved beside the code, so
    after a runtime restart it finds the server that is still downloading. It
