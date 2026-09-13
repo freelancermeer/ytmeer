@@ -14,6 +14,7 @@ Optional flags:
     --channel            Group videos by channel (see LAYOUT below)
     --views N            Channel links: only videos with at least N views
     --limit N            Channel links: stop after the newest N matches
+    --links FILE         Read the links from FILE instead of <directory>/links.txt
     --min-height N       Quality floor   (default: 720)
     --max-height N       Quality ceiling (default: 1080)
     --no-subs            Do NOT build transcripts (built by default)
@@ -262,6 +263,7 @@ def read_links(path: str):
 
 LOG_FILE = [None]          # path to the run's text log, once main() sets it
 LOG_JSON = [None]          # path to the run's JSON log
+LOG_JSONL = [None]         # one line per record, written the moment it exists
 LOG_RECORDS = []           # one structured record per video
 
 # Both downloaders report progress, in their own shapes:
@@ -307,8 +309,19 @@ def note(text):
 
 
 def log_record(**fields):
-    """Keep one structured record for the JSON log."""
+    """Keep one structured record for the JSON log, and stream it as a line.
+
+    The JSON log is written once, when the run is over. The .jsonl line goes out
+    the moment the record exists, so whatever is watching - the API - can hand
+    over each video as it lands instead of after the whole batch.
+    """
     LOG_RECORDS.append(fields)
+    if LOG_JSONL[0]:
+        try:
+            with open(LOG_JSONL[0], "a", encoding="utf-8") as f:
+                f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
 
 def write_json_log(summary):
@@ -1420,7 +1433,6 @@ def skip_finished(folder, url, bar=None):
         bar.done(f"SKIP  already downloaded   {name}")
     else:
         print(f"    Already downloaded -> {rel(folder)}/  (skipping)")
-    log_record(url=url, status="skipped", folder=rel(folder))
     if DOWNLOAD_SUBS and not find_transcript_file(folder):
         trans, words = download_subs(folder, url)
         update_info_transcripts(folder, trans, words)
@@ -1447,6 +1459,9 @@ def skip_finished(folder, url, bar=None):
         if wants_counts and info:
             update_info_counts(folder, info)
             note("      + views and subscriber count")
+    # Recorded last: the moment this record exists it is streamed, and whoever
+    # reads it may open the folder straight away - so the backfill must be done.
+    log_record(url=url, status="skipped", folder=rel(folder))
 
 
 def rel(path):
@@ -1630,6 +1645,9 @@ def download_one(url, index, total):
     speed = f"{human_size(size / elapsed)}/s" if elapsed > 0 else "-"
     bar.done(f"OK  {quality:>6} {human_size(size):>9} {human_time(elapsed):>9} "
              f"{speed:>10}  [{got}]  {title}")
+    write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
+               thumbnail=thumb, description=desc, info=info)
+    # Recorded after videoinfo.txt, so the folder is complete when it streams.
     log_record(url=url, title=title, status="ok", quality=quality, folder=rel(folder),
                channel=info.get("channel") or info.get("uploader"),
                views=info.get("view_count"),
@@ -1641,8 +1659,6 @@ def download_one(url, index, total):
                       "words": os.path.basename(words) if words else None,
                       "thumbnail": os.path.basename(thumb) if thumb else None,
                       "description": os.path.basename(desc) if desc else None})
-    write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
-               thumbnail=thumb, description=desc, info=info)
     # Register it so a link repeated later in this same run is skipped too.
     if vid:
         DONE_INDEX[vid] = folder
@@ -1930,6 +1946,8 @@ def parse_args(argv=None):
     p.add_argument("--limit", type=int, default=0, metavar="N",
                    help="Channel links: stop after the newest N matching "
                         "videos (default: the whole channel).")
+    p.add_argument("--links", metavar="FILE",
+                   help="Read the links from FILE instead of <directory>/links.txt.")
     p.add_argument("--no-subs", action="store_true",
                    help="Do NOT build transcripts (transcripts are built by default).")
     p.add_argument("--sub-lang", default="en",
@@ -1971,7 +1989,8 @@ def main():
     args = parse_args()
     DOWNLOAD_DIR  = os.path.expanduser(args.directory)
     COOKIES_FILE  = os.path.join(DOWNLOAD_DIR, "cookies.txt")
-    LINKS_FILE    = os.path.join(DOWNLOAD_DIR, "links.txt")
+    LINKS_FILE    = (os.path.expanduser(args.links) if args.links
+                     else os.path.join(DOWNLOAD_DIR, "links.txt"))
     MIN_HEIGHT    = args.min_height
     MAX_HEIGHT    = args.max_height
     DOWNLOAD_SUBS = not args.no_subs
@@ -2012,6 +2031,11 @@ def main():
 
     LOG_FILE[0] = os.path.join(DOWNLOAD_DIR, "download_log.txt")
     LOG_JSON[0] = os.path.join(DOWNLOAD_DIR, "download_log.json")
+    LOG_JSONL[0] = os.path.join(DOWNLOAD_DIR, "download_log.jsonl")
+    try:
+        open(LOG_JSONL[0], "w", encoding="utf-8").close()   # this run's lines only
+    except OSError:
+        LOG_JSONL[0] = None
     try:
         with open(LOG_FILE[0], "w", encoding="utf-8") as f:
             f.write(f"# run started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")

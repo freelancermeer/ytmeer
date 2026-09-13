@@ -15,6 +15,8 @@ import contextlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1042,6 +1044,95 @@ class PlatformCase:
             args = d.parse_args(["/tmp/x", flag, "1000", "--limit", "3"])
             self.assertEqual((args.views, args.limit), (1000, 3))
 
+
+
+    # ------------------------------------------------------------ --links
+    def test_links_default_to_the_folder_and_can_come_from_a_file(self):
+        self.assertIsNone(d.parse_args(["/tmp/x"]).links)
+        self.assertEqual(d.parse_args(["/tmp/x", "--links", "/tmp/l.txt"]).links, "/tmp/l.txt")
+
+    @unittest.skipUnless(shutil.which("yt-dlp") and shutil.which("ffmpeg"),
+                         "main() refuses to start without yt-dlp and ffmpeg")
+    def test_a_links_file_is_used_and_the_folders_links_txt_left_alone(self):
+        # The API passes each job's links this way, so a hand-kept links.txt in
+        # the download folder is never overwritten.
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as elsewhere:
+            with open(os.path.join(folder, "links.txt"), "w") as f:
+                f.write("https://www.youtube.com/watch?v=handkept123\n")
+            job_links = os.path.join(elsewhere, "job.txt")
+            with open(job_links, "w") as f:
+                f.write("https://www.youtube.com/watch?v=fromfile123\n")
+            script = ("import sys, downloader as d\n"
+                      "seen = []\n"
+                      "d.download_one = lambda url, i, n: (seen.append(url), 'ok')[1]\n"
+                      f"sys.argv = ['downloader.py', {folder!r}, '--links', {job_links!r}]\n"
+                      "d.main()\n"
+                      "print('SEEN', seen)\n")
+            out = subprocess.run([sys.executable, "-c", script], cwd=here,
+                                 capture_output=True, text=True, timeout=60)
+            self.assertIn("SEEN ['https://www.youtube.com/watch?v=fromfile123']",
+                          out.stdout, out.stderr)
+            with open(os.path.join(folder, "links.txt")) as f:
+                self.assertEqual(f.read(), "https://www.youtube.com/watch?v=handkept123\n")
+
+    # --------------------------------------------------------- record stream
+    def test_each_record_is_streamed_the_moment_it_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "download_log.jsonl")
+            saved = (d.LOG_JSONL[0], list(d.LOG_RECORDS))
+            d.LOG_JSONL[0] = path
+            try:
+                d.log_record(url="u1", status="ok", title="\u00dcn\u00efcode \u2713")
+                with open(path, encoding="utf-8") as f:
+                    first = f.read()          # before the second record exists
+                d.log_record(url="u2", status="skipped")
+                with open(path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            finally:
+                d.LOG_JSONL[0] = saved[0]
+                d.LOG_RECORDS[:] = saved[1]
+        self.assertEqual(json.loads(first)["title"], "\u00dcn\u00efcode \u2713")
+        self.assertEqual([json.loads(l)["url"] for l in lines], ["u1", "u2"])
+
+    def test_no_stream_is_written_when_logging_is_not_set_up(self):
+        saved = (d.LOG_JSONL[0], list(d.LOG_RECORDS))
+        d.LOG_JSONL[0] = None
+        try:
+            d.log_record(url="u", status="ok")           # must not raise
+        finally:
+            d.LOG_JSONL[0] = saved[0]
+            d.LOG_RECORDS[:] = saved[1]
+
+    def test_a_skipped_video_is_recorded_only_after_its_backfill(self):
+        # A reader acts on the streamed line at once, so the folder has to be
+        # complete by then - the transcript backfill must come first.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "Vid")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "videoinfo.txt"), "w", encoding="utf-8") as f:
+                f.write("Title: V\nLink: https://youtu.be/aaaaaaaaaaa\nViews: 1\n"
+                        "Subscribers: 1\nUploaded: NA\nCategory: NA\nStatus:  OK\n")
+            d.DOWNLOAD_DIR = tmp
+            d.SAVE_THUMBNAIL = d.SAVE_DESCRIPTION = False
+            before = len(d.LOG_RECORDS)
+            records_during_backfill = []
+            original = d.download_subs
+
+            def backfill(folder_, url_):
+                records_during_backfill.append(len(d.LOG_RECORDS))
+                return None, None
+
+            d.download_subs = backfill
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    d.skip_finished(folder, "https://youtu.be/aaaaaaaaaaa")
+                after = len(d.LOG_RECORDS)
+            finally:
+                d.download_subs = original
+                del d.LOG_RECORDS[before:]
+        self.assertEqual(records_during_backfill, [before])   # nothing yet
+        self.assertEqual(after, before + 1)                    # then exactly one
 
 
 class TestMacOS(PlatformCase, unittest.TestCase):

@@ -279,6 +279,9 @@ Two files are written into the folder you point at:
 - **`download_log.json`** — the run's totals, then a record per video: url,
   title, status, quality, bytes, seconds, folder, the files written, and the
   error if there was one. Easy to read from another script.
+- **`download_log.jsonl`** — the same records, one line each, written the moment
+  a video is done rather than when the run ends. This is what the API's
+  `/videos` endpoint reads.
 
 Redirecting the output to a file gives you the per-video lines and nothing else
 — the bar is only drawn when there is a terminal to rewrite. `--verbose` puts
@@ -438,151 +441,115 @@ differences are handled automatically, so the Mac path stays exactly as it is
 On Windows, install the requirements the same way, and make sure `node`,
 `ffmpeg`, and (optionally) `aria2c` are on `PATH`.
 
-## Google Colab
+## API
 
-There is a 2-cell notebook that runs the whole thing in Colab behind a Gradio UI
-and an HTTP API, for when you want to fire off a bulk run without tying up your
-own machine.
-
-**[Open in Colab](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/Youtube_Downloader_Colab.ipynb)**
-
-1. **Setup** — installs yt-dlp, ffmpeg, aria2c and gradio, and clones this repo.
-   Three optional boxes: **use_drive** (off by default), the Drive folder name,
-   and your own **api_key** if you would rather not use a generated one.
-2. **Run** — starts the UI and prints one public URL plus the key.
-
-### Worth knowing
-
-**Cookies are optional.** Public videos come down on Colab without an account.
-Upload a `cookies.txt` under *Extras, skip list, cookies* only for private,
-members-only or age-restricted videos — or if YouTube starts asking the runtime to
-confirm it is not a bot, which can happen on a datacenter IP. If it ever does, the
-downloader recognises that error, gives up on the video at once rather than
-working through all nine retries, and says so in the summary.
-
-**`/content/downloads` is wiped when the runtime disconnects.** For a long run,
-tick **use_drive** in cell 1 and the files go to
-`/content/drive/MyDrive/yt-downloads` instead, which survives. Leave it off and
-nothing touches your Drive — Colab only asks you to sign in if you tick it.
-
-**Nothing is swallowed.** Anything that fails is listed at the end of the log and
-in the API's `failures`, with the reason — see below.
-
-### The API
-
-`share=True` gives the notebook a public URL, and **three things live on it**: the
-web UI, the REST API under `/api`, and Gradio's own predict API. The URL and the
-key are printed under cell 2.
-
-A download is a **job**, not a request — a bulk run outlasts any sensible HTTP
-timeout — so `POST /api/download` hands back an id straight away and the work
-carries on in the background.
+A small REST API so other code can drive the downloader: start a batch, then
+collect each video the moment it finishes while the rest keep downloading.
 
 ```bash
-BASE=https://xxxxxxxx.gradio.live/api
-KEY=the-key-cell-2-printed
-
-# alive? (the one route that needs no key)
-curl $BASE/ping
-
-# what would this channel give me? no downloads, one listing request
-curl -H "X-API-Key: $KEY" \
-  "$BASE/preview?channel=https://www.youtube.com/@SomeChannel&views=1000&limit=3"
-
-# start it
-curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
-  $BASE/download -d '{"links": "https://www.youtube.com/@SomeChannel",
-                      "views": 1000, "limit": 3, "channel": true}'
-# -> {"job_id": "job_a1b2c3d4", "state": "queued", ...}
-
-# follow it, stop it, fetch the lot
-curl -H "X-API-Key: $KEY" "$BASE/jobs/job_a1b2c3d4?tail=20"
-curl -X POST -H "X-API-Key: $KEY" $BASE/jobs/job_a1b2c3d4/stop
-curl -H "X-API-Key: $KEY" -OJ $BASE/jobs/job_a1b2c3d4/zip
+python3 api.py                                  # http://127.0.0.1:8000
+python3 api.py --port 9000 --outdir ~/Videos/YT
 ```
+
+It prints the URL and the key. Every endpoint, with a form to try it, is on one
+page: **`/docs`** (click *Authorize* and paste the key).
 
 | | |
 |---|---|
-| `GET /api/ping` | alive, and whether a key is wanted. No key needed. |
-| `GET /api/health` | tools on PATH, default folder, job counts |
-| `GET` `POST /api/preview` | what a channel link expands to. No downloads. |
-| `POST /api/download` | start a job → `job_id` |
-| `GET /api/jobs` | every job |
-| `GET /api/jobs/{id}?tail=N` | state, log tail, summary, failures |
-| `GET /api/jobs/{id}/zip` | the finished folders as one file |
-| `POST /api/jobs/{id}/stop` | Ctrl+C it; finished videos are kept |
+| `GET /api/ping` | alive, and `busy` while a job runs (no key) |
+| `GET /api/health` | tools found, default folder, jobs |
+| `GET /api/preview?channel=URL&views=1000&limit=3` | what a channel link would download |
+| `POST /api/jobs` | start downloading, returns `job_id` |
+| `GET /api/jobs` | all jobs |
+| `GET /api/jobs/{id}` | state, progress, summary, failures |
+| `GET /api/jobs/{id}/videos?since=N` | finished videos, as they finish |
+| `POST /api/jobs/{id}/stop` | Ctrl+C it; finished videos stay |
 | `DELETE /api/jobs/{id}` | forget a finished job |
 
-The key goes in an `X-API-Key` header or a `?key=` parameter. Set your own in
-cell 1, or let it generate one. `python3 api.py --no-key` turns it off entirely,
-which is only sensible on localhost.
+Send the key as an `X-API-Key` header. A generated key is saved in `.api_key`, so
+a restart keeps it; `--new-key` replaces it.
 
-**`POST /api/download` body** — `links` is the only required field, as a string or
-a list. Everything else matches the CLI: `skip`, `outdir`, `channel`, `views`,
-`limit`, `min_height`, `max_height`, `subs`, `sub_lang`, `thumbnail`,
-`description`, `verbose`, `zip`. An unknown field is **rejected**, not ignored, so
-`"view"` for `"views"` fails loudly instead of quietly fetching the whole channel.
+`POST /api/jobs` takes `links` (a list, or one per line: video links, channel
+links or both) plus any of the command-line options: `views`, `limit`, `channel`,
+`min_height`, `max_height`, `subs`, `sub_lang`, `thumbnail`, `description`,
+`verbose`, `outdir`, `skip`. An unknown field is refused, so a typo fails instead
+of quietly fetching a whole channel. `outdir` is absolute, or relative to the
+default folder. `skip` replaces the folder's `skip.txt`; leave it out to keep the
+one already there. The links go straight to the downloader, so a `links.txt` you
+keep in that folder is left alone.
 
-**The job tells you what failed**, so nothing has to go and read
-`download_log.json`:
-
-```jsonc
-{
-  "job_id": "job_a1b2c3d4", "state": "finished", "returncode": 0,
-  "summary": { "downloaded": 12, "skipped": 3, "failed": 2, "size": "1.9 GB" },
-  "failures": [
-    { "url": "...", "status": "unavailable",
-      "error": "[youtube] xxx: This video is unavailable" }
-  ]
-}
-```
-
-An empty `failures` means everything asked for arrived. One thing worth knowing
-while a job runs: the progress bar is suppressed when output is not a terminal, so
-the log gains a line per finished video rather than a live percentage. Pass
-`"verbose": true` if you want yt-dlp's own progress in the job log.
-
-### Running the API locally
-
-The same routes, no Colab and no Gradio:
-
-```bash
-pip install fastapi uvicorn
-python3 api.py                        # http://127.0.0.1:8000, prints a key
-python3 api.py --port 9000 --key mysecret --outdir ~/Videos/YT
-python3 api.py --host 0.0.0.0         # reachable from your network
-```
-
-`api.py` holds the shared core — writing `links.txt`, building the command line,
-reading the run's JSON log — and `colab_app.py` imports it, so the UI and the API
-cannot drift apart. fastapi is only imported when routes are actually served, so
-`import api` works with nothing but the standard library.
-
-### ...or with gradio_client
+Collecting videos as they finish:
 
 ```python
-from gradio_client import Client
-c = Client("https://xxxxxxxx.gradio.live")
-c.predict("https://www.youtube.com/@SomeChannel", 1000, 3, "", api_name="/preview")
+import requests, time
+
+API, H = "http://127.0.0.1:8000/api", {"X-API-Key": "your-key"}
+
+def call(method, path, **kw):
+    r = requests.request(method, API + path, headers=H, timeout=60, **kw)
+    if not r.ok:
+        raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
+    return r.json()
+
+job = call("POST", "/jobs", json={"links": ["https://www.youtube.com/@SomeChannel"],
+                                  "views": 1000, "limit": 3})
+since = 0
+while True:
+    page = call("GET", f"/jobs/{job['job_id']}/videos", params={"since": since})
+    for v in page["videos"]:
+        if v["status"] in ("ok", "skipped"):      # skipped = already on disk
+            analyse(v["files"]["video"], v["files"]["transcript"])
+    since = page["next"]
+    if page["done"]:
+        break
+    time.sleep(5)
+
+job = call("GET", f"/jobs/{job['job_id']}")
+print(job["state"], job["error"], job["failures"])
 ```
+
+A video is handed over once its folder is complete, with absolute paths in
+`files`: `video`, `transcript`, `words`, `thumbnail`, `description`, `info`
+(`None` when absent). A failed one has `status` and `error` and no files - and
+can come back later as `ok`, because a run retries its failures once at the end.
+The job's `failures` lists only what finally did not come down.
+
+A job ends `finished`, `stopped`, or `error` (the downloader crashed or could not
+start; the reason is in `error`). `POST /stop` interrupts the downloader and the
+yt-dlp it is running, like Ctrl+C in a terminal; finished videos stay. Stopping
+the server stops its jobs the same way, so no download is left running unseen.
+
+## Google Colab
+
+**[Open the notebook](https://colab.research.google.com/github/freelancermeer/ytmeer/blob/main/Youtube_Downloader_Colab.ipynb)** - two cells:
+
+1. **Setup** installs yt-dlp, ffmpeg, aria2c, fastapi and uvicorn, and clones this
+   repo. Tick `use_drive` to keep downloads in Drive; otherwise they go to
+   `/content/downloads`, which is wiped with the runtime. `api_key` is optional:
+   leave it blank to keep the saved key. A new key takes effect when cell 2 next
+   starts a server, so a server that is still downloading keeps its own.
+2. **Start the API** runs `api.py` in the background and prints its URL, key and
+   folder. In a cell after it, use the example it prints: that already uses the
+   `API_URL` and `HEADERS` it sets.
+
+   It is safe to re-run. The folder, key and port are saved beside the code, so
+   after a runtime restart it finds the server that is still downloading. It
+   replaces the server only when cell 1 pulled newer code or changed the folder or
+   key - and never while that server is still downloading, unless you tick
+   `force_restart`, which stops its jobs first. If the saved port has been taken
+   by something else, it picks another.
+
+Cookies are optional: public videos download without an account.
 
 ## Tests
 
 ```bash
-python3 test_downloader.py    # 210 - the engine
-python3 test_api.py           # 34  - the API layer, stdlib only
-python3 test_colab_app.py     # 5   - skips itself unless gradio is installed
+python3 test_downloader.py    # the engine, through both the macOS and Windows code paths
+python3 test_api.py           # the API's logic - standard library only
+python3 test_api_routes.py    # the API over HTTP against a stand-in downloader (fastapi + httpx)
 ```
 
-No network and no downloads. Every test runs twice — once through the
-macOS code path and once through the Windows one — so you can check both from
-either machine. They cover naming rules, video-id matching, the resume index in
-both layouts, channel-link expansion, the skip list, caption-track selection, and
-transcript formatting. `test_api.py` covers the API layer — a request
-normalised and validated, the command line it becomes, the key check, the input
-files, and the failure list — and needs nothing but the standard library, so it
-runs anywhere. `test_colab_app.py` is only what is genuinely Gradio's (which paths
-it may hand back) and skips itself when gradio is absent.
+No network and no downloads.
 
 ## Notes
 
