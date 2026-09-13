@@ -26,3 +26,6 @@ __pycache__/
 .api_port
 .api_outdir
 api.log
+
+# Gradio writes this when api.py --share runs from the repo folder
+.gradio/
