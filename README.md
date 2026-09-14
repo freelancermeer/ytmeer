@@ -33,6 +33,7 @@ python3 downloader.py "/path/to/your folder" --channel
 | `--max-height N` | Quality ceiling | `1080` |
 | `--views N` | Channel links only: skip videos under N views | no floor |
 | `--limit N` | Channel links only: stop after the newest N matches | whole channel |
+| `--days N` | Only download videos uploaded in the last N days | 0 (any time) |
 | `--no-subs` | Skip the transcripts | transcripts on |
 | `--sub-lang CODE` | Transcript language | `en` |
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
@@ -62,6 +63,7 @@ passes straight through untouched.
 |---|---|
 | `--views N` | Keep only videos with at least N views. No `--views` keeps every video. |
 | `--limit N` | Stop after the newest N videos that match. **No `--limit` means the whole channel.** |
+| `--days N` | Stop looking if videos are older than N days. **No `--days` means any time.** |
 
 Details worth knowing:
 

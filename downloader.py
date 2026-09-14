@@ -98,6 +98,7 @@ SAVE_DESCRIPTION = True    # also save the video description as .txt
 VERBOSE        = False     # True = show yt-dlp's full output instead of a bar
 MIN_VIEWS      = 0         # channel links: view floor (0 = take every video)
 LIMIT          = 0         # channel links: newest N matches each (0 = no cap)
+DAYS           = 0         # filter by last N days (0 = any time)
 SKIP_FILE      = "skip.txt"
 SKIP_IDS       = set()     # video ids listed in skip.txt - never downloaded
 
@@ -649,7 +650,8 @@ PERMANENT_ERRORS = ("private video", "incomplete youtube id", "video is unavaila
                     "removed by the uploader", "has been terminated",
                     "sign in to confirm your age", "members-only",
                     "is not a valid url", "unsupported url",
-                    "video has been removed", "copyright claim") + BOT_GATE_ERRORS
+                    "video has been removed", "copyright claim",
+                    "upload date is not in range") + BOT_GATE_ERRORS
 
 
 def failure_status(error_text):
@@ -806,6 +808,8 @@ def base_cmd():
         cmd += ["--extractor-args",
                 f"youtubepot-bgutilscript:script_path={BGUTIL_SCRIPT}"]
     cmd += windows_flags()
+    if DAYS > 0:
+        cmd += ["--dateafter", f"today-{DAYS}days"]
     return cmd + cookie_flags()
 
 
@@ -1452,6 +1456,10 @@ def fetch_info_once(url: str, extra_flags=()):
     if out.returncode != 0:
         msg = out.stderr.strip().splitlines()
         return None, (msg[-1] if msg else "Failed to fetch video info")
+    
+    if "not in range" in out.stderr.lower() or "dateafter" in out.stderr.lower():
+        return None, "upload date is not in range"
+
     try:
         return json.loads(out.stdout), None
     except json.JSONDecodeError:
@@ -1823,6 +1831,12 @@ def download_one(url, index, total):
     # If we couldn't even fetch info, record the error and stop here.
     if info is None:
         err = (err or "Failed to fetch video info").replace("ERROR:", "").strip()
+        
+        if "not in range" in err.lower() or "dateafter" in err.lower():
+            bar.done("SKIP  (older than requested days)")
+            log_record(url=url, status="skipped", error="older than requested days")
+            return "skip"
+
         note(f"    ! Failed to fetch info: {err}")
         bar.done(f"FAIL  {err}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
@@ -1852,6 +1866,8 @@ def download_one(url, index, total):
           + sub_flags(sub_lang, sub_source) + thumb_flags() + extra_flags + ["--", url]
         text = run_streaming(cmd, bar)
         if last_returncode[0] == 0:
+            if "not in range" in (text or "").lower() or "dateafter" in (text or "").lower():
+                return "upload date is not in range"
             return None
         lines = re.split(r"[\r\n]+", text or "")
         err = next((l for l in reversed(lines) if "ERROR" in l),
@@ -1863,6 +1879,12 @@ def download_one(url, index, total):
     started = time.monotonic()
     err = run_with_retries(attempt)
     elapsed = time.monotonic() - started
+
+    if err == "upload date is not in range":
+        bar.done("SKIP  (older than requested days)")
+        log_record(url=url, status="skipped", error="older than requested days")
+        shutil.rmtree(folder, ignore_errors=True)
+        return "skip"
 
     if err:
         note(f"    ! Download failed: {err}")
@@ -2220,6 +2242,8 @@ def parse_args(argv=None):
     p.add_argument("--limit", type=int, default=0, metavar="N",
                    help="Channel links: stop after the newest N matching "
                         "videos (default: the whole channel).")
+    p.add_argument("--days", type=int, default=0, metavar="N",
+                   help="Only download videos uploaded in the last N days (0 = any time).")
     p.add_argument("--cookies", metavar="FILE",
                    help="Use this cookies.txt instead of <directory>/cookies.txt.")
     p.add_argument("--links", metavar="FILE",
@@ -2277,7 +2301,7 @@ def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
-    global MIN_VIEWS, LIMIT, SKIP_FILE, SKIP_IDS
+    global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS
 
     use_utf8_output()
     args = parse_args()
@@ -2298,6 +2322,7 @@ def main():
     VERBOSE       = args.verbose
     MIN_VIEWS     = args.views
     LIMIT         = args.limit
+    DAYS          = args.days
     FORMAT        = build_format()
     SKIP_FILE     = os.path.join(DOWNLOAD_DIR, "skip.txt")
     SKIP_IDS      = read_skips(SKIP_FILE)
@@ -2311,9 +2336,10 @@ def main():
     print(f"  Speed   : {'aria2c, 16 connections' if ARIA2C else 'built-in (install aria2c for a big speedup)'}")
     print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found - some videos may fail with 403'}")
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
-    if MIN_VIEWS or LIMIT:
+    if MIN_VIEWS or LIMIT or DAYS:
         print(f"  Channels: {f'>= {MIN_VIEWS:,} views' if MIN_VIEWS else 'every video'}"
-              f"{f', newest {LIMIT} each' if LIMIT else ''}")
+              f"{f', newest {LIMIT} each' if LIMIT else ''}"
+              f"{f', last {DAYS} days' if DAYS else ''}")
     print(f"  Skip    : {f'skip.txt ({len(SKIP_IDS)} video(s))' if SKIP_IDS else 'none'}")
     print(f"  Transcript: {'yes (' + SUB_LANG + ', trans_ + words_ .txt)' if DOWNLOAD_SUBS else 'no'}")
     extras = [n for n, on in (("thumbnail", SAVE_THUMBNAIL),

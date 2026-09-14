@@ -162,14 +162,14 @@ def key_ok(supplied):
 
 # ----------------------------------------------------------------- requests
 DEFAULTS = {
-    "skip": None, "outdir": None, "channel": True, "views": 0, "limit": 0,
+    "skip": None, "outdir": None, "channel": True, "views": 0, "limit": 0, "days": 0,
     "min_height": 720, "max_height": 1080, "subs": True, "sub_lang": "en",
     "thumbnail": True, "description": True, "verbose": False,
 }
-INT_FIELDS = ("views", "limit", "min_height", "max_height")
-# Upper bounds, so no value reaches a JSON encoder (Gradio's orjson) that cannot
+INT_FIELDS = ("views", "limit", "days", "min_height", "max_height")
+# Limits to keep integer bounds safe for Pydantic v1 vs v2, and SQLite's ability to
 # write it - a limit of 10**20 used to turn GET /api/jobs into a 500 for everyone.
-INT_MAX = {"views": 10**12, "limit": 10**6, "min_height": 10**4, "max_height": 10**4}
+INT_MAX = {"views": 10**12, "limit": 10**6, "days": 10**5, "min_height": 10**4, "max_height": 10**4}
 SUB_LANG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,34}$")   # anchored for the schema too
 BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose")
 
@@ -265,6 +265,8 @@ def build_argv(outdir, opts, links_file=None):
         argv += ["--views", str(opts["views"])]
     if opts["limit"] > 0:
         argv += ["--limit", str(opts["limit"])]
+    if opts.get("days", 0) > 0:
+        argv += ["--days", str(opts["days"])]
     argv += ["--min-height", str(opts["min_height"]),
              "--max-height", str(opts["max_height"])]
     argv += ["--sub-lang", opts["sub_lang"]] if opts["subs"] else ["--no-subs"]
@@ -778,6 +780,8 @@ def build_app():
                            "skip videos under this many views. 0 = no floor.")
         limit: int = Field(0, ge=0, le=INT_MAX["limit"], description="Channel links only: "
                            "newest N matches per channel. 0 = the whole channel.")
+        days: int = Field(0, ge=0, le=INT_MAX["days"], description="Only download videos "
+                          "uploaded in the last N days. 0 = any time.")
         min_height: int = Field(720, ge=1, le=INT_MAX["min_height"],
                                 description="Quality floor, in pixels.")
         max_height: int = Field(1080, ge=1, le=INT_MAX["max_height"],
