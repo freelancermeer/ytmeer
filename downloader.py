@@ -584,6 +584,9 @@ def is_permanent(error_text):
 MAX_ATTEMPTS = 3
 RETRY_DELAYS = (10, 30)
 
+# What yt-dlp says when nothing lies between --min-height and --max-height.
+FORMAT_GONE = "requested format is not available"
+
 
 def mark_incomplete(folder):
     """Rename media left by a failed download so it can never be mistaken for a
@@ -1499,6 +1502,7 @@ def run_with_retries(attempt):
     """
     err = None
     for round_no in range(1, MAX_ATTEMPTS + 1):
+        round_errors = []
         for label, flags, fast in download_routes():
             if err:
                 note(f"    ! {err}")
@@ -1510,6 +1514,13 @@ def run_with_retries(attempt):
                 return None
             if is_permanent(err):
                 return err                     # retrying cannot help
+            round_errors.append(err)
+        # Every route - the PO-token client included, which can see formats the
+        # default one cannot - says nothing exists in the height range. That is the
+        # video, not a hiccup: waiting 10 s and 30 s and asking twice more cannot add
+        # a format, and on a bulk run it cost three minutes a video.
+        if round_errors and all(FORMAT_GONE in e.lower() for e in round_errors):
+            return err
         if round_no < MAX_ATTEMPTS:
             delay = RETRY_DELAYS[min(round_no - 1, len(RETRY_DELAYS) - 1)]
             note(f"    ! {err}")

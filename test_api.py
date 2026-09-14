@@ -59,10 +59,34 @@ class TestNormalizeRequest(unittest.TestCase):
         self.assertEqual(api.normalize_request({"links": "x", "skip": ["a", "b"]})["skip"], "a\nb")
         self.assertEqual(api.normalize_request({"links": "x", "skip": ""})["skip"], "")
 
-    def test_the_folder_is_made_absolute(self):
-        opts = api.normalize_request({"links": "x", "outdir": "~/somewhere"})
-        self.assertTrue(os.path.isabs(opts["outdir"]))
-        self.assertNotIn("~", opts["outdir"])
+    def test_a_folder_outside_the_download_folder_is_refused(self):
+        # A job writes into its folder and the file endpoints read from it, so a
+        # caller-chosen /etc would hand out the machine's files.
+        for bad in ("~/somewhere", "/etc", "../elsewhere", "a/../../b"):
+            with self.assertRaises(ValueError, msg=bad):
+                api.normalize_request({"links": "x", "outdir": bad})
+
+    def test_numbers_are_bounded(self):
+        # Gradio's JSON encoder cannot write integers past 64 bits: a limit of
+        # 10**20 used to make GET /api/jobs a 500 for every caller.
+        for field in ("views", "limit", "min_height", "max_height"):
+            with self.assertRaises(ValueError, msg=field):
+                api.normalize_request({"links": "x", field: 10**20})
+        opts = api.normalize_request({"links": "x", "views": 10**12, "limit": 10**6})
+        self.assertEqual((opts["views"], opts["limit"]), (10**12, 10**6))
+
+    def test_comment_lines_are_dropped_and_all_comments_is_no_links(self):
+        opts = api.normalize_request({"links": "# channels\nhttps://youtu.be/aaaaaaaaaaa\n  # later"})
+        self.assertEqual(opts["links"], "https://youtu.be/aaaaaaaaaaa")
+        with self.assertRaises(ValueError):
+            api.normalize_request({"links": "# only a comment\n#another"})
+
+    def test_sub_lang_must_look_like_a_language_code(self):
+        for good in ("en", "pt-BR", "zh-Hans", "en_US"):
+            self.assertEqual(api.normalize_request({"links": "x", "sub_lang": good})["sub_lang"], good)
+        for bad in ("-x", "--no-subs", "en us", "en;rm", "a" * 40):
+            with self.assertRaises(ValueError, msg=bad):
+                api.normalize_request({"links": "x", "sub_lang": bad})
 
     def test_a_relative_folder_goes_inside_the_default_one(self):
         # Not wherever the server was started: on Colab that is not the Drive
@@ -78,8 +102,12 @@ class TestNormalizeRequest(unittest.TestCase):
     def test_one_folder_spelled_two_ways_is_one_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "a"))
-            one = api.normalize_request({"links": "x", "outdir": os.path.join(tmp, "a")})
-            two = api.normalize_request({"links": "x", "outdir": os.path.join(tmp, "a", "..", "a")})
+            saved, api.DEFAULT_OUT = api.DEFAULT_OUT, tmp
+            try:
+                one = api.normalize_request({"links": "x", "outdir": os.path.join(tmp, "a")})
+                two = api.normalize_request({"links": "x", "outdir": "a/../a"})
+            finally:
+                api.DEFAULT_OUT = saved
             self.assertEqual(one["outdir"], two["outdir"])
 
 
@@ -278,9 +306,149 @@ class TestReadVideos(unittest.TestCase):
                 f.write(whole.encode() + cut)
             self.assertEqual([v["url"] for v in api.read_videos(tmp)], ["a"])
 
+    def test_a_skipped_video_gets_its_quality_from_videoinfo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = self.make_video(tmp, "Ch/A", "A")
+            with open(os.path.join(folder, "videoinfo.txt"), "a") as f:
+                f.write("Quality: 1080p\n")
+            self.write_stream(tmp, [{"url": "a", "status": "skipped", "folder": "Ch/A"}])
+            self.assertEqual(api.read_videos(tmp)[0]["quality"], "1080p")
+
+    def test_a_failed_video_does_not_borrow_unknown_title(self):
+        # Its videoinfo.txt says "Unknown Title"; the job's failures say null. The
+        # two must agree.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "video_x"))
+            with open(os.path.join(tmp, "video_x", "videoinfo.txt"), "w") as f:
+                f.write("Title:   Unknown Title\nStatus:  ERROR\n")
+            self.write_stream(tmp, [{"url": "x", "status": "unavailable", "folder": "video_x"}])
+            self.assertIsNone(api.read_videos(tmp)[0]["title"])
+
     def test_no_stream_yet_means_no_videos(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(api.read_videos(tmp), [])
+
+
+class TestJobFile(unittest.TestCase):
+    """What the download endpoint may hand out - and above all what it must not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "out")
+        self.put("Ch/Vid/videoinfo.txt", "Ch/Vid/Vid.mp4", "Ch/Vid/trans_Vid.txt",
+                 "Ch/Vid/Vid.f137.mp4.part", "Ch/Vid/Vid.f137.mp4", "Ch/Vid/Vid.temp.mp4",
+                 "Ch/Vid/INCOMPLETE_old.mp4", "Ch/Vid/incomplete_other.mp4",
+                 "Ch/Vid/Vid.mp4.aria2", "Ch/Vid/cookies.txt",
+                 "cookies.txt", "links.txt", "download_log.json", ".api_key")
+        with open(os.path.join(self.tmp.name, "secret.txt"), "w") as f:
+            f.write("outside")
+
+    def put(self, *names):
+        for name in names:
+            path = os.path.join(self.root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_finished_file_is_served(self):
+        self.assertTrue(api.job_file(self.root, "Ch/Vid/Vid.mp4").endswith("Vid.mp4"))
+
+    def test_nothing_outside_the_folder(self):
+        for bad in ("../secret.txt", "Ch/../../secret.txt", os.path.join(self.tmp.name, "secret.txt"),
+                    "/etc/passwd", ".", "Ch/.."):
+            with self.assertRaises(PermissionError, msg=bad):
+                api.job_file(self.root, bad)
+
+    def test_a_symlink_pointing_out_is_refused(self):
+        os.symlink(os.path.join(self.tmp.name, "secret.txt"), os.path.join(self.root, "Ch", "Vid", "link.txt"))
+        with self.assertRaises(PermissionError):
+            api.job_file(self.root, "Ch/Vid/link.txt")
+
+    def test_only_files_inside_a_video_folder(self):
+        for bad in ("cookies.txt", "COOKIES.TXT", "links.txt", "download_log.json", ".api_key"):
+            with self.assertRaises(PermissionError, msg=bad):
+                api.job_file(self.root, bad)
+
+    def test_private_and_unfinished_files_are_refused(self):
+        for bad in ("Ch/Vid/cookies.txt", "Ch/Vid/Vid.f137.mp4.part", "Ch/Vid/Vid.f137.mp4",
+                    "Ch/Vid/Vid.temp.mp4", "Ch/Vid/INCOMPLETE_old.mp4",
+                    "Ch/Vid/incomplete_other.mp4", "Ch/Vid/Vid.mp4.aria2"):
+            with self.assertRaises(PermissionError, msg=bad):
+                api.job_file(self.root, bad)
+
+    def test_awkward_titles_are_still_served(self):
+        # Folder and file take the video's title, so a title may start with a dot
+        # or end in something that looks like a temporary suffix.
+        self.put(".NET tutorial/videoinfo.txt", ".NET tutorial/.NET tutorial.mp4",
+                 "My.temp/videoinfo.txt", "My.temp/My.temp.mp4", "My.temp/My.temp.temp.mp4")
+        self.assertTrue(api.job_file(self.root, ".NET tutorial/.NET tutorial.mp4"))
+        self.assertTrue(api.job_file(self.root, "My.temp/My.temp.mp4"))
+        with self.assertRaises(PermissionError):
+            api.job_file(self.root, "My.temp/My.temp.temp.mp4")
+
+    def test_a_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            api.job_file(self.root, "Ch/Vid/nope.mp4")
+
+    def test_the_listing_offers_only_what_can_be_downloaded(self):
+        paths = [f["path"] for f in api.list_files(self.root, "job_x")]
+        self.assertEqual(paths, ["Ch/Vid/Vid.mp4", "Ch/Vid/trans_Vid.txt", "Ch/Vid/videoinfo.txt"])
+
+    def test_download_urls_are_escaped(self):
+        folder = os.path.join(self.root, "Ch", "A video #1? 100%")
+        self.put("Ch/A video #1? 100%/videoinfo.txt")
+        path = os.path.join(folder, "\u0627\u0631\u062f\u0648.mp4")
+        open(path, "w").close()
+        url = api.download_url("job_x", self.root, path)
+        self.assertEqual(url, "/jobs/job_x/files/Ch/A%20video%20%231%3F%20100%25/"
+                              "%D8%A7%D8%B1%D8%AF%D9%88.mp4")
+        import urllib.parse
+        rel = urllib.parse.unquote(url.split("/files/", 1)[1])
+        self.assertEqual(api.job_file(self.root, rel), os.path.realpath(path))
+
+    def test_downloads_are_offered_only_for_files_that_would_be_served(self):
+        outside = os.path.join(self.tmp.name, "elsewhere", "Vid")
+        os.makedirs(outside)
+        for name in ("videoinfo.txt", "Vid.mp4"):
+            open(os.path.join(outside, name), "w").close()
+        os.symlink(os.path.dirname(outside), os.path.join(self.root, "Linked"))
+        video = api.describe({"url": "u", "status": "ok", "folder": "Linked/Vid"}, self.root, "job_x")
+        self.assertTrue(video["files"]["video"])           # the path exists...
+        self.assertEqual(video["downloads"], {})           # ...but it is not served
+        mine = api.describe({"url": "u", "status": "ok", "folder": "Ch/Vid"}, self.root, "job_x")
+        self.assertEqual(sorted(mine["downloads"]), ["info", "transcript", "video"])
+
+
+class TestPreview(unittest.TestCase):
+    def test_a_second_preview_is_turned_away_rather_than_queued(self):
+        # A request a proxy abandons keeps its listing running; waiting behind it
+        # would make every later preview time out as well.
+        d = api.downloader
+        saved = (d.is_channel_url, api.PREVIEW_WAIT)
+        d.is_channel_url, api.PREVIEW_WAIT = (lambda url: True), 0.2
+        api.PREVIEW_LOCK.acquire()
+        try:
+            with self.assertRaises(api.PreviewBusy):
+                api.preview_channel("https://www.youtube.com/@X", limit=1)
+        finally:
+            api.PREVIEW_LOCK.release()
+            d.is_channel_url, api.PREVIEW_WAIT = saved
+
+    def test_the_lock_is_released_even_when_the_listing_fails(self):
+        d = api.downloader
+        saved = (d.is_channel_url, d.list_channel_videos)
+        d.is_channel_url = lambda url: True
+        d.list_channel_videos = lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            with self.assertRaises(RuntimeError):
+                api.preview_channel("https://www.youtube.com/@X", limit=1)
+            self.assertTrue(api.PREVIEW_LOCK.acquire(timeout=0.1))
+            api.PREVIEW_LOCK.release()
+        finally:
+            d.is_channel_url, d.list_channel_videos = saved
 
 
 class TestDefaultFolder(unittest.TestCase):
@@ -328,11 +496,13 @@ class TestStartAndStop(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             before = set(os.listdir(tempfile.gettempdir()))
             saved, api.threading.Thread = api.threading.Thread, Broken
+            saved_out, api.DEFAULT_OUT = api.DEFAULT_OUT, tmp
             try:
                 with self.assertRaises(RuntimeError):
-                    api.start_job(api.normalize_request({"links": "x", "outdir": tmp}))
+                    api.start_job(api.normalize_request({"links": "x"}))
             finally:
                 api.threading.Thread = saved
+                api.DEFAULT_OUT = saved_out
             self.assertEqual(api.JOBS, {})                 # nothing blocks the folder
             self.assertEqual(self.leftover_links_files(before), [])
 

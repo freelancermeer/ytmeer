@@ -14,6 +14,8 @@ Every endpoint, with a form to try each one, is on one page: /api/docs
     GET    /api/jobs                        all jobs
     GET    /api/jobs/{id}                   state, progress, summary, failures
     GET    /api/jobs/{id}/videos?since=N    finished videos, as they finish
+    GET    /api/jobs/{id}/files             every file in the job's folder
+    GET    /api/jobs/{id}/files/{path}      download one (Range works, so it can resume)
     POST   /api/jobs/{id}/stop              Ctrl+C it; finished videos stay
     DELETE /api/jobs/{id}                   forget a finished job
 
@@ -35,6 +37,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -42,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -68,6 +72,19 @@ STREAM = "download_log.jsonl"          # download_log.txt. The stream: downloade
 ACTIVE = ("queued", "running")
 DONE = ("ok", "skipped")
 FAILED = ("failed", "unavailable", "channel_failed")
+
+# Never downloadable, wherever they turn up: a logged-in session and the keys.
+PRIVATE_NAMES = {"cookies.txt", ".api_key", ".api_key_new"}
+PARTIAL_RE = re.compile(r"\.(part|ytdl|aria2)$|\.part-frag\d*$", re.I)
+# yt-dlp writes <name>.f137.mp4 streams and a <name>.temp.mp4 merge before the
+# final <name>.mp4 - judged against the video folder's own name, so a video titled
+# "My.temp" still has a downloadable "My.temp.mp4".
+STREAM_PART_RE = re.compile(r"\.(temp|f\d+)\.", re.I)
+PREVIEW_WAIT = 5                       # seconds a preview waits for another one to end
+
+
+class PreviewBusy(Exception):
+    """Another channel preview still holds the lock."""
 
 API_KEY = [None]
 PUBLIC_URL = [None]                    # the Gradio share link, when served with --share
@@ -143,6 +160,10 @@ DEFAULTS = {
     "thumbnail": True, "description": True, "verbose": False,
 }
 INT_FIELDS = ("views", "limit", "min_height", "max_height")
+# Upper bounds, so no value reaches a JSON encoder (Gradio's orjson) that cannot
+# write it - a limit of 10**20 used to turn GET /api/jobs into a 500 for everyone.
+INT_MAX = {"views": 10**12, "limit": 10**6, "min_height": 10**4, "max_height": 10**4}
+SUB_LANG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,34}")
 BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose")
 
 
@@ -161,7 +182,10 @@ def normalize_request(payload):
     None when it is left out, which means "keep the folder's skip.txt".
     """
     payload = dict(payload or {})
-    links = _lines(payload.pop("links", None)).strip()
+    # Comment lines are dropped here as the downloader would drop them, so a list
+    # that is all comments is refused now rather than "finishing" with nothing.
+    links = "\n".join(line.strip() for line in _lines(payload.pop("links", None)).splitlines()
+                      if line.strip() and not line.strip().startswith("#"))
     if not links:
         raise ValueError("links is required: video links, channel links or both")
     unknown = sorted(set(payload) - set(DEFAULTS))
@@ -179,6 +203,8 @@ def normalize_request(payload):
             raise ValueError(f"{field} must be a whole number, got {opts[field]!r}")
         if opts[field] < 0:
             raise ValueError(f"{field} cannot be negative")
+        if opts[field] > INT_MAX[field]:
+            raise ValueError(f"{field} is too large (at most {INT_MAX[field]})")
     # Unlike views and limit, 0 is not "no limit" for a height: yt-dlp would find
     # no format at all, which reads like a different problem altogether.
     for field in ("min_height", "max_height"):
@@ -192,11 +218,21 @@ def normalize_request(payload):
     if opts["skip"] is not None:
         opts["skip"] = _lines(opts["skip"])
     opts["sub_lang"] = str(opts["sub_lang"] or "en")
+    if not SUB_LANG_RE.fullmatch(opts["sub_lang"]):
+        raise ValueError(f"sub_lang must be a language code such as en or pt-BR, "
+                         f"got {opts['sub_lang']!r}")
     # A relative folder goes inside the default one - not wherever the server was
     # started, which on Colab is not the Drive folder chosen in cell 1. realpath,
     # so one folder spelled two ways is still one folder to the clash check.
     folder = os.path.expanduser(str(opts["outdir"] or DEFAULT_OUT))
     opts["outdir"] = os.path.realpath(os.path.join(DEFAULT_OUT, folder))
+    # Inside the download folder only. A job writes and deletes files in its folder
+    # and the file endpoints read from it, so a caller-chosen /etc would hand out
+    # the machine's files.
+    root = os.path.realpath(DEFAULT_OUT)
+    if opts["outdir"] != root and not opts["outdir"].startswith(root + os.sep):
+        raise ValueError(f"outdir must be a folder inside {DEFAULT_OUT} - give a name "
+                         f"such as \"batch1\"")
     return opts
 
 
@@ -282,6 +318,7 @@ def video_records(records):
     return [r for r in records if r.get("status") not in ("channel", "channel_failed")]
 
 
+
 def failures_from(records):
     """What finally did not come down: each link's last record, where that is a failure.
 
@@ -314,17 +351,94 @@ def folder_files(folder):
     }
 
 
-def describe(record, outdir):
-    """A video record as /videos hands it over: an absolute folder, and its files
-    once it is done. An already-downloaded video takes its title from videoinfo.txt."""
+def _unfinished(name, folder_name):
+    low = name.lower()
+    if low.startswith("incomplete_") or PARTIAL_RE.search(low):
+        return True
+    if name.startswith(folder_name + "."):
+        return STREAM_PART_RE.match(name[len(folder_name):]) is not None
+    return False
+
+
+def job_file(outdir, relpath):
+    """The absolute path of a file in a job's folder that may be downloaded.
+
+    Only what the downloader made is served: files that sit in a video folder (one
+    holding videoinfo.txt) inside the job's folder. That leaves out cookies.txt, the
+    keys, links and logs, and anything else a folder may contain. PermissionError
+    for a path that resolves outside ("..", absolute, a symlink out), a private or
+    unfinished file, or one outside a video folder; FileNotFoundError when absent.
+    """
+    if not relpath or "\x00" in relpath:
+        raise PermissionError("no file named")
+    root = os.path.realpath(outdir)
+    target = os.path.realpath(os.path.join(root, relpath))
+    if not target.startswith(root + os.sep):
+        raise PermissionError("that path is outside the job's folder")
+    name, folder = os.path.basename(target), os.path.dirname(target)
+    if name.lower() in PRIVATE_NAMES:
+        raise PermissionError("that file is not served")
+    if not os.path.isfile(os.path.join(folder, "videoinfo.txt")):
+        raise PermissionError("only files inside a video folder are served")
+    if _unfinished(name, os.path.basename(folder)):
+        raise PermissionError("that file is still being written, or was left incomplete")
+    if not os.path.isfile(target):
+        raise FileNotFoundError(relpath)
+    return target
+
+
+def download_url(job_id, outdir, path):
+    """The API path (after /api) that downloads a file of a job's folder."""
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(outdir))
+    return f"/jobs/{job_id}/files/" + urllib.parse.quote(rel.replace(os.sep, "/"))
+
+
+def list_files(outdir, job_id):
+    """Every file in a job's folder that can be downloaded, with its size and URL."""
+    root = os.path.realpath(outdir)
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        if "videoinfo.txt" not in filenames:
+            continue                      # only video folders hold downloadable files
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            try:
+                job_file(root, rel)
+                size = os.path.getsize(full)
+            except OSError:               # refused, gone, or a symlink out of the folder
+                continue
+            found.append({"path": rel.replace(os.sep, "/"), "bytes": size,
+                          "url": download_url(job_id, root, full)})
+    return found
+
+
+def describe(record, outdir, job_id=None):
+    """A video record as /videos hands it over: an absolute folder, its files once it
+    is done, and - for a job - the API paths that download them from anywhere. An
+    already-downloaded video takes its title from videoinfo.txt."""
     folder = os.path.join(outdir, record["folder"]) if record.get("folder") else None
     done = record.get("status") in DONE
-    title = record.get("title")
-    if not title and folder:
-        title = downloader.read_info(folder).get("Title")
+    title, quality = record.get("title"), record.get("quality")
+    # Only a finished video's videoinfo.txt is worth reading: a failed one says
+    # "Unknown Title", which would disagree with the job's failures. A skipped video
+    # has no title or quality in its record, but videoinfo.txt has both.
+    if done and folder and not (title and quality):
+        info = downloader.read_info(folder)
+        title, quality = title or info.get("Title"), quality or info.get("Quality")
+    files = folder_files(folder) if done else {}
+    downloads = {}
+    for key, path in files.items():
+        if job_id and path:
+            try:                          # offered only if it would really be served
+                job_file(outdir, os.path.relpath(os.path.realpath(path), os.path.realpath(outdir)))
+            except OSError:
+                continue
+            downloads[key] = download_url(job_id, outdir, path)
     return {"url": record.get("url"), "status": record.get("status"), "title": title,
-            "quality": record.get("quality"), "error": record.get("error"),
-            "folder": folder, "files": folder_files(folder) if done else {}}
+            "quality": quality, "error": record.get("error"),
+            "folder": folder, "files": files, "downloads": downloads}
 
 
 def read_videos(outdir):
@@ -528,7 +642,7 @@ def shutdown_jobs(timeout=15):
     while time.time() < deadline and any(j["state"] in ACTIVE for j in jobs):
         time.sleep(0.2)
 
-def preview_channel(channel, views=0, limit=0, skip=""):
+def preview_channel(channel, views=0, limit=20, skip=""):
     """What a channel link expands to, without downloading anything.
 
     Its own lock, not the jobs' one: a listing can take minutes, and nothing about
@@ -540,13 +654,21 @@ def preview_channel(channel, views=0, limit=0, skip=""):
     d = downloader
     if not d.is_channel_url(url):
         raise ValueError(f"not a channel link: {url}")
-    with PREVIEW_LOCK:                    # these are module globals in downloader
+    # One listing at a time (they share downloader's module globals), but never a
+    # queue: a request abandoned by a proxy keeps its listing running, and anything
+    # waiting behind it would time out too.
+    if not PREVIEW_LOCK.acquire(timeout=PREVIEW_WAIT):
+        raise PreviewBusy("another channel preview is still running; try again in a "
+                          "minute, or with a smaller limit")
+    try:
         d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")   # as a job would
         d.MIN_VIEWS, d.LIMIT = int(views or 0), int(limit or 0)
         d.SKIP_IDS = {v for v in (d.video_id_from_url(x) or
                                   (x if d.BARE_ID_RE.match(x) else None)
                                   for x in _lines(skip).split()) if v}
         found, name, err = d.list_channel_videos(url)
+    finally:
+        PREVIEW_LOCK.release()
     return {"channel": name or None, "tab_read": d.channel_videos_url(url),
             "matched": len(found), "videos": found, "error": err}
 
@@ -559,6 +681,7 @@ def tools_present():
 # ------------------------------------------------------------------- server
 def build_app():
     from fastapi import Depends, FastAPI, HTTPException, Query, Security
+    from fastapi.responses import FileResponse
     from fastapi.security import APIKeyHeader
     from pydantic import BaseModel, ConfigDict, Field
 
@@ -571,17 +694,20 @@ def build_app():
         skip: str | list[str] | None = Field(
             None, description="Never download these (links or 11-character ids). Replaces the "
                               "folder's skip.txt; leave it out to keep the one already there.")
-        outdir: str | None = Field(None, description="Folder to download into: absolute, or "
-                                                     "relative to the server's download folder.")
+        outdir: str | None = Field(None, description="Folder to download into: a name "
+                                   "inside the server's download folder, such as batch1.")
         channel: bool = Field(True, description="Group into <Channel>/<Video>/ folders.")
-        views: int = Field(0, ge=0, description="Channel links only: skip videos under this "
-                                                "many views. 0 = no floor.")
-        limit: int = Field(0, ge=0, description="Channel links only: newest N matches per "
-                                                "channel. 0 = the whole channel.")
-        min_height: int = Field(720, ge=1, description="Quality floor, in pixels.")
-        max_height: int = Field(1080, ge=1, description="Quality ceiling, in pixels.")
+        views: int = Field(0, ge=0, le=INT_MAX["views"], description="Channel links only: "
+                           "skip videos under this many views. 0 = no floor.")
+        limit: int = Field(0, ge=0, le=INT_MAX["limit"], description="Channel links only: "
+                           "newest N matches per channel. 0 = the whole channel.")
+        min_height: int = Field(720, ge=1, le=INT_MAX["min_height"],
+                                description="Quality floor, in pixels.")
+        max_height: int = Field(1080, ge=1, le=INT_MAX["max_height"],
+                                description="Quality ceiling, in pixels.")
         subs: bool = Field(True, description="Write the transcript files.")
-        sub_lang: str = Field("en", description="Transcript language code.")
+        sub_lang: str = Field("en", pattern=SUB_LANG_RE.pattern,
+                              description="Transcript language code, such as en or pt-BR.")
         thumbnail: bool = Field(True, description="Save the thumbnail.")
         description: bool = Field(True, description="Save the description.")
         verbose: bool = Field(False, description="Put yt-dlp's full output in the job log.")
@@ -630,13 +756,19 @@ def build_app():
 
     @app.get("/api/preview", tags=["channels"], dependencies=keyed)
     def preview(channel: str = Query(..., description="A channel link."),
-                views: int = Query(0, ge=0), limit: int = Query(0, ge=0),
+                views: int = Query(0, ge=0, le=INT_MAX["views"]),
+                limit: int = Query(20, ge=1, le=500, description="How many matching "
+                                   "videos to list: a preview is a look, not the channel."),
                 skip: str = Query("", description="Links or ids to leave out.")):
-        """The videos a channel link would download. Nothing is downloaded."""
+        """The newest videos a channel link would download, up to limit. Nothing is
+        downloaded. One preview runs at a time; another gets 503. On the public link a
+        request must finish within about 60 s, so keep the limit small there."""
         try:
             return preview_channel(channel, views, limit, skip)
         except ValueError as e:
             raise unprocessable(str(e), "query", "channel")
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
 
     @app.post("/api/jobs", status_code=202, tags=["jobs"], dependencies=keyed)
     def create_job(body: JobRequest):
@@ -676,7 +808,30 @@ def build_app():
         videos = video_records(records)
         return {"job_id": job_id, "state": state, "done": state not in ACTIVE,
                 "next": len(videos),
-                "videos": [describe(r, job["outdir"]) for r in videos[since:]]}
+                "videos": [describe(r, job["outdir"], job_id) for r in videos[since:]]}
+
+    @app.get("/api/jobs/{job_id}/files", tags=["files"], dependencies=keyed)
+    def get_files(job_id: str):
+        """Every file in the job's folder that can be downloaded: path, size, and the
+        URL (after /api) to fetch it. Includes videos from earlier runs in that folder."""
+        job = find(job_id)
+        return {"job_id": job_id, "folder": job["outdir"],
+                "files": list_files(job["outdir"], job_id)}
+
+    @app.get("/api/jobs/{job_id}/files/{path:path}", tags=["files"], dependencies=keyed)
+    def get_file(job_id: str, path: str):
+        """Download one file from the job's folder. Range requests work, so a large
+        video can be fetched in parts or resumed. Files still being written, hidden
+        files and cookies.txt are refused."""
+        job = find(job_id)
+        try:
+            full = job_file(job["outdir"], path)
+            stat = os.stat(full)
+        except FileNotFoundError:
+            raise HTTPException(404, f"no such file: {path}")
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        return FileResponse(full, filename=os.path.basename(full), stat_result=stat)
 
     @app.post("/api/jobs/{job_id}/stop", tags=["jobs"], dependencies=keyed)
     def post_stop(job_id: str):
@@ -712,6 +867,7 @@ def banner(base, key, public=None):
         "  POST /api/jobs                       {\"links\": [...], \"views\": 1000, \"limit\": 3}",
         "  GET  /api/jobs/{id}                  progress",
         "  GET  /api/jobs/{id}/videos?since=0   finished videos, as they finish",
+        "  GET  /api/jobs/{id}/files/{path}     download a file (each video lists its own)",
     ]
     return "\n".join(lines)
 

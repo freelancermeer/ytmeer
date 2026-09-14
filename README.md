@@ -461,11 +461,13 @@ link as well - nothing else, no UI.
 |---|---|
 | `GET /api/ping` | alive, and `busy` while a job runs (no key) |
 | `GET /api/health` | tools found, default folder, jobs |
-| `GET /api/preview?channel=URL&views=1000&limit=3` | what a channel link would download |
+| `GET /api/preview?channel=URL&views=1000&limit=3` | the newest videos a channel link would download |
 | `POST /api/jobs` | start downloading, returns `job_id` |
 | `GET /api/jobs` | all jobs |
 | `GET /api/jobs/{id}` | state, progress, summary, failures |
 | `GET /api/jobs/{id}/videos?since=N` | finished videos, as they finish |
+| `GET /api/jobs/{id}/files` | every downloadable file in the job's folder |
+| `GET /api/jobs/{id}/files/{path}` | download one; Range works, so big videos can resume |
 | `POST /api/jobs/{id}/stop` | Ctrl+C it; finished videos stay |
 | `DELETE /api/jobs/{id}` | forget a finished job |
 
@@ -476,8 +478,8 @@ a restart keeps it; `--new-key` replaces it.
 links or both) plus any of the command-line options: `views`, `limit`, `channel`,
 `min_height`, `max_height`, `subs`, `sub_lang`, `thumbnail`, `description`,
 `verbose`, `outdir`, `skip`. An unknown field is refused, so a typo fails instead
-of quietly fetching a whole channel. `outdir` is absolute, or relative to the
-default folder. `skip` replaces the folder's `skip.txt`; leave it out to keep the
+of quietly fetching a whole channel. `outdir` is a folder inside the download
+folder, such as `"batch1"`; anything outside it is refused. `skip` replaces the folder's `skip.txt`; leave it out to keep the
 one already there. The links go straight to the downloader, so a `links.txt` you
 keep in that folder is left alone.
 
@@ -513,7 +515,11 @@ print(job["state"], job["error"], job["failures"])
 
 A video is handed over once its folder is complete, with absolute paths in
 `files`: `video`, `transcript`, `words`, `thumbnail`, `description`, `info`
-(`None` when absent). A failed one has `status` and `error` and no files - and
+(`None` when absent) - and the same files in `downloads`, as API paths that fetch
+them from anywhere: `requests.get(API + v["downloads"]["video"], headers=H,
+stream=True)`. Only files inside a video folder are served - never `cookies.txt`,
+the logs, or anything still being written - and nothing outside the job's folder
+is reachable. A failed one has `status` and `error` and no files - and
 can come back later as `ok`, because a run retries its failures once at the end.
 The job's `failures` lists only what finally did not come down.
 
@@ -521,6 +527,14 @@ A job ends `finished`, `stopped`, or `error` (the downloader crashed or could no
 start; the reason is in `error`). `POST /stop` interrupts the downloader and the
 yt-dlp it is running, like Ctrl+C in a terminal; finished videos stay. Stopping
 the server stops its jobs the same way, so no download is left running unseen.
+
+`summary` is `null` when a run ends before writing one: nothing to download (every
+link failed or was skipped), stopped while reading a channel, or crashed. `failures`
+still says what happened.
+
+`/api/preview` lists up to `limit` matching videos (default 20, at most 500) and
+runs one at a time - a second one meanwhile gets 503. On the public link a request
+must answer within about 60 seconds, so keep the limit small there.
 
 ## Google Colab
 
@@ -550,9 +564,8 @@ authored by Google, click **Run anyway**.
    cell of the notebook, `API_URL`, `PUBLIC_URL`, `API_KEY` and `HEADERS` are set too.
 
    Keep the tab open: the link and the server stop when the runtime disconnects,
-   and the next Run all gives a new URL. The file paths the API returns are on the
-   Colab machine, so code running elsewhere cannot open them - do that part in a
-   cell of the notebook, or tick `use_drive` and read the files from your Drive.
+   and the next Run all gives a new URL. The paths in `files` are on the Colab
+   machine; code running anywhere else fetches the same files through `downloads`.
 
    It is safe to re-run. The folder, key and port are saved beside the code, so
    after a runtime restart it finds the server that is still downloading. It

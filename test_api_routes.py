@@ -61,7 +61,10 @@ FAKE = textwrap.dedent('''
             folder = os.path.join(out, "Ch", name)
             os.makedirs(folder, exist_ok=True)
             for fname in (f"{name}.mp4", f"trans_{name}.txt"):
-                open(os.path.join(folder, fname), "w").close()
+                with open(os.path.join(folder, fname), "w") as f:
+                    f.write(f"contents of {fname}")
+            with open(os.path.join(folder, "videoinfo.txt"), "w") as f:    # as the real one does
+                f.write(f"Title:   {name}\\nQuality: 720p\\nStatus:  OK\\n")
             log({"url": f"https://youtu.be/vid{i}xxxxxx", "status": "ok",
                  "title": name, "quality": "720p", "folder": f"Ch/{name}"})
             print(f"[{i+1}/{n}] OK {name}", flush=True)
@@ -137,7 +140,8 @@ class TestRoutes(unittest.TestCase):
         for method, path in (("get", "/api/health"), ("get", "/api/jobs"),
                              ("get", "/api/preview?channel=x"), ("post", "/api/jobs"),
                              ("get", "/api/jobs/x"), ("get", "/api/jobs/x/videos"),
-                             ("post", "/api/jobs/x/stop"), ("delete", "/api/jobs/x")):
+                             ("post", "/api/jobs/x/stop"), ("delete", "/api/jobs/x"),
+                             ("get", "/api/jobs/x/files"), ("get", "/api/jobs/x/files/a.mp4")):
             self.assertEqual(getattr(self.c, method)(path).status_code, 401, path)
             bad = getattr(self.c, method)(path, headers={"X-API-Key": "nope"})
             self.assertEqual(bad.status_code, 401, path)
@@ -147,7 +151,8 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(sorted(paths), sorted([
             "/api/ping", "/api/health", "/api/preview", "/api/jobs",
             "/api/jobs/{job_id}", "/api/jobs/{job_id}/videos",
-            "/api/jobs/{job_id}/stop"]))
+            "/api/jobs/{job_id}/stop", "/api/jobs/{job_id}/files",
+            "/api/jobs/{job_id}/files/{path}"]))
         self.assertEqual(self.c.get("/api/docs").status_code, 200)
 
     # ------------------------------------------------------------ validation
@@ -203,11 +208,11 @@ class TestRoutes(unittest.TestCase):
         self.assertIn("[3/3] OK Vid 2", job["log"])
 
     def test_the_links_reach_the_downloader(self):
-        folder = os.path.join(self.tmp.name, "kept")
+        folder = os.path.join(api.DEFAULT_OUT, "kept")
         os.makedirs(folder)
         with open(os.path.join(folder, "links.txt"), "w") as f:
             f.write("https://youtu.be/handkept123\n")
-        job = self.wait(self.start(outdir=folder, links=["https://youtu.be/aaaaaaaaaaa",
+        job = self.wait(self.start(outdir="kept", links=["https://youtu.be/aaaaaaaaaaa",
                                                          "https://www.youtube.com/@Ch"]))
         self.assertIn("links: https://youtu.be/aaaaaaaaaaa\nhttps://www.youtube.com/@Ch",
                       "\n".join(job["log"]))
@@ -219,8 +224,7 @@ class TestRoutes(unittest.TestCase):
         self.start()
         r = self.c.post("/api/jobs", json={"links": "x"}, headers=self.h)
         self.assertEqual(r.status_code, 409)
-        other = os.path.join(self.tmp.name, "other")
-        self.assertEqual(self.c.post("/api/jobs", json={"links": "x", "outdir": other},
+        self.assertEqual(self.c.post("/api/jobs", json={"links": "x", "outdir": "other"},
                                      headers=self.h).status_code, 202)
 
     def test_stop_keeps_what_finished_and_still_summarises(self):
@@ -394,6 +398,84 @@ class TestRoutes(unittest.TestCase):
                 finally:
                     if server.poll() is None:
                         server.kill()
+
+    def test_each_finished_video_can_be_downloaded_through_the_api(self):
+        job_id = self.start()
+        self.wait(job_id)
+        videos = [v for v in self.c.get(f"/api/jobs/{job_id}/videos", headers=self.h).json()["videos"]
+                  if v["status"] == "ok"]
+        self.assertEqual(len(videos), 3)
+        for v in videos:
+            r = self.c.get("/api" + v["downloads"]["video"], headers=self.h)
+            self.assertEqual(r.status_code, 200)
+            with open(v["files"]["video"], "rb") as f:
+                self.assertEqual(r.content, f.read())
+            self.assertIn("attachment", r.headers["content-disposition"])
+            self.assertEqual(self.c.get("/api" + v["downloads"]["transcript"], headers=self.h).text,
+                             f"contents of trans_{v['title']}.txt")
+        self.assertEqual(self.c.get("/api" + videos[0]["downloads"]["video"]).status_code, 401)
+
+    def test_a_download_can_be_fetched_in_parts(self):
+        job_id = self.start()
+        self.wait(job_id)
+        url = "/api" + self.c.get(f"/api/jobs/{job_id}/videos", headers=self.h).json()["videos"][0]["downloads"]["video"]
+        r = self.c.get(url, headers={**self.h, "Range": "bytes=0-7"})
+        self.assertEqual((r.status_code, r.content), (206, b"contents"))
+
+    def test_the_file_listing_and_what_it_refuses(self):
+        job_id = self.start()
+        job = self.wait(job_id)
+        folder = job["folder"]
+        for name in ("cookies.txt", "Ch/Vid 0/Vid 0.f137.mp4.part", ".api_key"):
+            with open(os.path.join(folder, name), "w") as f:
+                f.write("secret")
+        listed = self.c.get(f"/api/jobs/{job_id}/files", headers=self.h).json()["files"]
+        paths = {f["path"] for f in listed}
+        self.assertIn("Ch/Vid 0/Vid 0.mp4", paths)
+        self.assertFalse(paths & {"cookies.txt", ".api_key", "Ch/Vid 0/Vid 0.f137.mp4.part"})
+        for f in listed:
+            self.assertEqual(self.c.get("/api" + f["url"], headers=self.h).status_code, 200, f)
+        base = f"/api/jobs/{job_id}/files/"
+        for bad, code in (("cookies.txt", 403), ("COOKIES.TXT", 403), (".api_key", 403),
+                          ("Ch/Vid%200/Vid%200.f137.mp4.part", 403), ("%2e%2e/%2e%2e/etc/passwd", 403),
+                          ("..%2F..%2Fsecret", 403),
+                          ("nope.mp4", 403),                  # outside a video folder: refused unseen
+                          ("Ch/Vid%200/nope.mp4", 404)):     # inside one: simply not there
+            self.assertEqual(self.c.get(base + bad, headers=self.h).status_code, code, bad)
+        self.assertEqual(self.c.get("/api/jobs/job_nope/files/x.mp4", headers=self.h).status_code, 404)
+
+    def test_requests_the_live_test_broke_things_with_are_refused(self):
+        for body in ({"links": "x", "limit": 10**20}, {"links": "x", "views": 10**13},
+                     {"links": "x", "outdir": "/etc"}, {"links": "x", "outdir": "../../x"},
+                     {"links": "# only a comment"}, {"links": "x", "sub_lang": "-x"}):
+            r = self.c.post("/api/jobs", json=body, headers=self.h)
+            self.assertEqual(r.status_code, 422, body)
+            self.assertIsInstance(r.json()["detail"], list)
+        self.assertEqual(self.c.get("/api/jobs", headers=self.h).status_code, 200)
+
+    def test_preview_limit_is_bounded(self):
+        for q in ("limit=0", "limit=501", "views=10000000000000"):
+            r = self.c.get(f"/api/preview?channel=https://www.youtube.com/@X&{q}", headers=self.h)
+            self.assertEqual(r.status_code, 422, q)
+
+    def test_a_second_preview_meanwhile_gets_503(self):
+        d = api.downloader
+        saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT)
+        d.is_channel_url, d.channel_videos_url = (lambda url: True), (lambda url: url)
+        d.list_channel_videos = lambda url: (time.sleep(2), ([], "Ch", None))[1]
+        api.PREVIEW_WAIT = 0.3
+        try:
+            import threading as _t
+            first = _t.Thread(target=lambda: TestClient(self.app).get("/api/preview?channel=x", headers=self.h))
+            first.start()
+            time.sleep(0.3)
+            r = self.c.get("/api/preview?channel=y", headers=self.h)
+            self.assertEqual(r.status_code, 503)
+            self.assertIn("another channel preview", r.json()["detail"])
+            first.join()
+            self.assertEqual(self.c.get("/api/preview?channel=z", headers=self.h).status_code, 200)
+        finally:
+            d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT = saved
 
     def test_health_reports_the_code_version(self):
         body = self.c.get("/api/health", headers=self.h).json()

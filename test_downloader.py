@@ -703,6 +703,40 @@ class PlatformCase:
         finally:
             d.po_token_first[0] = saved
 
+    def test_no_format_in_the_height_range_is_not_retried_for_minutes(self):
+        self._no_sleep()
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = False
+        calls = []
+        try:
+            def no_format(flags, fast=True):
+                calls.append(tuple(flags))
+                return "[youtube] abc: Requested format is not available. Use --list-formats"
+            routes = len(d.download_routes())
+            err = d.run_with_retries(no_format)
+        finally:
+            d.po_token_first[0] = saved
+        self.assertIn("Requested format is not available", err)
+        self.assertEqual(len(calls), routes, "one round over every route, not three")
+
+    def test_formats_missing_on_one_route_only_still_get_every_attempt(self):
+        # The default client can hide formats the PO-token client sees, so this is
+        # not "the video has none" - it keeps the full retry schedule.
+        self._no_sleep()
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = False
+        calls = []
+        try:
+            def mixed(flags, fast=True):
+                calls.append(tuple(flags))
+                return ("Requested format is not available" if not flags
+                        else "HTTP Error 403: Forbidden")
+            routes = len(d.download_routes())
+            d.run_with_retries(mixed)
+        finally:
+            d.po_token_first[0] = saved
+        self.assertEqual(len(calls), d.MAX_ATTEMPTS * routes)
+
     def test_a_failing_video_gets_several_attempts(self):
         self._no_sleep()
         saved = d.po_token_first[0]
