@@ -81,6 +81,7 @@ import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # These are filled in from command-line arguments in main().
 LINKS_FILE     = "links.txt"
@@ -2231,6 +2232,9 @@ def expand_sources(links):
     A video link passes straight through, so links.txt can mix the two. Repeats
     are dropped by video id - so a video reached through both a channel and its
     own link is downloaded once, and --limit keeps meaning N videos.
+
+    When there are multiple channel links, they are scanned concurrently so the
+    total wall time is roughly that of the slowest single channel, not the sum.
     """
     skipped_by_list[0] = 0            # one expansion, one count
     channels = [u for u in links if is_channel_url(u)]
@@ -2255,11 +2259,24 @@ def expand_sources(links):
             seen.add(vid)
         out.append((url, group))          # not a video link: left alone, as before
 
+    # Scan all channels concurrently, then merge results in link order.
+    channel_results = {}  # url -> (found, name, err)
+    if channels:
+        workers = min(len(channels), 6)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(list_channel_videos, u): u for u in channels}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    channel_results[url] = future.result()
+                except Exception as e:
+                    channel_results[url] = ([], url, str(e))
+
     for url in links:
         if not is_channel_url(url):
             add(url, None)
             continue
-        found, name, err = list_channel_videos(url)
+        found, name, err = channel_results[url]
         label = name or url
         before = len(out)
         for u in found:
