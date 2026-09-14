@@ -46,8 +46,9 @@ python3 downloader.py "/path/to/your folder" --channel
 channel link is expanded into its videos, newest first, before anything is
 downloaded:
 
-```
+```text
 https://www.youtube.com/@SomeChannel
+https://www.youtube.com/@basketballlegends67/videos
 https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
