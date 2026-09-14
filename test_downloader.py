@@ -1368,7 +1368,7 @@ class PlatformCase:
         links, name, err = d.list_channel_videos("https://www.youtube.com/@X")
         self.assertIsNone(err)
         self.assertEqual(name, "Test Channel")
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
                                  "https://www.youtube.com/watch?v=ccccccccccc"])
 
     def test_no_view_floor_takes_every_video(self):
@@ -1383,7 +1383,7 @@ class PlatformCase:
                       self.entry("ccccccccccc", 2000),
                       self.entry("ddddddddddd", 9000)])   # never reached
         links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
                                  "https://www.youtube.com/watch?v=ccccccccccc"])
 
     def test_a_skipped_video_does_not_use_up_a_limit_slot(self):
@@ -1392,7 +1392,7 @@ class PlatformCase:
         self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb"),
                       self.entry("ccccccccccc")])
         links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=bbbbbbbbbbb",
                                  "https://www.youtube.com/watch?v=ccccccccccc"])
 
     def test_the_summary_counts_videos_skip_txt_kept_out_of_a_listing(self):
@@ -1403,7 +1403,7 @@ class PlatformCase:
         self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb"),
                       self.entry("ccccccccccc")])
         links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=ccccccccccc"])
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=ccccccccccc"])
         self.assertEqual(d.skipped_by_list[0], 2)
 
     def test_live_and_upcoming_videos_are_left_out(self):
@@ -1411,14 +1411,14 @@ class PlatformCase:
                       self.entry("bbbbbbbbbbb", live_status="is_live"),
                       self.entry("ccccccccccc")])
         links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=ccccccccccc"])
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=ccccccccccc"])
 
     def test_a_video_with_no_view_count_cannot_clear_the_floor(self):
         d.MIN_VIEWS = 1000
         self.listing([self.entry("aaaaaaaaaaa", None), self.entry("bbbbbbbbbbb", 2000)])
         with contextlib.redirect_stdout(io.StringIO()) as out:
             links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=bbbbbbbbbbb"])
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=bbbbbbbbbbb"])
         self.assertIn("no view count", out.getvalue())   # never dropped silently
 
     def test_listing_pages_until_the_channel_runs_out(self):
@@ -1442,13 +1442,13 @@ class PlatformCase:
         d.channel_page = lambda url, start, end: ({}, "Channel not found")
         self.addCleanup(setattr, d, "channel_page", original)
         links, _name, err = d.list_channel_videos("https://www.youtube.com/@Nope")
-        self.assertEqual(links, [])
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], [])
         self.assertEqual(err, "Channel not found")
 
     def test_video_links_pass_through_expansion_untouched(self):
         links = d.expand_sources(["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                   "https://youtu.be/aaaaaaaaaaa"])
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                  "https://youtu.be/aaaaaaaaaaa"])
 
     def test_channels_and_videos_mix_in_one_links_file(self):
@@ -1456,7 +1456,7 @@ class PlatformCase:
         with contextlib.redirect_stdout(io.StringIO()):
             links = d.expand_sources(["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                       "https://www.youtube.com/@X"])
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                  "https://www.youtube.com/watch?v=aaaaaaaaaaa",
                                  "https://www.youtube.com/watch?v=bbbbbbbbbbb"])
 
@@ -1465,7 +1465,7 @@ class PlatformCase:
         with contextlib.redirect_stdout(io.StringIO()):
             links = d.expand_sources(["https://youtu.be/dQw4w9WgXcQ",
                                       "https://www.youtube.com/@X"])
-        self.assertEqual(links, ["https://youtu.be/dQw4w9WgXcQ",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://youtu.be/dQw4w9WgXcQ",
                                  "https://www.youtube.com/watch?v=bbbbbbbbbbb"])
 
     def test_a_listing_that_breaks_partway_keeps_what_it_found(self):
@@ -1486,7 +1486,7 @@ class PlatformCase:
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
             links = d.expand_sources(["https://www.youtube.com/@X"])
-        self.assertEqual(links, ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=aaaaaaaaaaa",
                                  "https://www.youtube.com/watch?v=bbbbbbbbbbb"])
         self.assertIn("stopped early", out.getvalue())
 
@@ -1498,11 +1498,11 @@ class PlatformCase:
             "https://youtu.be/8e6xIpf7qpk?t=12",
         ])
         self.assertEqual(
-            links, ["https://www.youtube.com/watch?v=8e6xIpf7qpk&pp=ygULa2FzaA%3D%3D"])
+            [u[0] if isinstance(u, tuple) else u for u in links], ["https://www.youtube.com/watch?v=8e6xIpf7qpk&pp=ygULa2FzaA%3D%3D"])
 
     def test_a_link_that_is_not_a_youtube_video_is_left_alone(self):
         links = d.expand_sources(["https://example.com/whatever"])
-        self.assertEqual(links, ["https://example.com/whatever"])
+        self.assertEqual([u[0] if isinstance(u, tuple) else u for u in links], ["https://example.com/whatever"])
 
     def test_skip_list_reads_links_comments_and_bare_ids(self):
         with tempfile.TemporaryDirectory() as tmp:

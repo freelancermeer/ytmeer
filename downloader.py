@@ -1884,7 +1884,7 @@ def download_one(url, index, total):
         bar.done("SKIP  (older than requested days)")
         log_record(url=url, status="skipped", error="older than requested days")
         shutil.rmtree(folder, ignore_errors=True)
-        return "skip"
+        return "skip_date"
 
     if err:
         note(f"    ! Download failed: {err}")
@@ -2152,24 +2152,24 @@ def expand_sources(links):
 
     out, seen = [], set()
 
-    def add(url):
+    def add(url, group=None):
         """Keep a link, unless that video is in the list already."""
         vid = video_id_from_url(url)
         if vid:
             if vid in seen:
                 return
             seen.add(vid)
-        out.append(url)          # not a video link: left alone, as before
+        out.append((url, group))          # not a video link: left alone, as before
 
     for url in links:
         if not is_channel_url(url):
-            add(url)
+            add(url, None)
             continue
         found, name, err = list_channel_videos(url)
         label = name or url
         before = len(out)
         for u in found:
-            add(u)
+            add(u, url)
         kept = len(out) - before
         if err:
             # Whatever the listing reached before it broke is still real, so it
@@ -2221,7 +2221,12 @@ def drop_skipped(links):
     """Drop the links named in skip.txt. Returns (kept, how many went)."""
     if not SKIP_IDS:
         return links, 0
-    kept = [u for u in links if video_id_from_url(u) not in SKIP_IDS]
+    
+    kept = []
+    for item in links:
+        u = item[0] if isinstance(item, tuple) else item
+        if video_id_from_url(u) not in SKIP_IDS:
+            kept.append(item)
     return kept, len(links) - len(kept)
 
 
@@ -2419,7 +2424,11 @@ def main():
     def run(batch, sweep=False):
         """Download a list of links. `failed` holds the ones worth trying again, kept
         current as each video ends, so a stop mid-batch still counts them."""
-        for i, url in enumerate(batch, 1):
+        skip_groups = set()
+        for i, (url, group) in enumerate(batch, 1):
+            if group and group in skip_groups:
+                counts["skip"] += 1
+                continue
             try:
                 result = download_one(url, i, len(batch))
             except OSError as e:
@@ -2428,14 +2437,19 @@ def main():
                 print(f"    ! {url}: {e}")
                 log_record(url=url, status="failed", error=str(e))
                 result = "fail"
+            
+            if result == "skip_date" and group:
+                skip_groups.add(group)
+                result = "skip"
+
             if sweep and result != "fail":
-                failed.remove(url)    # the sweep settled it
+                failed.remove((url, group))    # the sweep settled it
             if result in counts:
                 counts[result] += 1
             elif result == "gone":
-                gone.append(url)      # nothing a retry could change
+                gone.append((url, group))      # nothing a retry could change
             elif not sweep:
-                failed.append(url)
+                failed.append((url, group))
 
     stopped = False
     RUN_LOOP_STARTED[0] = True
