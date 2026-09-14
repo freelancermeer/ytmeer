@@ -808,8 +808,6 @@ def base_cmd():
         cmd += ["--extractor-args",
                 f"youtubepot-bgutilscript:script_path={BGUTIL_SCRIPT}"]
     cmd += windows_flags()
-    if DAYS > 0:
-        cmd += ["--dateafter", f"today-{DAYS}days"]
     return cmd + cookie_flags()
 
 
@@ -2071,11 +2069,16 @@ def wanted_entry(entry):
 
 def list_channel_recent(url, deadline=None):
     """Scan a channel using --dateafter to only extract recent videos.
-    This is slower (fetches each video page) but stops correctly at the date limit."""
+
+    Uses yt-dlp's --dateafter + --break-on-reject so it stops as soon as it
+    hits a video older than DAYS.  Slightly slower than --flat-playlist (which
+    cannot filter by date at all) but only touches the recent videos instead of
+    the whole channel.
+    """
     tab = channel_videos_url(url)
     links, seen, name = [], set(), ""
-    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0, "date": 0}
-    
+    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0}
+
     cmd = base_cmd() + [
         "--print", "%(id)s|%(view_count)s|%(channel)s|%(live_status)s",
         "--dateafter", f"today-{DAYS}days",
@@ -2083,69 +2086,67 @@ def list_channel_recent(url, deadline=None):
         "--no-warnings",
         "--", tab
     ]
-    
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
+
     try:
-        for line in proc.stdout:
-            if deadline is not None and time.monotonic() >= deadline:
-                proc.kill()
-                scan_done()
-                return links, name, (f"stopped after scanning {counts['scanned']} videos to "
-                                     f"answer in time; lower views to find matches sooner")
-            line = line.strip()
-            if not line:
-                continue
-                
-            parts = line.split("|")
-            if len(parts) >= 3:
-                vid, views, ch_name = parts[0], parts[1], parts[2]
-                live_status = parts[3] if len(parts) >= 4 else ""
-                
-                counts["scanned"] += 1
-                name = name or ch_name
-                
-                if vid in seen:
-                    continue
-                    
-                if live_status in ("is_upcoming", "is_live", "post_live"):
-                    counts["live"] += 1
-                    continue
-                    
-                if views == "NA" or views == "None":
-                    keep = not MIN_VIEWS
-                    if not keep:
-                        counts["unknown"] += 1
-                        continue
-                else:
-                    try:
-                        v_count = int(views)
-                        if MIN_VIEWS and v_count < MIN_VIEWS:
-                            counts["views"] += 1
-                            continue
-                    except ValueError:
-                        if MIN_VIEWS:
-                            counts["unknown"] += 1
-                            continue
-                
-                if vid in SKIP_IDS:
-                    counts["skipped"] += 1
-                    continue
-                    
-                seen.add(vid)
-                links.append(f"https://www.youtube.com/watch?v={vid}")
-                
-                scan_progress(name or url, counts["scanned"], len(links))
-                
-                if LIMIT and len(links) >= LIMIT:
-                    proc.kill()
-                    break
-        
-        proc.wait(timeout=5)
-    except Exception as e:
-        proc.kill()
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
         scan_done()
-        return links, name, f"Error scanning recent videos: {e}"
+        return links, name, "Timed out while scanning recent videos"
+    except OSError as e:
+        scan_done()
+        return links, name, f"Could not run yt-dlp: {e}"
+
+    # --break-on-reject exits with 101 after the first out-of-range video,
+    # but the stdout lines for the in-range videos are still valid.
+    for line in out.stdout.splitlines():
+        if deadline is not None and time.monotonic() >= deadline:
+            scan_done()
+            return links, name, (f"stopped after scanning {counts['scanned']} videos to "
+                                 f"answer in time; lower views to find matches sooner")
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        vid, views, ch_name = parts[0], parts[1], parts[2]
+        live_status = parts[3] if len(parts) >= 4 else ""
+
+        counts["scanned"] += 1
+        name = name or ch_name
+
+        if vid in seen:
+            continue
+
+        if live_status in ("is_upcoming", "is_live", "post_live"):
+            counts["live"] += 1
+            continue
+
+        if views in ("NA", "None"):
+            if MIN_VIEWS:
+                counts["unknown"] += 1
+                continue
+        else:
+            try:
+                v_count = int(views)
+                if MIN_VIEWS and v_count < MIN_VIEWS:
+                    counts["views"] += 1
+                    continue
+            except ValueError:
+                if MIN_VIEWS:
+                    counts["unknown"] += 1
+                    continue
+
+        if vid in SKIP_IDS:
+            counts["skipped"] += 1
+            continue
+
+        seen.add(vid)
+        links.append(f"https://www.youtube.com/watch?v={vid}")
+
+        if LIMIT and len(links) >= LIMIT:
+            break
         
     scan_done()
     note(f"      listed {counts['scanned']} video(s) from last {DAYS} days: kept {len(links)}"
