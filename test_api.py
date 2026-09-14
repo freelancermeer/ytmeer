@@ -138,6 +138,21 @@ class TestArgv(unittest.TestCase):
         argv = api.build_argv("/out", opts, "/tmp/job.txt")
         self.assertEqual(argv[3:6], ["/out", "--links", "/tmp/job.txt"])
 
+    def test_a_shared_cookie_file_reaches_jobs_in_subfolders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            saved, api.DEFAULT_OUT = api.DEFAULT_OUT, tmp
+            try:
+                opts = api.normalize_request({"links": "x", "outdir": "batch1"})
+                os.makedirs(opts["outdir"])
+                self.assertNotIn("--cookies", api.build_argv(opts["outdir"], opts))
+                open(os.path.join(tmp, "cookies.txt"), "w").close()
+                argv = api.build_argv(opts["outdir"], opts)
+                self.assertEqual(argv[argv.index("--cookies") + 1], os.path.join(tmp, "cookies.txt"))
+                open(os.path.join(opts["outdir"], "cookies.txt"), "w").close()   # its own wins
+                self.assertNotIn("--cookies", api.build_argv(opts["outdir"], opts))
+            finally:
+                api.DEFAULT_OUT = saved
+
     def test_output_is_unbuffered(self):
         # Buffered, the log would arrive in blocks and a job would look stuck.
         self.assertEqual(self.argv()[1], "-u")
@@ -389,6 +404,33 @@ class TestJobFile(unittest.TestCase):
         with self.assertRaises(PermissionError):
             api.job_file(self.root, "My.temp/My.temp.temp.mp4")
 
+    def test_a_jobs_own_run_files_are_never_served(self):
+        # Even when a job's folder is itself a video folder (holds videoinfo.txt).
+        self.put("Ch/Vid/download_log.json", "Ch/Vid/skip.txt", "Ch/Vid/links.txt", "videoinfo.txt")
+        for bad in ("Ch/Vid/download_log.json", "Ch/Vid/skip.txt", "Ch/Vid/links.txt"):
+            with self.assertRaises(PermissionError, msg=bad):
+                api.job_file(self.root, bad)
+        with self.assertRaises(PermissionError):
+            api.job_file(self.root, "download_log.json")       # top level, videoinfo.txt or not
+        video_root = os.path.join(self.root, "Ch", "Vid")      # a job pointed at a video folder
+        with self.assertRaises(PermissionError):
+            api.job_file(video_root, "Vid.mp4")
+
+    def test_hidden_files_are_refused_but_a_dotted_title_is_not(self):
+        self.put("Ch/Vid/.DS_Store", ".NET/videoinfo.txt", ".NET/.NET.mp4")
+        with self.assertRaises(PermissionError):
+            api.job_file(self.root, "Ch/Vid/.DS_Store")
+        self.assertTrue(api.job_file(self.root, ".NET/.NET.mp4"))
+
+    def test_an_older_clash_folder_still_recognises_its_streams(self):
+        # "<title> [<id>]" folders made before files took the folder's full name.
+        self.put("Ch/My Video [abcdefghijk]/videoinfo.txt", "Ch/My Video [abcdefghijk]/My Video.mp4",
+                 "Ch/My Video [abcdefghijk]/My Video.f137.mp4", "Ch/My Video [abcdefghijk]/My Video.temp.mp4")
+        self.assertTrue(api.job_file(self.root, "Ch/My Video [abcdefghijk]/My Video.mp4"))
+        for bad in ("My Video.f137.mp4", "My Video.temp.mp4"):
+            with self.assertRaises(PermissionError, msg=bad):
+                api.job_file(self.root, "Ch/My Video [abcdefghijk]/" + bad)
+
     def test_a_missing_file(self):
         with self.assertRaises(FileNotFoundError):
             api.job_file(self.root, "Ch/Vid/nope.mp4")
@@ -437,11 +479,24 @@ class TestPreview(unittest.TestCase):
             api.PREVIEW_LOCK.release()
             d.is_channel_url, api.PREVIEW_WAIT = saved
 
+    def test_a_preview_scans_with_a_deadline(self):
+        d = api.downloader
+        seen = {}
+        saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url)
+        d.is_channel_url, d.channel_videos_url = (lambda url: True), (lambda url: url)
+        d.list_channel_videos = lambda url, deadline=None: (seen.update(deadline=deadline), ([], "Ch", None))[1]
+        try:
+            began = __import__("time").monotonic()
+            api.preview_channel("https://www.youtube.com/@X", limit=1)
+        finally:
+            d.is_channel_url, d.list_channel_videos, d.channel_videos_url = saved
+        self.assertAlmostEqual(seen["deadline"] - began, api.PREVIEW_SECONDS, delta=2)
+
     def test_the_lock_is_released_even_when_the_listing_fails(self):
         d = api.downloader
         saved = (d.is_channel_url, d.list_channel_videos)
         d.is_channel_url = lambda url: True
-        d.list_channel_videos = lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
+        d.list_channel_videos = lambda url, deadline=None: (_ for _ in ()).throw(RuntimeError("boom"))
         try:
             with self.assertRaises(RuntimeError):
                 api.preview_channel("https://www.youtube.com/@X", limit=1)
@@ -580,8 +635,9 @@ class TestFailures(unittest.TestCase):
                    {"url": "3", "status": "failed", "error": "x"},
                    {"url": "4", "status": "unavailable"},
                    {"url": "5", "status": "channel_failed"},
-                   {"url": "6", "status": "channel", "videos": 3}]
-        self.assertEqual([f["url"] for f in api.failures_from(records)], ["3", "4", "5"])
+                   {"url": "6", "status": "channel", "videos": 3},
+                   {"url": "7", "status": "blocked", "error": "not a bot"}]
+        self.assertEqual([f["url"] for f in api.failures_from(records)], ["3", "4", "5", "7"])
 
     def test_a_failure_the_final_retry_fixed_is_not_a_failure(self):
         records = [{"url": "a", "status": "failed", "error": "stream died"},

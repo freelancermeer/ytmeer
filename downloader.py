@@ -15,6 +15,7 @@ Optional flags:
     --views N            Channel links: only videos with at least N views
     --limit N            Channel links: stop after the newest N matches
     --links FILE         Read the links from FILE instead of <directory>/links.txt
+    --cookies FILE       Use FILE instead of <directory>/cookies.txt
     --min-height N       Quality floor   (default: 720)
     --max-height N       Quality ceiling (default: 1080)
     --no-subs            Do NOT build transcripts (built by default)
@@ -324,6 +325,21 @@ def log_record(**fields):
             pass
 
 
+def write_empty_summary(stopped=False, excluded=0):
+    """The JSON log for a run that ended before downloading anything, so a caller
+    always has a summary. Unreadable channels are counted as failed, since they are
+    usually why there was nothing to do."""
+    write_json_log({
+        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "layout": "channel" if CHANNEL_MODE else "flat",
+        "min_views": MIN_VIEWS or None, "limit": LIMIT or None,
+        "excluded_by_skip_list": excluded, "links": 0, "downloaded": 0, "skipped": 0,
+        "failed": sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),
+        "stopped_early": stopped, "bytes": 0, "size": human_size(0),
+        "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
+    })
+
+
 def write_json_log(summary):
     """Write the JSON log: the run's totals, then a record per video."""
     if not LOG_JSON[0]:
@@ -570,6 +586,16 @@ PERMANENT_ERRORS = ("private video", "video is unavailable", "video unavailable"
                     "sign in to confirm your age", "members-only",
                     "is not a valid url", "unsupported url",
                     "video has been removed", "copyright claim") + BOT_GATE_ERRORS
+
+
+def failure_status(error_text):
+    """How a failure is recorded: "blocked" when YouTube refused this machine's IP,
+    "unavailable" when the video itself is gone, "failed" when another go may work.
+    A caller has to tell the first two apart - one needs cookies or another IP, the
+    other needs nothing."""
+    if is_bot_gated(error_text):
+        return "blocked"
+    return "unavailable" if is_permanent(error_text) else "failed"
 
 
 def is_permanent(error_text):
@@ -1244,6 +1270,15 @@ def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
         info, err = fetch_info_once(url, flags)
         if info:
             return info, None
+        if is_bot_gated(err) and not extra_flags:
+            # The gate is on this IP, but the mweb client sometimes still gets
+            # through. One immediate try; if it works, the rest of the batch starts
+            # with that client too.
+            info, _ = fetch_info_once(url, PO_TOKEN_FLAGS)
+            if info:
+                po_token_first[0] = True
+                return info, None
+            return None, err
         if is_permanent(err):
             return None, err
         if attempt < attempts:
@@ -1288,7 +1323,10 @@ def find_video_file(folder: str):
     for name in candidates:
         if os.path.splitext(name)[0] == wanted:
             return os.path.join(folder, name)
-    return os.path.join(folder, candidates[0]) if candidates else None
+    # Otherwise the first finished one: "<title>.f137.mp4" and "<title>.temp.mp4" are
+    # streams yt-dlp has not merged yet, and would sort ahead of "<title>.mp4".
+    finished = [n for n in candidates if not re.search(r"\.(f\d+|temp)\.[A-Za-z0-9]+$", n)]
+    return os.path.join(folder, finished[0]) if finished else None
 
 
 # ======================= identity, layout & resume =========================
@@ -1579,12 +1617,14 @@ def download_one(url, index, total):
         note(f"    ! Failed to fetch info: {err}")
         bar.done(f"FAIL  {err}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
-        log_record(url=url, status="unavailable" if is_permanent(err) else "failed",
-                   error=err, folder=rel(folder))
+        log_record(url=url, status=failure_status(err), error=err, folder=rel(folder))
         return "gone" if is_permanent(err) else "fail"
 
     # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
-    out_template = output_template(folder, folder_name)
+    # Named after the folder actually used - "<title> [<id>]" when another video
+    # already has "<title>" - so every name in it (video, trans_, words_, and the
+    # .f137/.temp streams yt-dlp writes on the way) shares one stem.
+    out_template = output_template(folder, os.path.basename(folder))
     sub_lang, sub_source, sub_client = choose_caption(url, info)
     if sub_client:
         po_token_first[0] = True   # only that client can see the caption track
@@ -1622,10 +1662,12 @@ def download_one(url, index, total):
         leftovers = mark_incomplete(folder)
         for name in leftovers:
             note(f"      partial file kept as {name}")
-        log_record(url=url, title=title, status="unavailable" if is_permanent(err) else "failed",
+        log_record(url=url, title=title, status=failure_status(err),
                    error=err, folder=rel(folder), partial=leftovers or None)
         write_info(folder, title, url, "FAILED", "ERROR", err)
-        return "gone" if is_permanent(err) else "fail"
+        # No format in the height range is as final as a deleted video: the final
+        # sweep would only run the same rounds again and record it twice.
+        return "gone" if is_permanent(err) or FORMAT_GONE in err.lower() else "fail"
 
     # 3) Verify the actual downloaded quality with ffprobe.
     vfile = find_video_file(folder)
@@ -1792,8 +1834,12 @@ def wanted_entry(entry):
     return (True, "") if views >= MIN_VIEWS else (False, "views")
 
 
-def list_channel_videos(url):
+def list_channel_videos(url, deadline=None):
     """A channel's videos worth downloading. Returns (links, channel name, error).
+
+    With a deadline (a time.monotonic() value) it stops before the next page once
+    that has passed, and answers with what it found and an error saying so - a
+    preview has to answer in time even when few videos clear the views floor.
 
     Pages through the channel's video tab newest-first and stops as soon as
     --limit is satisfied, so a small --limit costs one listing request even on a
@@ -1804,6 +1850,10 @@ def list_channel_videos(url):
     counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0}
     start = 1
     while True:
+        if deadline is not None and start > 1 and time.monotonic() >= deadline:
+            scan_done()
+            return links, name, (f"stopped after scanning {counts['scanned']} videos to "
+                                 f"answer in time; lower views to find matches sooner")
         data, err = channel_page(tab, start, start + CHANNEL_PAGE - 1)
         if err:
             scan_done()
@@ -1957,6 +2007,8 @@ def parse_args(argv=None):
     p.add_argument("--limit", type=int, default=0, metavar="N",
                    help="Channel links: stop after the newest N matching "
                         "videos (default: the whole channel).")
+    p.add_argument("--cookies", metavar="FILE",
+                   help="Use this cookies.txt instead of <directory>/cookies.txt.")
     p.add_argument("--links", metavar="FILE",
                    help="Read the links from FILE instead of <directory>/links.txt.")
     p.add_argument("--no-subs", action="store_true",
@@ -1999,7 +2051,8 @@ def main():
     use_utf8_output()
     args = parse_args()
     DOWNLOAD_DIR  = os.path.expanduser(args.directory)
-    COOKIES_FILE  = os.path.join(DOWNLOAD_DIR, "cookies.txt")
+    COOKIES_FILE  = (os.path.expanduser(args.cookies) if args.cookies
+                     else os.path.join(DOWNLOAD_DIR, "cookies.txt"))
     LINKS_FILE    = (os.path.expanduser(args.links) if args.links
                      else os.path.join(DOWNLOAD_DIR, "links.txt"))
     MIN_HEIGHT    = args.min_height
@@ -2069,6 +2122,7 @@ def main():
     links = read_links(LINKS_FILE)
     if not links:
         print(f"No links found in {LINKS_FILE}. Add one link per line.")
+        write_empty_summary()
         return
 
     # A channel link stands for many videos, so it is expanded before anything
@@ -2079,6 +2133,7 @@ def main():
     except KeyboardInterrupt:
         scan_done()
         print("\n\n  Stopped while reading the channel list; nothing was downloaded.")
+        write_empty_summary(stopped=True)
         return
     links, excluded = drop_skipped(links)
     excluded += skipped_by_list[0]      # the channel listings applied it too
@@ -2086,6 +2141,7 @@ def main():
         print(f"  Excluded {excluded} video(s) listed in skip.txt.")
     if not links:
         print("\nNothing left to download.")
+        write_empty_summary(excluded=excluded)
         return
 
     # Resume: one scan of what is already finished (either layout), keyed by

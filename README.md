@@ -523,18 +523,27 @@ is reachable. A failed one has `status` and `error` and no files - and
 can come back later as `ok`, because a run retries its failures once at the end.
 The job's `failures` lists only what finally did not come down.
 
+A video's `status` is `ok`, `skipped` (already on disk), `failed` (worth another
+go), `unavailable` (private, deleted - gone for good), or `blocked`: YouTube refused
+the server's IP ("confirm you're not a bot"), which says nothing about the video.
+When that happens the job has `"blocked": true` - give the server a cookies.txt, or
+run it from another IP. Channel links that could not be read are `channel_failed`.
+
 A job ends `finished`, `stopped`, or `error` (the downloader crashed or could not
 start; the reason is in `error`). `POST /stop` interrupts the downloader and the
 yt-dlp it is running, like Ctrl+C in a terminal; finished videos stay. Stopping
 the server stops its jobs the same way, so no download is left running unseen.
 
-`summary` is `null` when a run ends before writing one: nothing to download (every
-link failed or was skipped), stopped while reading a channel, or crashed. `failures`
-still says what happened.
+`summary` is `null` only when the downloader crashed; the reason is then in `error`.
+A run with nothing to download still writes one (with `excluded_by_skip_list` when
+skip.txt left nothing), and so does a stop while a channel was being read.
 
-`/api/preview` lists up to `limit` matching videos (default 20, at most 500) and
-runs one at a time - a second one meanwhile gets 503. On the public link a request
-must answer within about 60 seconds, so keep the limit small there.
+`/api/preview` lists up to `limit` matching videos (default 20, at most 500), stops
+scanning after about 45 seconds so it always answers on the public link (the result
+then says how far it got), and runs one at a time - a second one meanwhile gets 503.
+
+A `cookies.txt` in the download folder is used by every job and preview, and is
+never downloadable. On Colab, cell 1's `upload_cookies` puts it there.
 
 ## Google Colab
 
@@ -574,7 +583,12 @@ authored by Google, click **Run anyway**.
    still downloading, unless you tick `force_restart`, which stops its jobs first.
    If the saved port has been taken by something else, it picks another.
 
-Cookies are optional: public videos download without an account.
+Cookies are optional: public videos download without an account - unless YouTube
+blocks the runtime's IP, which happens to some Colab machines. Cell 2 checks that at
+start and prints `youtube OK` or `youtube BLOCKED`. When blocked, start a fresh
+runtime (Runtime > Disconnect and delete runtime, then Run all) to get another IP, or
+tick `upload_cookies` in cell 1 and upload a cookies.txt from a browser signed in to
+YouTube.
 
 ## Tests
 

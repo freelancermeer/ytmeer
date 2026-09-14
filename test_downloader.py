@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import downloader as d
@@ -702,6 +703,136 @@ class PlatformCase:
                              "no point paying for an attempt already known to 403")
         finally:
             d.po_token_first[0] = saved
+
+    # ------------------------------------------------ how a failure is recorded
+    def _download_one_failing(self, error, info_error=None, base=None):
+        """Run download_one with the network stubbed out; return (result, record)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = (d.fetch_info, d.choose_caption, d.run_with_retries, d.DONE_INDEX,
+                 d.CHANNEL_MODE, list(d.LOG_RECORDS))
+        info = None if info_error else {"id": "abcdefghijk", "title": "T"}
+        d.fetch_info = lambda url, *a, **k: (info, info_error)
+        d.choose_caption = lambda url, i: (None, None, [])
+        d.run_with_retries = lambda attempt: error
+        d.DONE_INDEX, d.CHANNEL_MODE, d.DOWNLOAD_DIR = {}, False, base or tmp.name
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = d.download_one("https://youtu.be/abcdefghijk", 1, 1)
+            record = d.LOG_RECORDS[-1]
+        finally:
+            (d.fetch_info, d.choose_caption, d.run_with_retries, d.DONE_INDEX,
+             d.CHANNEL_MODE, records) = saved
+            d.LOG_RECORDS[:] = records
+        return result, record
+
+    def test_failure_statuses(self):
+        self.assertEqual(d.failure_status("Sign in to confirm you\u2019re not a bot"), "blocked")
+        self.assertEqual(d.failure_status("ERROR: Private video"), "unavailable")
+        self.assertEqual(d.failure_status("HTTP Error 403: Forbidden"), "failed")
+
+    def test_a_bot_gated_download_is_recorded_as_blocked(self):
+        result, record = self._download_one_failing("ERROR: [youtube] x: Sign in to confirm you're not a bot.")
+        self.assertEqual((result, record["status"]), ("gone", "blocked"))
+
+    def test_a_bot_gated_lookup_is_recorded_as_blocked(self):
+        result, record = self._download_one_failing(None, info_error="Sign in to confirm you're not a bot")
+        self.assertEqual((result, record["status"]), ("gone", "blocked"))
+
+    def test_no_format_in_range_is_final_so_the_sweep_leaves_it(self):
+        result, record = self._download_one_failing(
+            "[youtube] abcdefghijk: Requested format is not available. Use --list-formats")
+        self.assertEqual((result, record["status"]), ("gone", "failed"))
+
+    def test_a_passing_hiccup_is_still_worth_the_sweep(self):
+        result, record = self._download_one_failing("HTTP Error 503: Service Unavailable")
+        self.assertEqual((result, record["status"]), ("fail", "failed"))
+
+    def test_files_take_the_name_of_the_folder_they_land_in(self):
+        with tempfile.TemporaryDirectory() as base:
+            os.makedirs(os.path.join(base, "T"))
+            with open(os.path.join(base, "T", "videoinfo.txt"), "w") as f:
+                f.write("Link:    https://youtu.be/zzzzzzzzzzz\n")      # another video's "T"
+            seen, real = [], d.output_template
+            d.output_template = lambda folder, name: seen.append(name) or real(folder, name)
+            try:
+                self._download_one_failing("HTTP Error 503", base=base)
+            finally:
+                d.output_template = real
+        self.assertEqual(seen, ["T [abcdefghijk]"])
+
+    def test_an_unmerged_stream_is_never_taken_for_the_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "My Video [abcdefghijk]")
+            os.makedirs(folder)
+            for name in ("My Video.f137.mp4", "My Video.temp.mp4"):
+                open(os.path.join(folder, name), "w").close()
+            self.assertIsNone(d.find_video_file(folder))
+            open(os.path.join(folder, "My Video [abcdefghijk].mp4"), "w").close()
+            self.assertTrue(d.find_video_file(folder).endswith("[abcdefghijk].mp4"))
+
+    def test_a_bot_gated_lookup_tries_the_mweb_client_once(self):
+        self._no_sleep()
+        calls, saved = [], (d.fetch_info_once, d.po_token_first[0])
+
+        def once(url, flags=()):
+            calls.append(list(flags))
+            return ({"id": "x"}, None) if flags else (None, "Sign in to confirm you're not a bot")
+
+        d.fetch_info_once, d.po_token_first[0] = once, False
+        try:
+            info, err = d.fetch_info("https://youtu.be/x")
+            latched = d.po_token_first[0]
+        finally:
+            d.fetch_info_once, d.po_token_first[0] = saved
+        self.assertEqual((info, err), ({"id": "x"}, None))
+        self.assertEqual(calls, [[], d.PO_TOKEN_FLAGS])
+        self.assertTrue(latched, "the rest of the batch should start with that client")
+
+    def test_a_lookup_gated_on_every_client_gives_up_at_once(self):
+        self._no_sleep()
+        calls, saved = [], d.fetch_info_once
+        d.fetch_info_once = lambda url, flags=(): (calls.append(1), (None, "Sign in to confirm you're not a bot"))[1]
+        try:
+            info, err = d.fetch_info("https://youtu.be/x")
+        finally:
+            d.fetch_info_once = saved
+        self.assertIsNone(info)
+        self.assertIn("not a bot", err)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_listing_with_a_deadline_answers_with_what_it_has(self):
+        d.CHANNEL_PAGE = 2
+        asked = self.listing([self.entry("aaaaaaaaaaa"), self.entry("bbbbbbbbbbb")],
+                             [self.entry("ccccccccccc")])
+        links, _name, err = d.list_channel_videos("https://www.youtube.com/@X",
+                                                  deadline=time.monotonic() - 1)
+        self.assertEqual(asked, [(1, 2)])                   # never the second page
+        self.assertEqual(len(links), 2)
+        self.assertIn("stopped after scanning 2 videos", err)
+
+    @unittest.skipUnless(shutil.which("yt-dlp") and shutil.which("ffmpeg"),
+                         "main() refuses to start without yt-dlp and ffmpeg")
+    def test_runs_that_end_early_still_write_a_summary(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        for links, skip, excluded in (("https://youtu.be/abcdefghijk\n", "abcdefghijk\n", 1),
+                                      ("# only a comment\n", None, 0)):
+            with tempfile.TemporaryDirectory() as folder:
+                with open(os.path.join(folder, "links.txt"), "w") as f:
+                    f.write(links)
+                if skip:
+                    with open(os.path.join(folder, "skip.txt"), "w") as f:
+                        f.write(skip)
+                cookies = os.path.join(folder, "elsewhere-cookies.txt")
+                script = ("import sys, downloader as d\n"
+                          f"sys.argv = ['downloader.py', {folder!r}, '--cookies', {cookies!r}]\n"
+                          "d.main()\nprint('COOKIES', d.COOKIES_FILE)\n")
+                out = subprocess.run([sys.executable, "-c", script], cwd=here,
+                                     capture_output=True, text=True, timeout=60)
+                self.assertIn(f"COOKIES {cookies}", out.stdout, out.stderr)
+                with open(os.path.join(folder, "download_log.json")) as f:
+                    run = json.load(f)["run"]
+                self.assertEqual((run["downloaded"], run["excluded_by_skip_list"]), (0, excluded))
 
     def test_no_format_in_the_height_range_is_not_retried_for_minutes(self):
         self._no_sleep()

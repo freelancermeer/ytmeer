@@ -70,6 +70,9 @@ FAKE = textwrap.dedent('''
             print(f"[{i+1}/{n}] OK {name}", flush=True)
         if mode == "crash":
             raise RuntimeError("disk full")
+        if mode == "blocked":
+            log({"url": "https://youtu.be/gatedxxxxxx", "status": "blocked",
+                 "error": "Sign in to confirm you're not a bot"})
         if mode == "sweep":        # the final retry fixes it
             log({"url": "https://youtu.be/flakyxxxxxx", "status": "ok", "title": "Flaky",
                  "folder": "Ch/Vid 0"})
@@ -323,7 +326,7 @@ class TestRoutes(unittest.TestCase):
         saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url)
         d.is_channel_url = lambda url: True
         d.channel_videos_url = lambda url: url
-        d.list_channel_videos = lambda url: (time.sleep(3), ([], "Ch", None))[1]
+        d.list_channel_videos = lambda url, deadline=None: (time.sleep(3), ([], "Ch", None))[1]
         try:
             slow = TestClient(self.app)
             import threading as _t
@@ -462,7 +465,7 @@ class TestRoutes(unittest.TestCase):
         d = api.downloader
         saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT)
         d.is_channel_url, d.channel_videos_url = (lambda url: True), (lambda url: url)
-        d.list_channel_videos = lambda url: (time.sleep(2), ([], "Ch", None))[1]
+        d.list_channel_videos = lambda url, deadline=None: (time.sleep(2), ([], "Ch", None))[1]
         api.PREVIEW_WAIT = 0.3
         try:
             import threading as _t
@@ -476,6 +479,27 @@ class TestRoutes(unittest.TestCase):
             self.assertEqual(self.c.get("/api/preview?channel=z", headers=self.h).status_code, 200)
         finally:
             d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT = saved
+
+    def test_a_blocked_run_says_so(self):
+        os.environ["FAKE_MODE"] = "blocked"
+        job = self.wait(self.start())
+        self.assertTrue(job["blocked"])
+        self.assertIn("blocked", [f["status"] for f in job["failures"]])
+        os.environ.pop("FAKE_MODE")
+        self.assertFalse(self.wait(self.start(outdir="other"))["blocked"])
+
+    def test_head_on_a_download(self):
+        job_id = self.start()
+        self.wait(job_id)
+        url = "/api" + self.c.get(f"/api/jobs/{job_id}/videos", headers=self.h).json()["videos"][0]["downloads"]["video"]
+        r = self.c.head(url, headers=self.h)
+        self.assertEqual((r.status_code, r.content), (200, b""))
+        self.assertEqual(int(r.headers["content-length"]), len(self.c.get(url, headers=self.h).content))
+
+    def test_the_schema_anchors_sub_lang(self):
+        schema = self.c.get("/api/openapi.json").json()
+        pattern = schema["components"]["schemas"]["JobRequest"]["properties"]["sub_lang"]["pattern"]
+        self.assertTrue(pattern.startswith("^") and pattern.endswith("$"), pattern)
 
     def test_health_reports_the_code_version(self):
         body = self.c.get("/api/health", headers=self.h).json()
@@ -544,6 +568,26 @@ class TestPublicServer(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn("/api/openapi.json", body)
             self.assertEqual(get("/")[0], 200)                   # Gradio's page is still there
+
+            # Gradio's Brotli middleware must not touch downloads: Content-Length and
+            # Range have to describe the file's own bytes.
+            folder = os.path.join(api.DEFAULT_OUT, "brotli_check", "Vid")
+            os.makedirs(folder, exist_ok=True)
+            text = "[00:00:00] a transcript line long enough to be worth compressing\n" * 40
+            for name, content in (("videoinfo.txt", "Title: Vid\n"), ("trans_Vid.txt", text)):
+                with open(os.path.join(folder, name), "w") as f:
+                    f.write(content)
+            api.JOBS["job_brotli"] = {"outdir": os.path.join(api.DEFAULT_OUT, "brotli_check"), "state": "finished"}
+            try:
+                req = urllib.request.Request(base + "/api/jobs/job_brotli/files/Vid/trans_Vid.txt",
+                                             headers={"X-API-Key": "k", "Accept-Encoding": "br, gzip"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read()
+                    self.assertNotIn(resp.headers.get("Content-Encoding", ""), ("br", "gzip"))
+                    self.assertEqual(int(resp.headers["Content-Length"]), len(text))
+                self.assertEqual(raw.decode(), text)
+            finally:
+                api.JOBS.pop("job_brotli", None)
         finally:
             demo.close()
             api.API_KEY[0] = None

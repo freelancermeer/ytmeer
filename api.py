@@ -71,7 +71,7 @@ MAX_LOG_LINES = 2000                   # a job keeps its recent output; the rest
 STREAM = "download_log.jsonl"          # download_log.txt. The stream: downloader.log_record()
 ACTIVE = ("queued", "running")
 DONE = ("ok", "skipped")
-FAILED = ("failed", "unavailable", "channel_failed")
+FAILED = ("failed", "unavailable", "blocked", "channel_failed")
 
 # Never downloadable, wherever they turn up: a logged-in session and the keys.
 PRIVATE_NAMES = {"cookies.txt", ".api_key", ".api_key_new"}
@@ -81,6 +81,12 @@ PARTIAL_RE = re.compile(r"\.(part|ytdl|aria2)$|\.part-frag\d*$", re.I)
 # "My.temp" still has a downloadable "My.temp.mp4".
 STREAM_PART_RE = re.compile(r"\.(temp|f\d+)\.", re.I)
 PREVIEW_WAIT = 5                       # seconds a preview waits for another one to end
+PREVIEW_SECONDS = 45                   # a preview stops scanning then: gradio.live cuts at 60
+# A job's own run files - never downloadable, even when a job's folder is itself a
+# video folder (the file endpoints only serve what the downloader made for a video).
+RUN_FILES = {"download_log.json", "download_log.jsonl", "download_log.txt",
+             "skip.txt", "links.txt"}
+CLASH_SUFFIX_RE = re.compile(r" \[[A-Za-z0-9_-]{11}\]$")
 
 
 class PreviewBusy(Exception):
@@ -163,7 +169,7 @@ INT_FIELDS = ("views", "limit", "min_height", "max_height")
 # Upper bounds, so no value reaches a JSON encoder (Gradio's orjson) that cannot
 # write it - a limit of 10**20 used to turn GET /api/jobs into a 500 for everyone.
 INT_MAX = {"views": 10**12, "limit": 10**6, "min_height": 10**4, "max_height": 10**4}
-SUB_LANG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,34}")
+SUB_LANG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,34}$")   # anchored for the schema too
 BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose")
 
 
@@ -241,6 +247,12 @@ def build_argv(outdir, opts, links_file=None):
     argv = [sys.executable, "-u", DOWNLOADER, outdir]
     if links_file:
         argv += ["--links", links_file]
+    # A cookies.txt in the download folder serves every job - also one in a
+    # subfolder, which would otherwise look for its own. The downloader reads the
+    # job folder's own cookies.txt first when there is one.
+    shared = os.path.join(DEFAULT_OUT, "cookies.txt")
+    if os.path.isfile(shared) and not os.path.isfile(os.path.join(outdir, "cookies.txt")):
+        argv += ["--cookies", shared]
     if opts["channel"]:
         argv.append("--channel")
     if opts["views"] > 0:
@@ -351,12 +363,20 @@ def folder_files(folder):
     }
 
 
+def _stems(folder_name):
+    """The names a video folder's files can start with: the folder's own, and - for a
+    "<title> [<id>]" folder made before files took that full name - the bare title."""
+    bare = CLASH_SUFFIX_RE.sub("", folder_name)
+    return (folder_name, bare) if bare != folder_name else (folder_name,)
+
+
 def _unfinished(name, folder_name):
     low = name.lower()
     if low.startswith("incomplete_") or PARTIAL_RE.search(low):
         return True
-    if name.startswith(folder_name + "."):
-        return STREAM_PART_RE.match(name[len(folder_name):]) is not None
+    for stem in _stems(folder_name):
+        if name.startswith(stem + "."):
+            return STREAM_PART_RE.match(name[len(stem):]) is not None
     return False
 
 
@@ -376,10 +396,14 @@ def job_file(outdir, relpath):
     if not target.startswith(root + os.sep):
         raise PermissionError("that path is outside the job's folder")
     name, folder = os.path.basename(target), os.path.dirname(target)
-    if name.lower() in PRIVATE_NAMES:
+    if name.lower() in PRIVATE_NAMES or name in RUN_FILES:
         raise PermissionError("that file is not served")
-    if not os.path.isfile(os.path.join(folder, "videoinfo.txt")):
+    if folder == root or not os.path.isfile(os.path.join(folder, "videoinfo.txt")):
         raise PermissionError("only files inside a video folder are served")
+    # Hidden files (.DS_Store and the like) are not the downloader's - but a video
+    # whose title starts with a dot has files that do too, named after its folder.
+    if name.startswith(".") and not any(name.startswith(stem) for stem in _stems(os.path.basename(folder))):
+        raise PermissionError("that file is not served")
     if _unfinished(name, os.path.basename(folder)):
         raise PermissionError("that file is still being written, or was left incomplete")
     if not os.path.isfile(target):
@@ -399,7 +423,7 @@ def list_files(outdir, job_id):
     found = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
-        if "videoinfo.txt" not in filenames:
+        if "videoinfo.txt" not in filenames or os.path.realpath(dirpath) == root:
             continue                      # only video folders hold downloadable files
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
@@ -478,6 +502,8 @@ def public(job, tail=20):
             "created": job["created"], "finished": job["finished"],
             "videos_done": sum(1 for v in videos if v.get("status") in DONE),
             "failures": failures_from(records),
+            # YouTube refused this server's IP: a problem with the machine, not the videos.
+            "blocked": any(r.get("status") == "blocked" for r in records),
             "summary": job["summary"], "returncode": job["returncode"],
             "error": job["error"], "log_lines": job["lines"],
             "log": log[-tail:] if tail else [],
@@ -666,7 +692,7 @@ def preview_channel(channel, views=0, limit=20, skip=""):
         d.SKIP_IDS = {v for v in (d.video_id_from_url(x) or
                                   (x if d.BARE_ID_RE.match(x) else None)
                                   for x in _lines(skip).split()) if v}
-        found, name, err = d.list_channel_videos(url)
+        found, name, err = d.list_channel_videos(url, deadline=time.monotonic() + PREVIEW_SECONDS)
     finally:
         PREVIEW_LOCK.release()
     return {"channel": name or None, "tab_read": d.channel_videos_url(url),
@@ -751,6 +777,7 @@ def build_app():
             states = collections.Counter(j["state"] for j in JOBS.values())
         return {"ok": True, "version": VERSION, "code": CODE_VERSION,
                 "public_url": PUBLIC_URL[0],
+                "cookies": os.path.isfile(os.path.join(DEFAULT_OUT, "cookies.txt")),
                 "default_folder": DEFAULT_OUT, "tools": tools_present(),
                 "jobs": dict(states)}
 
@@ -818,7 +845,8 @@ def build_app():
         return {"job_id": job_id, "folder": job["outdir"],
                 "files": list_files(job["outdir"], job_id)}
 
-    @app.get("/api/jobs/{job_id}/files/{path:path}", tags=["files"], dependencies=keyed)
+    @app.api_route("/api/jobs/{job_id}/files/{path:path}", methods=["GET", "HEAD"],
+                   tags=["files"], dependencies=keyed)
     def get_file(job_id: str, path: str):
         """Download one file from the job's folder. Range requests work, so a large
         video can be fetched in parts or resumed. Files still being written, hidden
@@ -831,7 +859,10 @@ def build_app():
             raise HTTPException(404, f"no such file: {path}")
         except PermissionError as e:
             raise HTTPException(403, str(e))
-        return FileResponse(full, filename=os.path.basename(full), stat_result=stat)
+        # "identity" keeps Gradio's Brotli middleware off: it compresses .txt on the fly,
+        # which turns Content-Length and Range parts into sizes of compressed bytes.
+        return FileResponse(full, filename=os.path.basename(full), stat_result=stat,
+                            headers={"Content-Encoding": "identity"})
 
     @app.post("/api/jobs/{job_id}/stop", tags=["jobs"], dependencies=keyed)
     def post_stop(job_id: str):
