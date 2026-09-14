@@ -543,7 +543,8 @@ scanning after about 45 seconds so it always answers on the public link (the res
 then says how far it got), and runs one at a time - a second one meanwhile gets 503.
 
 A `cookies.txt` in the download folder is used by every job and preview, and is
-never downloadable. On Colab, cell 1's `upload_cookies` puts it there.
+never downloadable. Each job looks for it as it starts, so one added later is used
+from the next job on - no restart.
 
 ## Google Colab
 
@@ -585,10 +586,15 @@ authored by Google, click **Run anyway**.
 
 Cookies are optional: public videos download without an account - unless YouTube
 blocks the runtime's IP, which happens to some Colab machines. Cell 2 checks that at
-start and prints `youtube OK` or `youtube BLOCKED`. When blocked, start a fresh
+start and prints `youtube OK` or `youtube BLOCKED`. When blocked, either start a fresh
 runtime (Runtime > Disconnect and delete runtime, then Run all) to get another IP, or
-tick `upload_cookies` in cell 1 and upload a cookies.txt from a browser signed in to
-YouTube.
+drag a `cookies.txt` into Colab's Files panel - it lands in `/content` - and run cell 2
+again: it copies the file into the download folder, where every job uses it. With
+`use_drive` ticked you can instead keep `cookies.txt` in the Drive folder once.
+
+Export the cookies from a private browser window: sign in to YouTube there, export,
+then close the window. A session you keep using gets its cookies rotated, which
+quietly invalidates the exported copy.
 
 ## Tests
 
