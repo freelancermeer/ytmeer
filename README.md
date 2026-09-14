@@ -526,15 +526,20 @@ The job's `failures` lists only what finally did not come down.
 A video's `status` is `ok`, `skipped` (already on disk), `failed` (worth another
 go), `unavailable` (private, deleted - gone for good), or `blocked`: YouTube refused
 the server's IP ("confirm you're not a bot"), which says nothing about the video.
-When that happens the job has `"blocked": true` - give the server a cookies.txt, or
-run it from another IP. Channel links that could not be read are `channel_failed`.
+When that happens - to a video or to a channel listing - the job has `"blocked": true`:
+give the server a cookies.txt, or run it from another IP. Channel links that could not
+be read are `channel_failed`, and count in the summary's `failed`. A video with no
+format between `min_height` and `max_height` is `failed` but not retried in that run:
+only another height range can change it.
 
 A job ends `finished`, `stopped`, or `error` (the downloader crashed or could not
 start; the reason is in `error`). `POST /stop` interrupts the downloader and the
 yt-dlp it is running, like Ctrl+C in a terminal; finished videos stay. Stopping
 the server stops its jobs the same way, so no download is left running unseen.
 
-`summary` is `null` only when the downloader crashed; the reason is then in `error`.
+`summary` is `null` when the downloader crashed or could not write it - the job is
+then `error`, with the reason in `error` - or when the job was stopped before the
+downloader had started.
 A run with nothing to download still writes one (with `excluded_by_skip_list` when
 skip.txt left nothing), and so does a stop while a channel was being read.
 
@@ -544,7 +549,12 @@ then says how far it got), and runs one at a time - a second one meanwhile gets 
 
 A `cookies.txt` in the download folder is used by every job and preview, and is
 never downloadable. Each job looks for it as it starts, so one added later is used
-from the next job on - no restart.
+from the next job on - no restart. Your file is never changed: yt-dlp gets a private
+copy beside it, `.ytdl_cookies_*.txt`, removed when the run ends (yt-dlp would
+otherwise save rotated cookies back into yours; one left by a run killed outright is
+removed a day later). If the file cannot be
+read, or YouTube rejects it ("The page needs to be reloaded" - it was rotated after
+export, or is used from another IP), the run carries on without it and says so.
 
 ## Google Colab
 

@@ -1,5 +1,6 @@
 # Secrets / auth — never commit
 cookies.txt
+.ytdl_cookies_*
 
 # Downloaded media & outputs
 downloads/

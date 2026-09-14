@@ -19,6 +19,37 @@ class TestNormalizeRequest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 api.normalize_request(bad)
 
+    def test_a_link_that_yt_dlp_would_read_as_an_option_is_refused(self):
+        for bad in ("--exec=touch /tmp/x", "-f best", "https://youtu.be/aaaaaaaaaaa\n-v"):
+            with self.assertRaises(ValueError, msg=bad):
+                api.normalize_request({"links": bad})
+        # A bare video id may start with "-"; the downloader puts every URL after "--".
+        self.assertEqual(api.normalize_request({"links": "-wNyEUrxzFU"})["links"], "-wNyEUrxzFU")
+
+    def test_a_run_that_leaves_no_summary_is_an_error_unless_it_was_stopped(self):
+        import collections
+        with tempfile.TemporaryDirectory() as out:
+            for stopped, state in ((False, "error"), (True, "stopped")):
+                job = {"outdir": out, "links_file": None, "stop_requested": stopped, "error": None,
+                       "log": collections.deque(["(could not write download_log.json: denied)"])}
+                api._finish(job)
+                self.assertEqual(job["state"], state)
+                if stopped:
+                    self.assertIsNone(job["error"])
+                else:
+                    self.assertIn("could not write download_log.json", job["error"])
+
+    def test_a_stop_python_swallowed_while_starting_leaves_the_run_finished(self):
+        import collections
+        with tempfile.TemporaryDirectory() as out:
+            for stopped_early, state in ((False, "finished"), (True, "stopped")):
+                with open(os.path.join(out, "download_log.json"), "w") as f:
+                    json.dump({"run": {"stopped_early": stopped_early}, "videos": []}, f)
+                job = {"outdir": out, "links_file": None, "stop_requested": True, "error": None,
+                       "log": collections.deque()}
+                api._finish(job)
+                self.assertEqual(job["state"], state)
+
     def test_links_may_be_a_list(self):
         opts = api.normalize_request({"links": ["https://youtu.be/aaaaaaaaaaa",
                                                "https://youtu.be/bbbbbbbbbbb"]})
@@ -389,10 +420,36 @@ class TestJobFile(unittest.TestCase):
 
     def test_private_and_unfinished_files_are_refused(self):
         for bad in ("Ch/Vid/cookies.txt", "Ch/Vid/Vid.f137.mp4.part", "Ch/Vid/Vid.f137.mp4",
-                    "Ch/Vid/Vid.temp.mp4", "Ch/Vid/INCOMPLETE_old.mp4",
-                    "Ch/Vid/incomplete_other.mp4", "Ch/Vid/Vid.mp4.aria2"):
+                    "Ch/Vid/Vid.temp.mp4", "Ch/Vid/INCOMPLETE_old.mp4", "Ch/Vid/Vid.mp4.aria2"):
             with self.assertRaises(PermissionError, msg=bad):
                 api.job_file(self.root, bad)
+
+    def test_only_the_downloaders_own_marker_means_incomplete(self):
+        # sanitize("Incomplete: ideas") is "Incomplete_ ideas" - a title, not a leftover.
+        self.put("Ch/Incomplete_ ideas/videoinfo.txt", "Ch/Incomplete_ ideas/Incomplete_ ideas.mp4")
+        self.assertTrue(api.job_file(self.root, "Ch/Incomplete_ ideas/Incomplete_ ideas.mp4"))
+        self.assertTrue(api.job_file(self.root, "Ch/Vid/incomplete_other.mp4"))
+
+    def test_a_folder_spelled_another_way_is_not_served_either(self):
+        # Stream parts are recognised by the folder's name; another spelling of the
+        # folder must not turn them into ordinary files.
+        self.put("Ch/Vid/Vid.f137.mp4", "Ch/Vid/Vid.temp.mp4")
+        for other in ("Ch/VID/Vid.f137.mp4", "ch/vid/Vid.temp.mp4"):
+            # PermissionError on a case-insensitive disk, FileNotFoundError on another.
+            with self.assertRaises((PermissionError, FileNotFoundError), msg=other):
+                api.job_file(self.root, other)
+        self.assertTrue(api._unfinished("Vid.f137.mp4", "VID"))
+        self.assertTrue(api._unfinished("Cafe\u0301.temp.mp4", "Caf\u00e9"))
+
+    def test_only_the_name_as_it_is_on_disk_is_served(self):
+        # A case-insensitive disk (macOS, Windows) would open these as the real files.
+        self.put("Ch/Vid/download_log.txt")
+        for bad in ("Ch/Vid/DOWNLOAD_LOG.TXT", "Ch/Vid/Skip.TXT", "Ch/Vid/Links.txt"):
+            with self.assertRaises(PermissionError, msg=bad):
+                api.job_file(self.root, bad)
+        for other in ("Ch/Vid/VID.MP4", "Ch/Vid/incomplete_OLD.mp4"):
+            with self.assertRaises(FileNotFoundError, msg=other):
+                api.job_file(self.root, other)
 
     def test_awkward_titles_are_still_served(self):
         # Folder and file take the video's title, so a title may start with a dot
@@ -437,7 +494,8 @@ class TestJobFile(unittest.TestCase):
 
     def test_the_listing_offers_only_what_can_be_downloaded(self):
         paths = [f["path"] for f in api.list_files(self.root, "job_x")]
-        self.assertEqual(paths, ["Ch/Vid/Vid.mp4", "Ch/Vid/trans_Vid.txt", "Ch/Vid/videoinfo.txt"])
+        self.assertEqual(paths, ["Ch/Vid/Vid.mp4", "Ch/Vid/incomplete_other.mp4",
+                                 "Ch/Vid/trans_Vid.txt", "Ch/Vid/videoinfo.txt"])
 
     def test_download_urls_are_escaped(self):
         folder = os.path.join(self.root, "Ch", "A video #1? 100%")

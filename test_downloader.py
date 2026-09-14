@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -271,6 +272,157 @@ class PlatformCase:
                 "_dummy": None}
         got = [(code, source) for code, source, _c in d.caption_candidates("u", info)]
         self.assertEqual(got, [("en", "auto"), ("en-orig", "auto"), ("en-uYU", "manual")])
+
+    def test_a_vtt_only_auto_track_gives_way_to_the_manual_track(self):
+        # "Me at the zoo": auto "en" is offered as vtt only, manual "en" as json3.
+        info = {"automatic_captions": {"en": [{"ext": "vtt", "name": "English"}]},
+                "subtitles": {"en": [{"ext": "json3", "name": "English"}, {"ext": "vtt", "name": "English"}]}}
+        self.assertEqual(d.resolve_sub_lang(info), ("en", "manual"))
+        got = [(code, source) for code, source, _c in d.caption_candidates("u", {**info, "automatic_captions": {
+            "en": [{"ext": "vtt"}], "en-orig": [{"ext": "json3"}]}})]
+        self.assertEqual(got, [("en-orig", "auto"), ("en", "manual")])
+
+    def test_no_caption_file_outlives_the_transcript_search(self):
+        # A fetch that yt-dlp answered with a vtt, however the search ends.
+        saved = (d.caption_candidates, d.fetch_caption, d.DOWNLOAD_SUBS)
+        with tempfile.TemporaryDirectory() as folder:
+            def fetch(folder_, url, lang, source, client=()):
+                for name in ("Clip.en.vtt", "Clip.en.ttml", "Clip.en.json3"):
+                    open(os.path.join(folder_, name), "w").close()
+                return False
+            d.caption_candidates = lambda url, info: iter([("en", "auto", []), ("en", "manual", [])])
+            d.fetch_caption, d.DOWNLOAD_SUBS = fetch, True
+            try:
+                for name in ("Clip.en.vtt", "Clip.mp4", "videoinfo.txt", "Old.en.srt"):
+                    open(os.path.join(folder, name), "w").close()
+                d.build_transcripts(folder, "u", {})
+            finally:
+                d.caption_candidates, d.fetch_caption, d.DOWNLOAD_SUBS = saved
+            # .srt stays: the first version kept its transcripts that way.
+            self.assertEqual(sorted(n for n in os.listdir(folder) if not n.startswith(("trans_", "words_"))),
+                             ["Clip.mp4", "Old.en.srt", "videoinfo.txt"])
+
+    def test_a_non_english_json3_auto_track_still_leaves_room_for_the_mweb_opinion(self):
+        saved = d.fetch_info
+        asked = []
+        d.fetch_info = lambda url, flags=(), attempts=3: (asked.append(1), (None, "x"))[1]
+        try:
+            list(d.caption_candidates("u", {"automatic_captions": {"fr": [{"ext": "json3"}],
+                                                                   "en": [{"ext": "vtt"}]}}))
+        finally:
+            d.fetch_info = saved
+        self.assertEqual(asked, [1])
+
+    def test_a_stopped_download_waits_for_yt_dlp_before_going(self):
+        # Left running, yt-dlp would write its cookie jar into the removed private copy.
+        class Proc:
+            def __init__(self, timeout_first=False):
+                self.calls, self.timeout_first = [], timeout_first
+                self.stdout = self
+            def read1(self, n):
+                raise self.error
+            def terminate(self): self.calls.append("terminate")
+            def send_signal(self, sig): self.calls.append("sigint" if sig == signal.SIGINT else sig)
+            def kill(self): self.calls.append("kill")
+            def wait(self, timeout=None): self.calls.append("wait")
+            def communicate(self, timeout=None):
+                self.calls.append("communicate")
+                if self.timeout_first == "again" and self.calls.count("communicate") == 1:
+                    raise KeyboardInterrupt           # a second signal lands in the wait
+                if self.timeout_first is True and "kill" not in self.calls:
+                    raise subprocess.TimeoutExpired("yt-dlp", timeout)
+                return b"", None
+        saved, handler = d.subprocess.Popen, signal.getsignal(signal.SIGINT)
+        try:
+            for error, timeout_first, expected in (
+                    (KeyboardInterrupt(), False, ["communicate"]),          # the group got the Ctrl+C
+                    (SystemExit(143), False, ["sigint" if os.name == "posix" else "terminate",
+                                              "communicate"]),                     # a kill reached us alone
+                    (KeyboardInterrupt(), True, ["communicate", "kill", "wait"]),    # never unbounded
+                    (SystemExit(143), "again", ["sigint" if os.name == "posix" else "terminate",
+                                                "communicate", "communicate"])):     # waits on, exits 143
+                proc = Proc(timeout_first)
+                proc.error = error
+                d.subprocess.Popen = lambda *a, **k: proc
+                with self.assertRaises(type(error)):
+                    d.run_streaming(["yt-dlp"])
+                self.assertEqual(proc.calls, expected)
+                # Ctrl+C handling is left alone: after an error the batch carries on.
+                self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+        finally:
+            d.subprocess.Popen = saved
+            signal.signal(signal.SIGINT, handler)
+
+    def test_ctrl_c_stops_the_run_once_and_later_ones_are_ignored(self):
+        saved = d.STOPPING[0]
+        d.STOPPING[0] = False
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                d.on_sigint(signal.SIGINT, None)
+            self.assertIsNone(d.on_sigint(signal.SIGINT, None))   # the second press
+        finally:
+            d.STOPPING[0] = saved
+
+    def test_a_kill_while_writing_the_summary_keeps_the_last_one_whole(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "download_log.json")
+            with open(path, "w") as f:
+                f.write('{"run": "before"}')
+            saved = (d.LOG_JSON[0], d.json.dump)
+            def dump(obj, f, **kw):
+                f.write('{"run": ')
+                raise SystemExit(143)
+            d.LOG_JSON[0], d.json.dump = path, dump
+            try:
+                with self.assertRaises(SystemExit):
+                    d.write_json_log({"x": 1})
+            finally:
+                d.LOG_JSON[0], d.json.dump = saved
+            with open(path) as f:
+                self.assertEqual(json.load(f), {"run": "before"})
+            self.assertEqual(os.listdir(folder), ["download_log.json"])
+
+    def test_a_kill_to_the_downloader_alone_reaches_its_group(self):
+        # Otherwise aria2c keeps downloading and holds the pipe the wait is on.
+        sent = []
+        saved = (d.os.getpgrp, d.os.getpid, d.os.killpg, d.signal.signal)
+        self.addCleanup(d.STOPPING.__setitem__, 0, d.STOPPING[0])
+        d.os.getpgrp, d.os.getpid = (lambda: 4242), (lambda: 4242)
+        d.os.killpg = lambda pgid, sig: sent.append((pgid, sig))
+        d.signal.signal = lambda sig, handler: sent.append((sig, handler))
+        try:
+            with self.assertRaises(SystemExit) as stop:
+                d.stop_on_sigterm(signal.SIGTERM, None)
+            d.os.getpid = lambda: 99                    # inside someone else's group: only exit
+            with self.assertRaises(SystemExit):
+                d.stop_on_sigterm(signal.SIGTERM, None)
+        finally:
+            d.os.getpgrp, d.os.getpid, d.os.killpg, d.signal.signal = saved
+        self.assertEqual(stop.exception.code, 128 + signal.SIGTERM)
+        if os.name == "posix":
+            self.assertEqual([s for s in sent if s[0] == 4242], [(4242, signal.SIGTERM)])
+
+    def test_stale_cookie_copies_are_swept_but_live_ones_kept(self):
+        with tempfile.TemporaryDirectory() as folder:
+            old, live = (os.path.join(folder, n) for n in (".ytdl_cookies_old.txt", ".ytdl_cookies_live.txt"))
+            for p in (old, live):
+                open(p, "w").close()
+            os.utime(old, (time.time() - 2 * 86400,) * 2)
+            d.remove_stale_copies(folder)
+            self.assertEqual(os.listdir(folder), [".ytdl_cookies_live.txt"])
+
+    def test_a_vtt_only_auto_track_still_asks_the_mweb_client(self):
+        saved = d.fetch_info
+        asked = []
+        d.fetch_info = lambda url, flags=(), attempts=3: (asked.append(list(flags)), ({"automatic_captions": {
+            "en": [{"ext": "json3"}]}}, None))[1]
+        try:
+            got = list(d.caption_candidates("u", {"automatic_captions": {"en": [{"ext": "vtt"}]},
+                                                  "subtitles": {"en": [{"ext": "json3"}]}}))
+        finally:
+            d.fetch_info = saved
+        self.assertEqual(asked, [d.PO_TOKEN_FLAGS])
+        self.assertEqual([(c, s) for c, s, _ in got], [("en", "auto"), ("en", "manual")])
 
     def test_candidates_ignore_other_languages(self):
         info = {"automatic_captions": {"de": self._track("German"),
@@ -770,6 +922,178 @@ class PlatformCase:
             self.assertIsNone(d.find_video_file(folder))
             open(os.path.join(folder, "My Video [abcdefghijk].mp4"), "w").close()
             self.assertTrue(d.find_video_file(folder).endswith("[abcdefghijk].mp4"))
+
+    def _with_cookie_file(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "cookies.txt")
+        with open(path, "w") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+        saved = (d.COOKIES_FILE, d.use_cookies[0])
+        d.COOKIES_FILE, d.use_cookies[0] = path, True
+        self.addCleanup(lambda: (setattr(d, "COOKIES_FILE", saved[0]),
+                                 d.use_cookies.__setitem__(0, saved[1])))
+        return path
+
+    def test_yt_dlp_gets_a_private_copy_of_the_cookies_until_youtube_rejects_them(self):
+        path = self._with_cookie_file()
+        with open(path, "a") as f:
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n")
+        def read(p):
+            with open(p) as f:
+                return f.read()
+        before = read(path)
+        cmd = d.base_cmd()
+        copy = cmd[cmd.index("--cookies") + 1]
+        self.assertNotEqual(copy, path)                   # yt-dlp saves its jar into this file
+        self.assertEqual(read(copy), before)
+        with open(copy, "w") as f:
+            f.write("rewritten by yt-dlp")
+        self.assertEqual(read(path), before)              # the user's own export is untouched
+        self.assertEqual(d.base_cmd()[-1], d.base_cmd()[-1])
+        d.use_cookies[0] = False
+        self.assertNotIn("--cookies", d.base_cmd())
+
+    def test_the_cookie_copy_sits_beside_the_original_and_follows_its_changes(self):
+        path = self._with_cookie_file()
+        with open(path, "a") as f:
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\told\n")
+        stat = os.stat(path)
+        first = d.base_cmd()[-1]
+        self.assertEqual(os.path.dirname(first), os.path.dirname(path))
+        with open(path, "w") as f:                       # replaced, same mtime
+            f.write("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tnew\n")
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        second = d.base_cmd()[-1]
+        self.assertNotEqual(first, second)
+        self.assertFalse(os.path.exists(first))           # no pile of stale copies
+        with open(second) as f:
+            self.assertIn("new", f.read())
+
+    def test_a_rejected_cookie_file_is_dropped_for_a_thumbnail_too(self):
+        path = self._with_cookie_file()
+        with open(path, "a") as f:
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n")
+        saved = (d.subprocess.run, d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION, d.po_token_first[0])
+        calls = []
+        with tempfile.TemporaryDirectory() as folder:
+            def run(cmd, **kw):
+                calls.append("--cookies" in cmd)
+                if "--cookies" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, "", "ERROR: The page needs to be reloaded.\n")
+                open(os.path.join(folder, os.path.basename(folder) + ".jpg"), "w").close()
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            d.subprocess.run, d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION, d.po_token_first[0] = run, True, False, False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    thumb, _ = d.build_extras(folder, "https://youtu.be/x", {})
+            finally:
+                d.subprocess.run, d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION, d.po_token_first[0] = saved
+            self.assertTrue(thumb)
+        self.assertEqual(calls, [True, False])
+
+    def test_an_unreadable_cookie_file_is_dropped_up_front(self):
+        for content, why in ((b'[{"domain": ".youtube.com"}]', "JSON"), (b"\xff\xfe junk", "not a text"),
+                             (b"# Netscape HTTP Cookie File\n", "no cookies")):
+            path = self._with_cookie_file()
+            with open(path, "wb") as f:
+                f.write(content)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertNotIn("--cookies", d.base_cmd())
+            self.assertIn(why, out.getvalue())
+            self.assertFalse(d.use_cookies[0])
+
+    def test_a_rejected_cookie_file_is_dropped_for_channel_listings_and_downloads_too(self):
+        self._no_sleep()
+        path = self._with_cookie_file()
+        with open(path, "a") as f:
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n")
+        saved = d.subprocess.run
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append("--cookies" in cmd)
+            if "--cookies" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", "ERROR: [youtube:tab] x: The page needs to be reloaded.\n")
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"channel": "C", "entries": []}), "")
+
+        d.subprocess.run = run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(d.channel_page("https://www.youtube.com/@x/videos", 1, 50),
+                                 ({"channel": "C", "entries": []}, None))
+        finally:
+            d.subprocess.run = saved
+        self.assertEqual(calls, [True, False])
+
+        d.use_cookies[0] = True
+        tries = []
+
+        def attempt(flags, fast=True):
+            tries.append(d.use_cookies[0])
+            return "[youtube] x: The page needs to be reloaded." if d.use_cookies[0] else None
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(d.run_with_retries(attempt))
+        self.assertEqual(tries, [True, False])
+
+    def test_every_url_goes_after_a_double_dash(self):
+        # A "link" such as --exec=... must reach yt-dlp as a URL, never as an option.
+        saved = d.subprocess.run
+        seen = []
+        d.subprocess.run = lambda cmd, **kw: (seen.append(cmd), subprocess.CompletedProcess(cmd, 1, "", "ERROR: x"))[1]
+        try:
+            d.fetch_info_once("--exec=touch x")
+            d.channel_page("--exec=touch x", 1, 2)
+        finally:
+            d.subprocess.run = saved
+        for cmd in seen:
+            self.assertEqual(cmd[-2:], ["--", "--exec=touch x"])
+
+    def test_rejected_cookies_are_dropped_and_the_lookup_retried_without_them(self):
+        self._no_sleep()
+        self._with_cookie_file()
+        calls, saved = [], d.fetch_info_once
+
+        def once(url, flags=()):
+            calls.append(d.use_cookies[0])
+            return (None, "[youtube] x: The page needs to be reloaded.") if d.use_cookies[0] else ({"id": "x"}, None)
+
+        d.fetch_info_once = once
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                info, err = d.fetch_info("https://youtu.be/x")
+        finally:
+            d.fetch_info_once = saved
+        self.assertEqual((info, err), ({"id": "x"}, None))
+        self.assertEqual(calls, [True, False])            # once with, once without
+        self.assertFalse(d.use_cookies[0])                # the rest of the batch goes without
+        self.assertIn("rejected cookies.txt", out.getvalue())
+
+    def test_a_truncated_video_id_is_not_retried(self):
+        err = "ERROR: [youtube:truncated_id] abc: Incomplete YouTube ID abc. URL https://www.youtube.com/watch?v=abc looks truncated."
+        self.assertEqual(d.failure_status(err), "unavailable")
+
+    def test_long_non_latin_titles_fit_a_linux_file_name(self):
+        for title in ("\u0939\u093f" * 200, "\U0001F600" * 100, "a" * 400):
+            name = d.sanitize(title)
+            self.assertLessEqual(len(name.encode("utf-8")), d.NAME_BYTES)
+            self.assertLessEqual(len(("words_not_found_" + name + " [abcdefghijk].f137.mp4.part").encode()), 255)
+            name.encode("utf-8").decode("utf-8")          # never cut inside a character
+
+    def test_a_reload_page_without_cookies_is_blocked_and_fails_fast(self):
+        self._no_sleep()
+        saved = (d.fetch_info_once, d.COOKIES_FILE, d.use_cookies[0])
+        calls = []
+        d.COOKIES_FILE = "/nonexistent/cookies.txt"
+        d.fetch_info_once = lambda url, flags=(): (calls.append(1), (None, "The page needs to be reloaded."))[1]
+        try:
+            info, err = d.fetch_info("https://youtu.be/x")
+        finally:
+            d.fetch_info_once, d.COOKIES_FILE, d.use_cookies[0] = saved
+        self.assertIsNone(info)
+        self.assertEqual(d.failure_status(err), "blocked")
+        self.assertEqual(len(calls), 2)                   # default, then mweb - no 3-round ladder
 
     def test_a_bot_gated_lookup_tries_the_mweb_client_once(self):
         self._no_sleep()

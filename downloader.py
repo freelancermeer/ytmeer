@@ -71,9 +71,13 @@ import argparse
 import datetime
 import json
 import os
+import atexit
+import hashlib
+import tempfile
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -137,6 +141,10 @@ WINDOWS_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
 # there. Budget: base + channel + folder + "words_<folder>.txt" stays inside 260
 # even from a fairly deep base directory.
 NAME_LIMIT = 60 if IS_WINDOWS else 150
+# Linux limits a name to 255 bytes, not characters: 150 characters of Hindi or
+# Chinese are 450 bytes. The cap leaves room for what goes around a title -
+# "words_not_found_", " [<id>]", yt-dlp's ".f137.mp4.part".
+NAME_BYTES = 180
 
 
 def sanitize(name: str) -> str:
@@ -146,6 +154,7 @@ def sanitize(name: str) -> str:
     name = re.sub(r"\s+", " ", name).strip()      # collapse whitespace
     name = name.rstrip(". ")                       # no trailing dots/spaces
     name = name[:NAME_LIMIT].rstrip(". ")          # keep the path within limits
+    name = name.encode("utf-8")[:NAME_BYTES].decode("utf-8", "ignore").rstrip(". ")
     # Windows matches a reserved device by the part before the first dot, so the
     # underscore has to go on the stem: "aux.txt_" is still AUX, "aux_.txt" is not.
     stem, dot, rest = name.partition(".")
@@ -265,6 +274,18 @@ def read_links(path: str):
 LOG_FILE = [None]          # path to the run's text log, once main() sets it
 LOG_JSON = [None]          # path to the run's JSON log
 LOG_JSONL = [None]         # one line per record, written the moment it exists
+SUMMARY_WRITTEN = [False]  # the run's download_log.json is on disk
+RUN_LOOP_STARTED = [False] # past this point only main() itself writes the summary
+STOPPING = [False]         # a Ctrl+C was taken, or the run is writing its totals
+
+
+def on_sigint(signum, frame):
+    """Ctrl+C stops the run - once. Later ones (a second press, a stop sent twice) are
+    ignored wherever they land, so a stop can never cut its own clean-up short."""
+    if STOPPING[0]:
+        return
+    STOPPING[0] = True
+    raise KeyboardInterrupt
 LOG_RECORDS = []           # one structured record per video
 
 # Both downloaders report progress, in their own shapes:
@@ -344,12 +365,17 @@ def write_json_log(summary):
     """Write the JSON log: the run's totals, then a record per video."""
     if not LOG_JSON[0]:
         return
+    tmp = LOG_JSON[0] + ".tmp"            # replaced whole: a kill mid-write keeps the old one
     try:
-        with open(LOG_JSON[0], "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"run": summary, "videos": LOG_RECORDS}, f,
                       indent=2, ensure_ascii=False)
+        os.replace(tmp, LOG_JSON[0])
+        SUMMARY_WRITTEN[0] = True
     except OSError as e:
         print(f"  (could not write {os.path.basename(LOG_JSON[0])}: {e})")
+    finally:
+        _remove_quietly(tmp)
 
 
 BAR_WIDTH = 20
@@ -435,29 +461,58 @@ def run_streaming(cmd, progress=None):
     # live) and is safe on Windows too — a low-level os.read() on the raw file
     # descriptor crashes there with "Bad file descriptor" or hangs.
     chunks, pending = [], ""
-    while True:
-        data = proc.stdout.read1(4096)
-        if not data:
-            break
-        chunks.append(data)
-        if VERBOSE:
-            sys.stdout.buffer.write(data)   # raw bytes -> keeps the \r bar intact
-            sys.stdout.buffer.flush()
-            continue
-        # Progress repaints with \r rather than \n, so split on both and hold
-        # back the unfinished tail until more arrives.
-        pending += data.decode("utf-8", "replace")
-        parts = re.split(r"[\r\n]", pending)
-        pending = parts.pop()
-        for line in parts:
-            if not line.strip():
+    try:
+        while True:
+            data = proc.stdout.read1(4096)
+            if not data:
+                break
+            chunks.append(data)
+            if VERBOSE:
+                sys.stdout.buffer.write(data)   # raw bytes -> keeps the \r bar intact
+                sys.stdout.buffer.flush()
                 continue
-            log_line(line)
-            if progress and NEW_FILE_RE.search(line):
-                progress.restart()
-            found = parse_progress(line)
-            if found and progress:
-                progress.update(*found)
+            # Progress repaints with \r rather than \n, so split on both and hold
+            # back the unfinished tail until more arrives.
+            pending += data.decode("utf-8", "replace")
+            parts = re.split(r"[\r\n]", pending)
+            pending = parts.pop()
+            for line in parts:
+                if not line.strip():
+                    continue
+                log_line(line)
+                if progress and NEW_FILE_RE.search(line):
+                    progress.restart()
+                found = parse_progress(line)
+                if found and progress:
+                    progress.update(*found)
+    except BaseException as e:
+        # Stopped (Ctrl+C, a kill): yt-dlp has to be gone before this process is. Left
+        # running, it saves its cookie jar into the private copy after that has been
+        # removed, and keeps aria2c writing into the folder.
+        if not isinstance(e, KeyboardInterrupt):
+            # A kill reached this process alone. yt-dlp gets a Ctrl+C rather than a
+            # SIGTERM: it stops its aria2c on one, and would leave it running on the other.
+            if os.name == "posix":
+                proc.send_signal(signal.SIGINT)
+            else:
+                proc.terminate()
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(cmd, 15)
+                proc.communicate(timeout=deadline - time.monotonic())
+                break
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:                      # aria2c may hold the pipe open: wait, don't read
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            except BaseException:         # a second kill or Ctrl+C: keep waiting
+                continue
+        raise e
     if pending.strip():
         log_line(pending)
 
@@ -572,7 +627,16 @@ def is_transient(error_text):
 # YouTube gates requests it thinks are automated, which is what a datacenter IP
 # looks like from its side. The apostrophe in "you're not a bot" comes back as a
 # curly U+2019 as often as a plain one, so the marker avoids it entirely.
-BOT_GATE_ERRORS = ("not a bot", "this helps protect our community")
+BOT_GATE_ERRORS = ("not a bot", "this helps protect our community",
+                   "the page needs to be reloaded")
+
+# What YouTube answers a signed-in request it no longer accepts - cookies that were
+# rotated after export, or used from elsewhere. The same request without them may
+# well work, so a batch drops the cookies once this happens rather than failing on
+# every video.
+COOKIES_REJECTED = "the page needs to be reloaded"
+use_cookies = [True]
+COOKIE_COPIES = {}          # cookies.txt -> (sha1 of its bytes, the private copy yt-dlp gets)
 
 
 def is_bot_gated(error_text):
@@ -581,7 +645,7 @@ def is_bot_gated(error_text):
     return any(hint in low for hint in BOT_GATE_ERRORS)
 
 
-PERMANENT_ERRORS = ("private video", "video is unavailable", "video unavailable",
+PERMANENT_ERRORS = ("private video", "incomplete youtube id", "video is unavailable", "video unavailable",
                     "removed by the uploader", "has been terminated",
                     "sign in to confirm your age", "members-only",
                     "is not a valid url", "unsupported url",
@@ -632,6 +696,105 @@ def mark_incomplete(folder):
     return marked
 
 
+def cookies_problem(data):
+    """Why yt-dlp could not load a cookies.txt holding these bytes, or None. It gives up
+    on a file it cannot parse before making any request, so every video would fail."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "it is not a text file"
+    if text.lstrip().startswith(("[", "{")):
+        return "it is a JSON export; it has to be in the Netscape cookies.txt format"
+    if not any(len(line.split("\t")) >= 7 for line in text.splitlines()):
+        return "there are no cookies in it"
+    return None
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _remove_cookie_copies():
+    for _digest, copy in COOKIE_COPIES.values():
+        _remove_quietly(copy)
+
+
+atexit.register(_remove_cookie_copies)
+
+
+def remove_stale_copies(folder, age=86400):
+    """Remove cookie copies a day old: left by a run killed outright (SIGKILL, or a
+    stop on Windows), since a live one is rewritten by every yt-dlp call."""
+    try:
+        names = [n for n in os.listdir(folder) if n.startswith(".ytdl_cookies_")]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(folder, name)
+        try:
+            if time.time() - os.path.getmtime(path) > age:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def cookie_flags():
+    """--cookies pointing at a private copy of cookies.txt, or nothing.
+
+    yt-dlp writes its cookie jar back into the file it is given, so the user's own
+    export would be rewritten by every call - with whatever YouTube rotated or
+    cleared in it. The copy sits beside the original, so a run killed outright
+    leaves it there rather than in a temp folder; it is replaced when the original
+    changes, and removed when the process ends.
+    """
+    if not use_cookies[0] or not os.path.exists(COOKIES_FILE):
+        return []
+    path = os.path.abspath(COOKIES_FILE)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        digest = hashlib.sha1(data).hexdigest()
+        known = COOKIE_COPIES.get(path)
+        if known and known[0] == digest and os.path.exists(known[1]):
+            return ["--cookies", known[1]]
+        problem = cookies_problem(data)
+        if problem:
+            use_cookies[0] = False
+            print(f"  NOTE: cookies.txt cannot be used ({problem}); carrying on without it.")
+            return []
+        if known:
+            _remove_quietly(known[1])
+        remove_stale_copies(os.path.dirname(path))
+        try:
+            fd, copy = tempfile.mkstemp(prefix=".ytdl_cookies_", suffix=".txt",
+                                        dir=os.path.dirname(path))
+        except OSError:                   # a folder it cannot write to
+            fd, copy = tempfile.mkstemp(prefix="ytdl_cookies_", suffix=".txt")
+        COOKIE_COPIES[path] = (digest, copy)
+        with os.fdopen(fd, "wb") as dst:
+            dst.write(data)
+    except OSError as e:
+        use_cookies[0] = False
+        print(f"  NOTE: cookies.txt cannot be read ({e}); carrying on without it.")
+        return []
+    return ["--cookies", copy]
+
+
+def drop_rejected_cookies(error_text):
+    """True when YouTube just refused cookies.txt: it is dropped for the rest of the
+    run, and the caller makes the same request again without it."""
+    if (COOKIES_REJECTED not in (error_text or "").lower() or not use_cookies[0]
+            or not os.path.exists(COOKIES_FILE)):
+        return False
+    use_cookies[0] = False
+    print("  NOTE: YouTube rejected cookies.txt (\"the page needs to be reloaded\": rotated"
+          " after export, or used from another IP); carrying on without it.")
+    return True
+
+
 def base_cmd():
     """Common yt-dlp arguments (cookies added only if the file exists)."""
     cmd = ["yt-dlp"]
@@ -643,9 +806,7 @@ def base_cmd():
         cmd += ["--extractor-args",
                 f"youtubepot-bgutilscript:script_path={BGUTIL_SCRIPT}"]
     cmd += windows_flags()
-    if os.path.exists(COOKIES_FILE):
-        cmd += ["--cookies", COOKIES_FILE]
-    return cmd
+    return cmd + cookie_flags()
 
 
 # =================== transcript formatting component =======================
@@ -887,10 +1048,13 @@ def build_extras(folder, url, info):
         # does, so it gets the same escalation to the PO-token client.
         routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
         for extra in routes:
-            cmd = base_cmd() + ["--skip-download", "--no-warnings"] + thumb_flags() \
-                + list(extra) + ["-o", output_template(folder, name), url]
-            subprocess.run(cmd, capture_output=True, text=True)
-            thumb = find_thumbnail(folder)
+            for _ in range(2):
+                cmd = base_cmd() + ["--skip-download", "--no-warnings"] + thumb_flags() \
+                    + list(extra) + ["-o", output_template(folder, name), "--", url]
+                out = subprocess.run(cmd, capture_output=True, text=True)
+                thumb = find_thumbnail(folder)
+                if thumb or not drop_rejected_cookies(out.stderr):
+                    break
             if thumb:
                 break
 
@@ -901,6 +1065,14 @@ def build_extras(folder, url, info):
 
 
 # ============================ transcript helpers ===========================
+def offers_json3(entries):
+    """True unless a caption track's formats are listed and json3 is not one of them.
+    Some auto tracks come as vtt only; asking for json3 then gets a vtt, which gives
+    no transcript - while the manual track of the same code would."""
+    exts = {e.get("ext") for e in entries or [] if e.get("ext")}
+    return not exts or "json3" in exts
+
+
 def best_track_in(tracks):
     """The closest match to SUB_LANG among one set of caption tracks.
 
@@ -910,6 +1082,7 @@ def best_track_in(tracks):
     track too: dozens of downloads, and YouTube answers with HTTP 429. So one
     explicit code is chosen instead.
     """
+    tracks = {code: entries for code, entries in tracks.items() if offers_json3(entries)}
     if SUB_LANG in tracks:
         return SUB_LANG
     if f"{SUB_LANG}-orig" in tracks:
@@ -955,6 +1128,22 @@ def sub_flags(lang, source):
         return []
     kind = "--write-auto-subs" if source == "auto" else "--write-subs"
     return [kind, "--sub-langs", lang, "--sub-format", "json3"]
+
+
+# Not .srt: the first version of this script kept its transcripts as <name>.en.srt.
+CAPTION_EXTS = (".json3", ".vtt", ".ttml", ".srv1", ".srv2", ".srv3")
+
+
+def clear_captions(folder):
+    """Remove every caption file yt-dlp left in the folder - including a vtt it fell
+    back to when a track had no json3, which gives no transcript at all."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if name.lower().endswith(CAPTION_EXTS):
+            _remove_quietly(os.path.join(folder, name))
 
 
 def find_json3(folder):
@@ -1087,12 +1276,15 @@ def fetch_caption(folder, url, lang, source, client=()):
     else:
         routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
     for extra in routes:
-        cmd = base_cmd() + ["--skip-download"] + flags + list(extra) + [
-            "--no-warnings", "-o", output_template(folder, name), url,
-        ]
-        subprocess.run(cmd, capture_output=True, text=True)
-        if find_json3(folder):
-            return True
+        for _ in range(2):
+            cmd = base_cmd() + ["--skip-download"] + flags + list(extra) + [
+                "--no-warnings", "-o", output_template(folder, name), "--", url,
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True)
+            if find_json3(folder):
+                return True
+            if not drop_rejected_cookies(out.stderr):
+                break
     return False
 
 
@@ -1112,7 +1304,7 @@ def caption_candidates(url, info):
     """
     seen = set()
     sources = [(info, ())]
-    if not (info or {}).get("automatic_captions"):
+    if not best_track_in((info or {}).get("automatic_captions") or {}):
         richer, _ = fetch_info(url, PO_TOKEN_FLAGS, attempts=1)
         if richer:
             sources.append((richer, tuple(PO_TOKEN_FLAGS)))
@@ -1124,13 +1316,23 @@ def caption_candidates(url, info):
             for code in ordered:
                 if not (code == SUB_LANG or code.startswith(f"{SUB_LANG}-")):
                     continue
-                if code in seen:
+                if (code, source) in seen or not offers_json3(tracks[code]):
                     continue
-                seen.add(code)
+                seen.add((code, source))
                 yield code, source, list(client)
 
 
 def build_transcripts(folder, url, info):
+    """trans_/words_ for a video (see find_transcripts); no caption file stays behind."""
+    if not DOWNLOAD_SUBS:
+        return None, None
+    try:
+        return find_transcripts(folder, url, info)
+    finally:
+        clear_captions(folder)
+
+
+def find_transcripts(folder, url, info):
     """Produce trans_/words_ for a video, fetching the caption if needed.
 
     A caption normally arrives with the video, so usually there is nothing to
@@ -1240,7 +1442,7 @@ INFO_RETRY_DELAY = 5
 def fetch_info_once(url: str, extra_flags=()):
     """One metadata lookup. Returns (info, error)."""
     cmd = base_cmd() + ["--skip-download", "--dump-single-json",
-                        "--no-warnings"] + list(extra_flags) + [url]
+                        "--no-warnings"] + list(extra_flags) + ["--", url]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
@@ -1270,6 +1472,10 @@ def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
         info, err = fetch_info_once(url, flags)
         if info:
             return info, None
+        if drop_rejected_cookies(err):
+            info, err = fetch_info_once(url, flags)
+            if info:
+                return info, None
         if is_bot_gated(err) and not extra_flags:
             # The gate is on this IP, but the mweb client sometimes still gets
             # through. One immediate try; if it works, the rest of the batch starts
@@ -1546,6 +1752,8 @@ def run_with_retries(attempt):
                 note(f"    ! {err}")
                 note(f"    Attempt {round_no}/{MAX_ATTEMPTS} via {label}...")
             err = attempt(flags, fast)
+            if err and drop_rejected_cookies(err):
+                err = attempt(flags, fast)
             if not err:
                 if flags:
                     po_token_first[0] = True   # the rest of the batch will need it
@@ -1602,7 +1810,8 @@ def download_one(url, index, total):
     # Folder = video title, under the channel folder when --channel is on.
     bar.title = title
     parent = channel_dir(info)
-    folder_name = safe_title or (f"video_{vid}" if vid else "video")
+    folder_name = safe_title or (f"video_{vid}" if vid else
+                                 "link_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:8])
     folder = choose_folder(parent, folder_name, vid)
     try:
         os.makedirs(folder, exist_ok=True)
@@ -1639,9 +1848,8 @@ def download_one(url, index, total):
             "--no-playlist",
             "--progress",          # show the live download progress bar
             "-o", out_template,
-            url,
         ] + (speed_flags() if fast else ["--concurrent-fragments", "8"]) \
-          + sub_flags(sub_lang, sub_source) + thumb_flags() + extra_flags
+          + sub_flags(sub_lang, sub_source) + thumb_flags() + extra_flags + ["--", url]
         text = run_streaming(cmd, bar)
         if last_returncode[0] == 0:
             return None
@@ -1659,6 +1867,7 @@ def download_one(url, index, total):
     if err:
         note(f"    ! Download failed: {err}")
         bar.done(f"FAIL  {err}")
+        clear_captions(folder)
         leftovers = mark_incomplete(folder)
         for name in leftovers:
             note(f"      partial file kept as {name}")
@@ -1796,18 +2005,22 @@ def channel_videos_url(url):
 
 def channel_page(url, start, end):
     """One page of a channel's video list, newest first. Returns (data, error)."""
-    cmd = base_cmd() + ["--flat-playlist", "--dump-single-json", "--no-warnings",
-                        "--playlist-start", str(start),
-                        "--playlist-end", str(end), url]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return {}, "Timed out while listing the channel"
-    except OSError as e:
-        return {}, f"Could not run yt-dlp: {e}"
-    if out.returncode != 0:
+    for _ in range(2):
+        cmd = base_cmd() + ["--flat-playlist", "--dump-single-json", "--no-warnings",
+                            "--playlist-start", str(start),
+                            "--playlist-end", str(end), "--", url]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return {}, "Timed out while listing the channel"
+        except OSError as e:
+            return {}, f"Could not run yt-dlp: {e}"
+        if out.returncode == 0:
+            break
         msg = out.stderr.strip().splitlines()
-        return {}, (msg[-1] if msg else "Failed to list the channel")
+        err = msg[-1] if msg else "Failed to list the channel"
+        if not drop_rejected_cookies(err):
+            return {}, err
     try:
         data = json.loads(out.stdout)
     except json.JSONDecodeError:
@@ -2042,6 +2255,24 @@ def use_utf8_output():
             pass
 
 
+def stop_on_sigterm(signum, frame):
+    """A plain kill ends the run like an exit, so the private cookie copy is removed.
+
+    yt-dlp and its aria2c get it too. A kill sent to this process alone would leave
+    aria2c downloading - and holding the output pipe open, so the wait for yt-dlp
+    would never end. Only a process leading its own group signals the group: one
+    started inside someone else's would signal them as well.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    STOPPING[0] = True                    # and a Ctrl+C now does not cut the stop short
+    if os.name == "posix" and os.getpgrp() == os.getpid():
+        try:
+            os.killpg(os.getpgrp(), signal.SIGTERM)
+        except OSError:
+            pass
+    sys.exit(128 + signum)
+
+
 def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
@@ -2051,6 +2282,8 @@ def main():
     use_utf8_output()
     args = parse_args()
     DOWNLOAD_DIR  = os.path.expanduser(args.directory)
+    LOG_JSON[0]   = os.path.join(DOWNLOAD_DIR, "download_log.json")   # a stop during startup has a summary
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     COOKIES_FILE  = (os.path.expanduser(args.cookies) if args.cookies
                      else os.path.join(DOWNLOAD_DIR, "cookies.txt"))
     LINKS_FILE    = (os.path.expanduser(args.links) if args.links
@@ -2157,22 +2390,31 @@ def main():
 
     gone = []
 
-    def run(batch, batch_total):
-        """Download a list of links, returning the ones worth trying again."""
-        remaining = []
+    def run(batch, sweep=False):
+        """Download a list of links. `failed` holds the ones worth trying again, kept
+        current as each video ends, so a stop mid-batch still counts them."""
         for i, url in enumerate(batch, 1):
-            result = download_one(url, i, batch_total)
+            try:
+                result = download_one(url, i, len(batch))
+            except OSError as e:
+                # A full disk, a name the filesystem refuses: this video fails,
+                # the batch goes on.
+                print(f"    ! {url}: {e}")
+                log_record(url=url, status="failed", error=str(e))
+                result = "fail"
+            if sweep and result != "fail":
+                failed.remove(url)    # the sweep settled it
             if result in counts:
                 counts[result] += 1
             elif result == "gone":
                 gone.append(url)      # nothing a retry could change
-            else:
-                remaining.append(url)
-        return remaining
+            elif not sweep:
+                failed.append(url)
 
     stopped = False
+    RUN_LOOP_STARTED[0] = True
     try:
-        failed = run(links, total)
+        run(links)
 
         # A final sweep. Whatever was wrong earlier — a throttled stretch, a
         # stale token, a stream that dropped — has usually passed by the end of
@@ -2182,12 +2424,14 @@ def main():
             print(f"  Final sweep: retrying {len(failed)} video(s) that failed.")
             print("=" * 60)
             time.sleep(RETRY_DELAYS[-1])
-            failed = run(failed, len(failed))
+            run(list(failed), sweep=True)
     except KeyboardInterrupt:
         # Ctrl+C should leave a readable summary, not a stack trace. Finished
         # videos are already on disk, and the next run resumes from there.
         stopped = True
         print("\n\n  Stopped. Finished videos are saved; re-run to continue.")
+    # The totals below are the run's answer; a Ctrl+C now must not cut them short.
+    STOPPING[0] = True
 
     print("\n" + "=" * 60)
     done = counts["ok"] + counts["skip"] + len(failed) + len(gone)
@@ -2199,7 +2443,10 @@ def main():
         print("  Not retried (unavailable, or YouTube refused this IP):")
         for u in gone:
             print(f"    - {u}")
-    if any(is_bot_gated(r.get("error")) for r in LOG_RECORDS):
+    if not use_cookies[0] and os.path.exists(COOKIES_FILE):
+        print("  NOTE: this run went without cookies.txt (see the NOTE above). Export")
+        print("        a fresh one from a private browser window if you need it.")
+    elif any(is_bot_gated(r.get("error")) for r in LOG_RECORDS):
         print("  NOTE: YouTube bot-gated this IP. That is what a datacenter IP")
         print("        (Colab, a VPS) looks like to it. Put a cookies.txt in the")
         print("        folder, or run from a home connection.")
@@ -2226,7 +2473,8 @@ def main():
         "links": total,
         "downloaded": counts["ok"],
         "skipped": counts["skip"],
-        "failed": len(failed) + len(gone),
+        "failed": len(failed) + len(gone)
+                  + sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),
         "stopped_early": stopped,
         "bytes": STATS["bytes"],
         "size": human_size(STATS["bytes"]),
@@ -2238,4 +2486,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, on_sigint)
+    try:
+        main()
+    except KeyboardInterrupt:          # before the run loop, which has its own handler
+        scan_done()
+        if not SUMMARY_WRITTEN[0] and not RUN_LOOP_STARTED[0]:
+            folder = ""
+            if not LOG_JSON[0]:           # so early that main() had not read the arguments yet
+                try:
+                    folder = os.path.expanduser(parse_args().directory)
+                except (SystemExit, Exception):   # the arguments themselves were the problem
+                    pass
+            if not LOG_JSON[0] and os.path.isdir(folder):
+                LOG_JSON[0] = os.path.join(folder, "download_log.json")
+            print("\n\n  Stopped before anything was downloaded.")
+            write_empty_summary(stopped=True)

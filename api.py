@@ -45,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -194,6 +195,11 @@ def normalize_request(payload):
                       if line.strip() and not line.strip().startswith("#"))
     if not links:
         raise ValueError("links is required: video links, channel links or both")
+    # yt-dlp would read "--exec ..." as an option, not a link.
+    bad = next((line for line in links.splitlines()
+                if line.startswith("-") and not downloader.BARE_ID_RE.match(line)), None)
+    if bad:
+        raise ValueError(f"not a link: {bad[:100]!r}")
     unknown = sorted(set(payload) - set(DEFAULTS))
     if unknown:
         raise ValueError(f"unknown field(s): {', '.join(unknown)}; "
@@ -370,13 +376,20 @@ def _stems(folder_name):
     return (folder_name, bare) if bare != folder_name else (folder_name,)
 
 
+def _fold(text):
+    """A name as a case- and normalization-insensitive disk (macOS, Windows) sees it."""
+    return unicodedata.normalize("NFC", text).casefold()
+
+
 def _unfinished(name, folder_name):
-    low = name.lower()
-    if low.startswith("incomplete_") or PARTIAL_RE.search(low):
+    # The downloader's own marker, as it writes it: "Incomplete_ ideas" is a title.
+    if name.startswith("INCOMPLETE_") or PARTIAL_RE.search(name.lower()):
         return True
-    for stem in _stems(folder_name):
-        if name.startswith(stem + "."):
-            return STREAM_PART_RE.match(name[len(stem):]) is not None
+    # Folded: "VID/Vid.f137.mp4" opens the same stream part as "Vid/Vid.f137.mp4".
+    folded = _fold(name)
+    for stem in map(_fold, _stems(folder_name)):
+        if folded.startswith(stem + "."):
+            return STREAM_PART_RE.match(folded[len(stem):]) is not None
     return False
 
 
@@ -396,13 +409,22 @@ def job_file(outdir, relpath):
     if not target.startswith(root + os.sep):
         raise PermissionError("that path is outside the job's folder")
     name, folder = os.path.basename(target), os.path.dirname(target)
-    if name.lower() in PRIVATE_NAMES or name in RUN_FILES:
+    if name.lower() in PRIVATE_NAMES or name.lower() in RUN_FILES:
         raise PermissionError("that file is not served")
     if folder == root or not os.path.isfile(os.path.join(folder, "videoinfo.txt")):
         raise PermissionError("only files inside a video folder are served")
+    # A case-insensitive disk opens "clip.MP4" as Clip.mp4 - only the file name as it is
+    # on disk is served, so no other spelling gets past the checks on the name. (The
+    # folder's spelling only matters to the stream-part check, which folds it.)
+    try:
+        if name not in os.listdir(folder):
+            raise FileNotFoundError(relpath)
+    except NotADirectoryError:
+        raise FileNotFoundError(relpath)
     # Hidden files (.DS_Store and the like) are not the downloader's - but a video
     # whose title starts with a dot has files that do too, named after its folder.
-    if name.startswith(".") and not any(name.startswith(stem) for stem in _stems(os.path.basename(folder))):
+    if name.startswith(".") and not any(_fold(name).startswith(_fold(stem))
+                                        for stem in _stems(os.path.basename(folder))):
         raise PermissionError("that file is not served")
     if _unfinished(name, os.path.basename(folder)):
         raise PermissionError("that file is still being written, or was left incomplete")
@@ -503,7 +525,8 @@ def public(job, tail=20):
             "videos_done": sum(1 for v in videos if v.get("status") in DONE),
             "failures": failures_from(records),
             # YouTube refused this server's IP: a problem with the machine, not the videos.
-            "blocked": any(r.get("status") == "blocked" for r in records),
+            "blocked": any(r.get("status") == "blocked" or (r.get("status") == "channel_failed"
+                           and downloader.is_bot_gated(r.get("error"))) for r in records),
             "summary": job["summary"], "returncode": job["returncode"],
             "error": job["error"], "log_lines": job["lines"],
             "log": log[-tail:] if tail else [],
@@ -547,17 +570,31 @@ def _finish(job, error=None):
         with LOCK:
             stopped = job["stop_requested"]
             error = job["error"] or error
+            if not stopped and not error and summary is None:
+                # Every run that ends normally writes one; this one could not (a
+                # folder it cannot write to, say).
+                last = [line.strip() for line in job["log"] if line.strip()][-3:]
+                error = ("the run ended without writing its summary"
+                         + (": " + " | ".join(last) if last else ""))
             # The snapshot lands in the same step as the state change, so a finished
             # job always has its full list, and a new job in this folder (which may
             # truncate the stream) cannot start until then.
+            # A stop that lands while Python is still starting can be lost; the run then
+            # finishes, and its summary says it was not stopped.
+            missed = stopped and summary is not None and summary.get("stopped_early") is False
             job.update(records=records, summary=summary, proc=None, error=error,
                        finished=time.time(),
-                       state="stopped" if stopped else ("error" if error else "finished"))
+                       state="stopped" if stopped and not missed else ("error" if error else "finished"))
 
 
 def _pump(job):
     """Run the downloader and collect its output. Runs in the job's thread."""
     error = None
+    with LOCK:
+        stopped = job["stop_requested"]
+    if stopped:                           # stopped while queued: never started
+        _finish(job)
+        return
     try:
         proc = subprocess.Popen(job["argv"], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -581,7 +618,9 @@ def _pump(job):
         with LOCK:
             job["returncode"] = proc.returncode
             last = [line for line in job["log"] if line.strip()][-3:]
-        if proc.returncode != 0:
+        # A stop that lands while the downloader is still starting up exits non-zero
+        # too; that is the stop, not a crash.
+        if proc.returncode != 0 and not job["stop_requested"]:
             error = (f"the downloader exited with code {proc.returncode}"
                      + (": " + " | ".join(l.strip() for l in last) if last else ""))
     except Exception as e:                # never leave a job "running" for ever
@@ -590,13 +629,24 @@ def _pump(job):
         _finish(job, error=error)
 
 
+def _same_folder(a, b):
+    """One folder, however it is spelled: macOS and Windows disks ignore letter case
+    (and macOS, Unicode normalization), which a string comparison does not."""
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:                       # one of them does not exist yet
+        return False
+
+
 def start_job(opts):
     """Write the inputs and start the downloader in a thread. Returns the job."""
     outdir = opts["outdir"]
     with LOCK:
         # Two runs in one folder would mix their streams and logs.
         clash = next((j for j in JOBS.values()
-                      if j["state"] in ACTIVE and j["outdir"] == outdir), None)
+                      if j["state"] in ACTIVE and _same_folder(j["outdir"], outdir)), None)
         if clash:
             raise RuntimeError(f"job {clash['job_id']} is already running in "
                                f"{outdir}; use another folder or stop it first")
@@ -688,6 +738,7 @@ def preview_channel(channel, views=0, limit=20, skip=""):
                           "minute, or with a smaller limit")
     try:
         d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")   # as a job would
+        d.use_cookies[0] = True           # a replaced cookies.txt gets its chance
         d.MIN_VIEWS, d.LIMIT = int(views or 0), int(limit or 0)
         d.SKIP_IDS = {v for v in (d.video_id_from_url(x) or
                                   (x if d.BARE_ID_RE.match(x) else None)
