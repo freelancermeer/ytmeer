@@ -22,7 +22,6 @@ Optional flags:
     --sub-lang CODE      Transcript language code (default: en)
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
-    --debug              Echo the redacted diagnostic trace as it runs
 
 Examples:
     python3 downloader.py "/Users/me/Videos/YT"
@@ -99,7 +98,6 @@ CHANNEL_MODE   = False     # True = group videos into <Channel Name>/ folders
 SAVE_THUMBNAIL = True      # also save the video thumbnail as .jpg
 SAVE_DESCRIPTION = True    # also save the video description as .txt
 VERBOSE        = False     # True = show yt-dlp's full output instead of a bar
-DEBUG          = False     # True = also echo the structured diagnostic trace
 MIN_VIEWS      = 0         # channel links: view floor (0 = take every video)
 LIMIT          = 0         # channel links: newest N matches each (0 = no cap)
 DAYS           = 0         # filter by last N days (0 = any time)
@@ -402,11 +400,6 @@ def log_debug(event, **fields):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         return
-    if DEBUG:
-        short = {k: v for k, v in record.items() if k not in ("time", "run_id")}
-        print("[debug] " + json.dumps(short, ensure_ascii=False))
-
-
 def run_logged(stage, cmd, **kwargs):
     """Run a captured subprocess and record its full lifecycle in the trace."""
     started = time.monotonic()
@@ -2566,8 +2559,9 @@ def parse_args(argv=None):
                    help="Do NOT save the description (saved by default).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Show yt-dlp's full output instead of the progress bar.")
-    p.add_argument("--debug", action="store_true",
-                   help="Echo the redacted diagnostic trace as it is written.")
+    # Kept hidden for compatibility with older commands. The diagnostic trace
+    # is now always written; no flag is needed.
+    p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -2610,7 +2604,7 @@ def stop_on_sigterm(signum, frame):
 def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
-    global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE, DEBUG
+    global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS
 
     use_utf8_output()
@@ -2630,7 +2624,6 @@ def main():
     SAVE_THUMBNAIL = not args.no_thumbnail
     SAVE_DESCRIPTION = not args.no_description
     VERBOSE       = args.verbose
-    DEBUG         = args.debug
     MIN_VIEWS     = args.views
     LIMIT         = args.limit
     DAYS          = args.days
@@ -2657,8 +2650,7 @@ def main():
                               ("description", SAVE_DESCRIPTION)) if on]
     print(f"  Extras  : {', '.join(extras) if extras else 'none'}")
     print(f"  Log     : download_log.txt + download_log.json + download_debug.jsonl"
-          f"{'  (--verbose: full output on screen)' if VERBOSE else ''}"
-          f"{'  (--debug: trace on screen)' if DEBUG else ''}")
+          f"{'  (--verbose: full output on screen)' if VERBOSE else ''}")
 
     if not os.path.isdir(DOWNLOAD_DIR):
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")

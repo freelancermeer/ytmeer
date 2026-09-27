@@ -141,11 +141,10 @@ class PlatformCase:
     def test_diagnostic_trace_is_structured_and_redacted(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "download_debug.jsonl")
-            saved = (d.LOG_DEBUG[0], d.RUN_ID[0], d.DEBUG, d.subprocess.run)
+            saved = (d.LOG_DEBUG[0], d.RUN_ID[0], d.subprocess.run)
             try:
                 d.LOG_DEBUG[0] = path
                 d.RUN_ID[0] = "test-run"
-                d.DEBUG = False
                 d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
                     cmd, 0, "ok https://www.youtube.com/watch?v=abcdefghijk&pot=SECRET", "")
                 d.run_logged(
@@ -154,7 +153,7 @@ class PlatformCase:
                              "https://www.youtube.com/watch?v=abcdefghijk&pot=SECRET"],
                     capture_output=True, text=True)
             finally:
-                d.LOG_DEBUG[0], d.RUN_ID[0], d.DEBUG, d.subprocess.run = saved
+                d.LOG_DEBUG[0], d.RUN_ID[0], d.subprocess.run = saved
 
             with open(path, encoding="utf-8") as f:
                 events = [json.loads(line) for line in f]
