@@ -53,7 +53,7 @@ https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
 ```bash
-python3 downloader.py "/path/to/your folder" --channel --views 1000 --limit 3
+python3 downloader.py "/Users/macintoshhd/Desktop/test/" --channel --views 1000 --limit 3
 ```
 
 That reads `@SomeChannel`, keeps the videos with **at least 1000 views**, takes
@@ -199,6 +199,12 @@ Two `.txt` files are built next to each video from YouTube's auto-caption, in th
 - `words_<Video Title>.txt` — one word per line: `[hh:mm:ss.mmm] word`
 
 **Both files are always written** when the video has any English caption at all — and when word timings do not exist, the second one is `words_not_found_<Video Title>.txt`, which says why. See [When there is no words_ file](#when-there-is-no-words_-file).
+
+Captions are required by default: the downloader does not mark a video as
+finished until `trans_*.txt` exists. If YouTube temporarily returns HTTP 429,
+the media is kept but the video remains retryable; the next run tries the
+caption routes again. Use `--no-subs` only when captions are intentionally not
+needed.
 
 **Backfill:** if a video is already downloaded but has no `trans_*.txt`, re-running builds the transcripts for it without re-downloading the video.
 
@@ -410,7 +416,7 @@ Nothing in a batch takes the whole run down:
 | Directory or `links.txt` missing | Named directly, and the run stops there |
 | A folder cannot be created | That video fails with the reason; the batch continues |
 | A video is private or deleted | Failed immediately, listed under "Unavailable" |
-| A video has no English captions | `words_not_found_…` explains it; the video and everything else still download |
+| A video has no English captions | Recorded as an error and left retryable; it is not treated as a finished download while transcripts are enabled |
 | **Ctrl+C** | Stops cleanly with a summary — finished videos are on disk, and the next run resumes from there |
 
 Comments (`#`) and blank lines in `links.txt` are skipped, and a link repeated
