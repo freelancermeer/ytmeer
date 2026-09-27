@@ -324,18 +324,26 @@ Once one video in a batch needs it, the rest go straight there — no wasted
 attempts.
 
 The token comes from the **bgutil** provider, which runs a small JS script.
-**No browser window ever opens.** Install it once:
+**No browser window ever opens.** The downloader also uses bgutil's
+video-bound **subtitle PO token** for the caption request; this is separate from
+the media-download token. Install matching provider/server versions once:
 
 ```bash
-pip install bgutil-ytdlp-pot-provider
+BGUTIL_VERSION=2.0.0
+pip install "bgutil-ytdlp-pot-provider>=${BGUTIL_VERSION},<3"
 mkdir -p ~/.local/share/bgutil-pot && cd ~/.local/share/bgutil-pot
-curl -sL https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/1.3.2.tar.gz | tar xz --strip-components=1
+curl -sL "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${BGUTIL_VERSION}.tar.gz" | tar xz --strip-components=1
 cd server && npm install && npx tsc
 ```
 
 The script is found automatically at `~/.local/share/bgutil-pot/server/build/generate_once.js`;
 set `BGUTIL_SCRIPT` to point somewhere else. Keep the pip package and the server
-on the **same version**. The startup banner shows whether it was found.
+on the **same major version**; yt-dlp will reject mismatched PO-token providers.
+The startup banner shows whether the script was found.
+
+HTTP 429 is a YouTube subtitle rate limit, not the PO-token 403 gate. The code
+requests only the selected language, uses the subtitle PO-token route first, and
+keeps the mweb/default routes as fallbacks.
 
 > Avoid the browser-based providers (e.g. `yt-dlp-getpot-wpc`) — they open a
 > Chrome window for every video that needs a token, and cannot run headless.

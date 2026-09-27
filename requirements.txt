@@ -4,7 +4,7 @@ yt-dlp>=2026.7.4
 # Mints the "Proof of Origin" token some videos now require — without it those
 # downloads fail with HTTP Error 403. This provider runs a small JS script, so
 # no browser window ever opens. It needs its server half too; see README.md.
-bgutil-ytdlp-pot-provider>=1.3.2
+bgutil-ytdlp-pot-provider>=2.0.0,<3
 
 # Lets yt-dlp impersonate a browser. Optional, but some videos want it.
 # Pinned below 0.16 because that is the range yt-dlp supports.

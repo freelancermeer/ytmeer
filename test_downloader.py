@@ -690,8 +690,10 @@ class PlatformCase:
         finally:
             d.po_token_first[0] = saved
         self.assertFalse(got, "no caption file appeared")
-        self.assertEqual(len(runs), 2, "it should try again through the token client")
-        self.assertIn("youtube:player_client=mweb,default", runs[1])
+        self.assertGreaterEqual(len(runs), 2)
+        self.assertIn("youtube:player_client=web", runs[0])
+        self.assertTrue(any("youtube:player_client=mweb,default" in run for run in runs[1:]))
+        self.assertIn("--ignore-no-formats-error", runs[0])
 
     def test_lone_thumbnail_fetch_escalates_too(self):
         saved = d.po_token_first[0]
