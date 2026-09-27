@@ -1842,15 +1842,18 @@ def download_one(url, index, total):
         log_record(url=url, status=failure_status(err), error=err, folder=rel(folder))
         return "gone" if is_permanent(err) else "fail"
 
-    # 2) Download best 720p-1080p video+audio (merged mp4) + English json3 caption.
+    # 2) Download best 720p-1080p video+audio (merged mp4) and the thumbnail.
+    #
+    # Captions are deliberately not part of this command. YouTube can rate-limit
+    # the caption endpoint independently (HTTP 429); if captions are requested
+    # alongside the media, yt-dlp returns a failure for the entire job even when
+    # the video itself downloaded successfully. build_transcripts() fetches the
+    # selected caption after the video is complete, so a caption problem cannot
+    # turn a usable video into a failed download.
     # Named after the folder actually used - "<title> [<id>]" when another video
     # already has "<title>" - so every name in it (video, trans_, words_, and the
     # .f137/.temp streams yt-dlp writes on the way) shares one stem.
     out_template = output_template(folder, os.path.basename(folder))
-    sub_lang, sub_source, sub_client = choose_caption(url, info)
-    if sub_client:
-        po_token_first[0] = True   # only that client can see the caption track
-
     def attempt(extra_flags, fast=True):
         """Run yt-dlp, teeing its output so the live progress bar (%, size,
         speed, ETA) shows while the text is kept for error reporting.
@@ -1862,7 +1865,7 @@ def download_one(url, index, total):
             "--progress",          # show the live download progress bar
             "-o", out_template,
         ] + (speed_flags() if fast else ["--concurrent-fragments", "8"]) \
-          + sub_flags(sub_lang, sub_source) + thumb_flags() + extra_flags + ["--", url]
+          + thumb_flags() + extra_flags + ["--", url]
         text = run_streaming(cmd, bar)
         if last_returncode[0] == 0:
             if "not in range" in (text or "").lower() or "dateafter" in (text or "").lower():
@@ -1904,8 +1907,8 @@ def download_one(url, index, total):
     height = probe_height(vfile) if vfile else None
     quality = f"{height}p" if height else "Unknown"
 
-    # Transcripts: the json3 caption downloads alongside the video; convert it
-    # into trans_<name>.txt (grouped) + words_<name>.txt (word-level).
+    # Transcripts: fetch the json3 caption only after the video succeeds, then
+    # convert it into trans_<name>.txt (grouped) + words_<name>.txt (word-level).
     trans = words = None
     sub_note = ""
     if DOWNLOAD_SUBS:

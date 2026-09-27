@@ -900,6 +900,46 @@ class PlatformCase:
         result, record = self._download_one_failing("HTTP Error 503: Service Unavailable")
         self.assertEqual((result, record["status"]), ("fail", "failed"))
 
+    def test_media_download_does_not_fail_when_caption_endpoint_is_rate_limited(self):
+        """Captions are fetched after the media, not as part of its command."""
+        with tempfile.TemporaryDirectory() as base:
+            commands = []
+            saved = (d.fetch_info, d.run_with_retries, d.run_streaming,
+                     d.build_transcripts, d.DOWNLOAD_DIR, d.DONE_INDEX,
+                     d.CHANNEL_MODE, d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
+                     d.LOG_JSONL[0], list(d.LOG_RECORDS), dict(d.STATS))
+
+            def run_streaming(cmd, progress=None):
+                commands.append(cmd)
+                d.last_returncode[0] = 0
+                return ""
+
+            try:
+                d.fetch_info = lambda url: ({"id": "abcdefghijk", "title": "T"}, None)
+                d.run_with_retries = lambda attempt: attempt([], True)
+                d.run_streaming = run_streaming
+                d.build_transcripts = lambda folder, url, info: (None, None)
+                d.DOWNLOAD_DIR = base
+                d.DONE_INDEX = {}
+                d.CHANNEL_MODE = False
+                d.SAVE_THUMBNAIL = d.SAVE_DESCRIPTION = False
+                d.LOG_JSONL[0] = None
+                d.LOG_RECORDS[:] = []
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(d.download_one("https://youtu.be/abcdefghijk", 1, 1), "ok")
+            finally:
+                (d.fetch_info, d.run_with_retries, d.run_streaming,
+                 d.build_transcripts, d.DOWNLOAD_DIR, d.DONE_INDEX,
+                 d.CHANNEL_MODE, d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
+                 d.LOG_JSONL[0], records, stats) = saved
+                d.LOG_RECORDS[:] = records
+                d.STATS.clear()
+                d.STATS.update(stats)
+
+            self.assertEqual(len(commands), 1)
+            self.assertNotIn("--write-auto-subs", commands[0])
+            self.assertNotIn("--write-subs", commands[0])
+
     def test_files_take_the_name_of_the_folder_they_land_in(self):
         with tempfile.TemporaryDirectory() as base:
             os.makedirs(os.path.join(base, "T"))
