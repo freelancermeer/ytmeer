@@ -1335,6 +1335,11 @@ def build_transcripts(folder, url, info):
         clear_captions(folder)
 
 
+def required_caption_error():
+    """Error used when a required transcript could not be produced."""
+    return f"Could not download required '{SUB_LANG}' captions"
+
+
 def find_transcripts(folder, url, info):
     """Produce trans_/words_ for a video, fetching the caption if needed.
 
@@ -1613,6 +1618,8 @@ def index_downloaded(base):
     def consider(folder):
         fields = read_info(folder)
         if fields.get("Status") != "OK":
+            return
+        if DOWNLOAD_SUBS and not find_transcript_file(folder):
             return
         vid = video_id_from_url(fields.get("Link", ""))
         if vid and vid not in index and find_video_file(folder):
@@ -1913,9 +1920,16 @@ def download_one(url, index, total):
     sub_note = ""
     if DOWNLOAD_SUBS:
         trans, words = build_transcripts(folder, url, info)
+        if not trans:
+            err = required_caption_error()
+            note(f"    ! {err}")
+            bar.done(f"FAIL  {err}")
+            write_info(folder, title, url, quality, "ERROR", error=err, info=info)
+            log_record(url=url, title=title, status="failed", quality=quality,
+                       error=err, folder=rel(folder))
+            return "fail"
         sub_note = (f"  Transcript: {os.path.basename(trans)} + "
-                    f"{os.path.basename(words)}" if trans
-                    else "  Transcript: none available")
+                    f"{os.path.basename(words)}")
     thumb, desc = build_extras(folder, url, info)
     extras_note = "".join(f"  {label}: {os.path.basename(path)}"
                           for label, path in (("Thumbnail", thumb), ("Description", desc))

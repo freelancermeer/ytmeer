@@ -161,6 +161,9 @@ class PlatformCase:
         with open(os.path.join(folder, "clip.mp4"), "w") as f:
             f.write("x")
         d.write_info(folder, "T", url, "1080p", status)
+        if status == "OK" and d.DOWNLOAD_SUBS:
+            with open(os.path.join(folder, "trans_T.txt"), "w") as f:
+                f.write("[00:00:00] caption\n")
 
     def test_index_finds_both_layouts_and_ignores_failures(self):
         with tempfile.TemporaryDirectory() as base:
@@ -900,8 +903,8 @@ class PlatformCase:
         result, record = self._download_one_failing("HTTP Error 503: Service Unavailable")
         self.assertEqual((result, record["status"]), ("fail", "failed"))
 
-    def test_media_download_does_not_fail_when_caption_endpoint_is_rate_limited(self):
-        """Captions are fetched after the media, not as part of its command."""
+    def test_media_download_does_not_finish_without_required_captions(self):
+        """A caption 429 cannot be mistaken for a complete download."""
         with tempfile.TemporaryDirectory() as base:
             commands = []
             saved = (d.fetch_info, d.run_with_retries, d.run_streaming,
@@ -926,7 +929,7 @@ class PlatformCase:
                 d.LOG_JSONL[0] = None
                 d.LOG_RECORDS[:] = []
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(d.download_one("https://youtu.be/abcdefghijk", 1, 1), "ok")
+                    self.assertEqual(d.download_one("https://youtu.be/abcdefghijk", 1, 1), "fail")
             finally:
                 (d.fetch_info, d.run_with_retries, d.run_streaming,
                  d.build_transcripts, d.DOWNLOAD_DIR, d.DONE_INDEX,
@@ -939,6 +942,8 @@ class PlatformCase:
             self.assertEqual(len(commands), 1)
             self.assertNotIn("--write-auto-subs", commands[0])
             self.assertNotIn("--write-subs", commands[0])
+            self.assertEqual(d.read_info(os.path.join(base, "T"))["Status"], "ERROR")
+            self.assertIn("captions", d.read_info(os.path.join(base, "T"))["Error"])
 
     def test_files_take_the_name_of_the_folder_they_land_in(self):
         with tempfile.TemporaryDirectory() as base:
