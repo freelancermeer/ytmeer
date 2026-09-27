@@ -138,6 +138,34 @@ class PlatformCase:
         self.assertEqual(sorted(offenders), [],
                          f"non-ASCII text reaching the console at lines {sorted(offenders)}")
 
+    def test_diagnostic_trace_is_structured_and_redacted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "download_debug.jsonl")
+            saved = (d.LOG_DEBUG[0], d.RUN_ID[0], d.DEBUG, d.subprocess.run)
+            try:
+                d.LOG_DEBUG[0] = path
+                d.RUN_ID[0] = "test-run"
+                d.DEBUG = False
+                d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
+                    cmd, 0, "ok https://www.youtube.com/watch?v=abcdefghijk&pot=SECRET", "")
+                d.run_logged(
+                    "unit", ["yt-dlp", "--cookies", "/private/cookies.txt",
+                             "--extractor-args", "youtube:po_token=SECRET",
+                             "https://www.youtube.com/watch?v=abcdefghijk&pot=SECRET"],
+                    capture_output=True, text=True)
+            finally:
+                d.LOG_DEBUG[0], d.RUN_ID[0], d.DEBUG, d.subprocess.run = saved
+
+            with open(path, encoding="utf-8") as f:
+                events = [json.loads(line) for line in f]
+            self.assertEqual([e["event"] for e in events],
+                             ["command_start", "command_finish"])
+            self.assertEqual(events[1]["returncode"], 0)
+            body = json.dumps(events)
+            self.assertNotIn("SECRET", body)
+            self.assertIn("<cookies-file>", json.dumps(events[0]["command"]))
+            self.assertIn("v=abcdefghijk", body)
+
     def test_output_template_escapes_percent(self):
         tpl = d.output_template(os.path.join("base", "vid"), "100% Real")
         self.assertEqual(tpl, os.path.join("base", "vid", "100%% Real.%(ext)s"))
@@ -732,7 +760,8 @@ class PlatformCase:
             os.makedirs(folder)
             path = d.write_description(folder, info)
             self.assertEqual(os.path.basename(path), "description_My Video.txt")
-            body = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
             self.assertIn("Channel:  Some Channel", body)
             self.assertIn("Uploaded: 2026-05-12", body, "the date should be readable")
             self.assertIn("Line one.\nLine two.", body, "the description itself is kept")

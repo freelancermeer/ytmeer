@@ -22,6 +22,7 @@ Optional flags:
     --sub-lang CODE      Transcript language code (default: en)
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
+    --debug              Echo the redacted diagnostic trace as it runs
 
 Examples:
     python3 downloader.py "/Users/me/Videos/YT"
@@ -82,6 +83,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit, urlunsplit
 
 # These are filled in from command-line arguments in main().
 LINKS_FILE     = "links.txt"
@@ -97,6 +99,7 @@ CHANNEL_MODE   = False     # True = group videos into <Channel Name>/ folders
 SAVE_THUMBNAIL = True      # also save the video thumbnail as .jpg
 SAVE_DESCRIPTION = True    # also save the video description as .txt
 VERBOSE        = False     # True = show yt-dlp's full output instead of a bar
+DEBUG          = False     # True = also echo the structured diagnostic trace
 MIN_VIEWS      = 0         # channel links: view floor (0 = take every video)
 LIMIT          = 0         # channel links: newest N matches each (0 = no cap)
 DAYS           = 0         # filter by last N days (0 = any time)
@@ -276,6 +279,8 @@ def read_links(path: str):
 LOG_FILE = [None]          # path to the run's text log, once main() sets it
 LOG_JSON = [None]          # path to the run's JSON log
 LOG_JSONL = [None]         # one line per record, written the moment it exists
+LOG_DEBUG = [None]         # redacted, one-event-per-line diagnostic trace
+RUN_ID = [None]            # identifies one invocation across all trace events
 SUMMARY_WRITTEN = [False]  # the run's download_log.json is on disk
 RUN_LOOP_STARTED = [False] # past this point only main() itself writes the summary
 STOPPING = [False]         # a Ctrl+C was taken, or the run is writing its totals
@@ -325,6 +330,106 @@ def log_line(text):
         pass
 
 
+def _text(value):
+    """Turn subprocess output or an exception value into safe text."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def redact_url(value):
+    """Keep a URL useful for correlation without recording signed query values."""
+    text = _text(value)
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme and parsed.netloc:
+            vid = video_id_from_url(text)
+            query = f"v={vid}" if vid else ""
+            return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+    except (TypeError, ValueError):
+        pass
+    return re.sub(r"(?i)(token|signature|sig|cookie|authorization)=([^&\s]+)",
+                  r"\1=<redacted>", text)
+
+
+def redact_text(value):
+    """Remove signed URLs and common credential/token values from diagnostics."""
+    text = _text(value)
+    text = re.sub(r"https?://[^\s'\"]+", lambda m: redact_url(m.group(0)), text)
+    return re.sub(
+        r"(?i)((?:po[_-]?token|token|signature|sig|visitor_data|cookie|authorization|"
+        r"sapisid|sid)=)([^&\s]+)", r"\1<redacted>", text)
+
+
+def redact_command(cmd):
+    """Return a command suitable for a local diagnostic log."""
+    safe, hide_next = [], False
+    for arg in cmd:
+        arg = _text(arg)
+        if hide_next:
+            safe.append("<cookies-file>")
+            hide_next = False
+        elif arg in ("--cookies", "--password"):
+            safe.append(arg)
+            hide_next = True
+        else:
+            safe.append(redact_text(arg))
+    return safe
+
+
+def log_debug(event, **fields):
+    """Append one structured diagnostic event, without exposing credentials."""
+    if not LOG_DEBUG[0]:
+        return
+    record = {
+        "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+        "run_id": RUN_ID[0],
+        "event": event,
+    }
+    for key, value in fields.items():
+        if key in ("command",):
+            record[key] = redact_command(value)
+        elif key in ("url",):
+            record[key] = redact_url(value)
+        elif key in ("stdout_tail", "stderr_tail", "error", "message"):
+            record[key] = redact_text(value)[-2000:]
+        else:
+            record[key] = value
+    try:
+        with open(LOG_DEBUG[0], "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        return
+    if DEBUG:
+        short = {k: v for k, v in record.items() if k not in ("time", "run_id")}
+        print("[debug] " + json.dumps(short, ensure_ascii=False))
+
+
+def run_logged(stage, cmd, **kwargs):
+    """Run a captured subprocess and record its full lifecycle in the trace."""
+    started = time.monotonic()
+    log_debug("command_start", stage=stage, command=cmd, timeout=kwargs.get("timeout"))
+    try:
+        out = subprocess.run(cmd, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        log_debug("command_timeout", stage=stage, command=cmd,
+                  duration=round(time.monotonic() - started, 3),
+                  timeout=kwargs.get("timeout"), stdout_tail=e.stdout, stderr_tail=e.stderr)
+        raise
+    except OSError as e:
+        log_debug("command_error", stage=stage, command=cmd,
+                  duration=round(time.monotonic() - started, 3), error=str(e))
+        raise
+    log_debug("command_finish", stage=stage, command=cmd,
+              duration=round(time.monotonic() - started, 3),
+              returncode=getattr(out, "returncode", None),
+              stdout_tail=_text(getattr(out, "stdout", "")),
+              stderr_tail=_text(getattr(out, "stderr", "")))
+    return out
+
+
 def note(text):
     """Detail that belongs in the log; on screen only with --verbose."""
     log_line(text)
@@ -360,6 +465,7 @@ def write_empty_summary(stopped=False, excluded=0):
         "failed": sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),
         "stopped_early": stopped, "bytes": 0, "size": human_size(0),
         "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
+        "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
     })
 
 
@@ -445,7 +551,7 @@ class ProgressLine:
 last_returncode = [0]
 
 
-def run_streaming(cmd, progress=None):
+def run_streaming(cmd, progress=None, stage="media"):
     """Run a command and capture its output. Returns the captured text.
 
     With --verbose the raw output goes straight to the terminal, so yt-dlp's own
@@ -453,10 +559,14 @@ def run_streaming(cmd, progress=None):
     file and only the percentage and speed are lifted out, to drive the compact
     one-line display.
     """
+    started = time.monotonic()
+    log_debug("command_start", stage=stage, command=cmd)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except OSError as e:
         last_returncode[0] = 1
+        log_debug("command_error", stage=stage, command=cmd,
+                  duration=round(time.monotonic() - started, 3), error=str(e))
         return f"ERROR: could not start yt-dlp: {e}"
 
     # read1() returns as soon as any bytes are available (so progress stays
@@ -488,6 +598,8 @@ def run_streaming(cmd, progress=None):
                 if found and progress:
                     progress.update(*found)
     except BaseException as e:
+        log_debug("command_interrupted", stage=stage, command=cmd,
+                  duration=round(time.monotonic() - started, 3), error=str(e))
         # Stopped (Ctrl+C, a kill): yt-dlp has to be gone before this process is. Left
         # running, it saves its cookie jar into the private copy after that has been
         # removed, and keeps aria2c writing into the folder.
@@ -520,7 +632,11 @@ def run_streaming(cmd, progress=None):
 
     proc.wait()
     last_returncode[0] = proc.returncode
-    return b"".join(chunks).decode("utf-8", "replace")
+    result = b"".join(chunks).decode("utf-8", "replace")
+    log_debug("command_finish", stage=stage, command=cmd,
+              duration=round(time.monotonic() - started, 3),
+              returncode=proc.returncode, stdout_tail=result)
+    return result
 
 
 # The `mweb` client makes yt-dlp mint the "Proof of Origin" token that YouTube
@@ -1048,17 +1164,22 @@ def build_extras(folder, url, info):
     switched on.
     """
     thumb = find_thumbnail(folder) if SAVE_THUMBNAIL else None
+    log_debug("extras_start", stage="extras", url=url, folder=rel(folder),
+              thumbnail=SAVE_THUMBNAIL, description=SAVE_DESCRIPTION)
     if SAVE_THUMBNAIL and not thumb:
         name = os.path.basename(folder.rstrip("/\\"))
         # Fetching a thumbnail on its own runs into the same bot check the video
         # does, so it gets the same escalation to the PO-token client.
         routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
-        for extra in routes:
-            for _ in range(2):
+        for route_no, extra in enumerate(routes, 1):
+            for attempt_no in range(1, 3):
                 cmd = base_cmd() + ["--skip-download", "--no-warnings"] + thumb_flags() \
                     + list(extra) + ["-o", output_template(folder, name), "--", url]
-                out = subprocess.run(cmd, capture_output=True, text=True)
+                out = run_logged("thumbnail", cmd, capture_output=True, text=True)
                 thumb = find_thumbnail(folder)
+                log_debug("thumbnail_attempt", stage="thumbnail", url=url, folder=rel(folder),
+                          route=route_no, attempt=attempt_no, found=bool(thumb),
+                          returncode=out.returncode)
                 if thumb or not drop_rejected_cookies(out.stderr):
                     break
             if thumb:
@@ -1067,6 +1188,8 @@ def build_extras(folder, url, info):
     desc = find_description(folder) if SAVE_DESCRIPTION else None
     if SAVE_DESCRIPTION and not desc:
         desc = write_description(folder, info)
+    log_debug("extras_finish", stage="extras", url=url, folder=rel(folder),
+              thumbnail=bool(thumb), description=bool(desc))
     return thumb, desc
 
 
@@ -1286,16 +1409,27 @@ def fetch_caption(folder, url, lang, source, client=()):
         # still exposed only through those clients.
         routes = ([list(SUBTITLE_PO_TOKEN_FLAGS)] if BGUTIL_SCRIPT else [])
         routes += [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
-    for extra in routes:
-        for _ in range(2):
+    log_debug("caption_start", stage="caption", url=url, folder=rel(folder),
+              language=lang, source=source, routes=len(routes), known_client=bool(client))
+    for route_no, extra in enumerate(routes, 1):
+        for attempt_no in range(1, 3):
             cmd = base_cmd() + ["--skip-download", "--ignore-no-formats-error"] + flags + list(extra) + [
                 "--no-warnings", "-o", output_template(folder, name), "--", url,
             ]
-            out = subprocess.run(cmd, capture_output=True, text=True)
-            if find_json3(folder):
+            out = run_logged("caption", cmd, capture_output=True, text=True)
+            found = find_json3(folder)
+            log_debug("caption_attempt", stage="caption", url=url, folder=rel(folder),
+                      language=lang, source=source, route=route_no, attempt=attempt_no,
+                      client=extra, returncode=out.returncode, found=bool(found),
+                      stderr_tail=out.stderr)
+            if found:
+                log_debug("caption_finish", stage="caption", url=url, folder=rel(folder),
+                          success=True, language=lang, source=source)
                 return True
             if not drop_rejected_cookies(out.stderr):
                 break
+    log_debug("caption_finish", stage="caption", url=url, folder=rel(folder),
+              success=False, language=lang, source=source)
     return False
 
 
@@ -1337,8 +1471,15 @@ def build_transcripts(folder, url, info):
     """trans_/words_ for a video (see find_transcripts); no caption file stays behind."""
     if not DOWNLOAD_SUBS:
         return None, None
+    started = time.monotonic()
+    log_debug("transcript_start", stage="transcript", url=url, folder=rel(folder),
+              language=SUB_LANG)
     try:
-        return find_transcripts(folder, url, info)
+        result = find_transcripts(folder, url, info)
+        log_debug("transcript_finish", stage="transcript", url=url, folder=rel(folder),
+                  success=bool(result[0]), words=bool(result[1]),
+                  duration=round(time.monotonic() - started, 3))
+        return result
     finally:
         clear_captions(folder)
 
@@ -1460,7 +1601,7 @@ def fetch_info_once(url: str, extra_flags=()):
     cmd = base_cmd() + ["--skip-download", "--dump-single-json",
                         "--no-warnings"] + list(extra_flags) + ["--", url]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        out = run_logged("metadata", cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         return None, "Timed out while fetching video info"
     except OSError as e:
@@ -1519,7 +1660,7 @@ def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
 def probe_height(filepath: str):
     """Use ffprobe to get the real height (e.g. 1080) of the downloaded file."""
     try:
-        out = subprocess.run(
+        out = run_logged("ffprobe",
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=height", "-of", "csv=p=0", filepath],
             capture_output=True, text=True, timeout=30,
@@ -1773,9 +1914,17 @@ def run_with_retries(attempt):
             if err:
                 note(f"    ! {err}")
                 note(f"    Attempt {round_no}/{MAX_ATTEMPTS} via {label}...")
+            route_started = time.monotonic()
+            log_debug("media_attempt_start", stage="media", route=label,
+                      round=round_no, fast=fast, flags=flags)
             err = attempt(flags, fast)
             if err and drop_rejected_cookies(err):
+                log_debug("media_cookie_retry", stage="media", route=label,
+                          round=round_no, error=err)
                 err = attempt(flags, fast)
+            log_debug("media_attempt_finish", stage="media", route=label,
+                      round=round_no, fast=fast, success=not err,
+                      duration=round(time.monotonic() - route_started, 3), error=err)
             if not err:
                 if flags:
                     po_token_first[0] = True   # the rest of the batch will need it
@@ -1804,6 +1953,7 @@ def download_one(url, index, total):
     Returns "ok", "skip", "fail" (worth another go later), or "gone" (private,
     deleted, or otherwise never coming back — retrying it would be pointless).
     """
+    log_debug("video_start", stage="video", url=url, index=index, total=total)
     note(f"\n[{index}/{total}] {url}")
     bar = ProgressLine(index, total, url)
 
@@ -1812,6 +1962,8 @@ def download_one(url, index, total):
     vid = video_id_from_url(url)
     if vid and vid in DONE_INDEX:
         skip_finished(DONE_INDEX[vid], url, bar)
+        log_debug("video_finish", stage="video", url=url, status="skipped",
+                  reason="already_downloaded", folder=rel(DONE_INDEX[vid]))
         return "skip"
 
     # 1) Get the metadata first: it names the folder (title) and, in --channel
@@ -1827,6 +1979,8 @@ def download_one(url, index, total):
     # The id was unknown until now (unusual URL form) — re-check the index.
     if vid and vid in DONE_INDEX:
         skip_finished(DONE_INDEX[vid], url, bar)
+        log_debug("video_finish", stage="video", url=url, status="skipped",
+                  reason="already_downloaded", folder=rel(DONE_INDEX[vid]))
         return "skip"
 
     # Folder = video title, under the channel folder when --channel is on.
@@ -1840,6 +1994,8 @@ def download_one(url, index, total):
     except OSError as e:
         bar.done(f"FAIL  cannot create folder: {e}")
         log_record(url=url, status="failed", error=str(e))
+        log_debug("video_finish", stage="video", url=url, status="failed",
+                  error=str(e), folder=rel(folder))
         return "fail"
 
     # If we couldn't even fetch info, record the error and stop here.
@@ -1855,6 +2011,8 @@ def download_one(url, index, total):
         bar.done(f"FAIL  {err}")
         write_info(folder, title, url, "FAILED", "ERROR", err)
         log_record(url=url, status=failure_status(err), error=err, folder=rel(folder))
+        log_debug("video_finish", stage="video", url=url, status=failure_status(err),
+                  error=err, folder=rel(folder))
         return "gone" if is_permanent(err) else "fail"
 
     # 2) Download best 720p-1080p video+audio (merged mp4) and the thumbnail.
@@ -1915,7 +2073,10 @@ def download_one(url, index, total):
         write_info(folder, title, url, "FAILED", "ERROR", err)
         # No format in the height range is as final as a deleted video: the final
         # sweep would only run the same rounds again and record it twice.
-        return "gone" if is_permanent(err) or FORMAT_GONE in err.lower() else "fail"
+        result = "gone" if is_permanent(err) or FORMAT_GONE in err.lower() else "fail"
+        log_debug("video_finish", stage="video", url=url, status="failed",
+                  result=result, error=err, folder=rel(folder), partial=leftovers or None)
+        return result
 
     # 3) Verify the actual downloaded quality with ffprobe.
     vfile = find_video_file(folder)
@@ -1935,6 +2096,9 @@ def download_one(url, index, total):
             write_info(folder, title, url, quality, "ERROR", error=err, info=info)
             log_record(url=url, title=title, status="failed", quality=quality,
                        error=err, folder=rel(folder))
+            log_debug("video_finish", stage="video", url=url, status="failed",
+                      result="fail", error=err, quality=quality, folder=rel(folder),
+                      captions=False)
             return "fail"
         sub_note = (f"  Transcript: {os.path.basename(trans)} + "
                     f"{os.path.basename(words)}")
@@ -1967,6 +2131,9 @@ def download_one(url, index, total):
                       "words": os.path.basename(words) if words else None,
                       "thumbnail": os.path.basename(thumb) if thumb else None,
                       "description": os.path.basename(desc) if desc else None})
+    log_debug("video_finish", stage="video", url=url, status="ok", quality=quality,
+              folder=rel(folder), bytes=size, seconds=round(elapsed, 1),
+              captions=True, thumbnail=bool(thumb), description=bool(desc))
     # Register it so a link repeated later in this same run is skipped too.
     if vid:
         DONE_INDEX[vid] = folder
@@ -2056,7 +2223,7 @@ def channel_page(url, start, end):
                             "--playlist-start", str(start),
                             "--playlist-end", str(end), "--", url]
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            out = run_logged("channel_page", cmd, capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
             return {}, "Timed out while listing the channel"
         except OSError as e:
@@ -2114,7 +2281,7 @@ def list_channel_recent(url, deadline=None):
     ]
 
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        out = run_logged("channel_recent", cmd, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
         scan_done()
         return links, name, "Timed out while scanning recent videos"
@@ -2399,6 +2566,8 @@ def parse_args(argv=None):
                    help="Do NOT save the description (saved by default).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Show yt-dlp's full output instead of the progress bar.")
+    p.add_argument("--debug", action="store_true",
+                   help="Echo the redacted diagnostic trace as it is written.")
     return p.parse_args(argv)
 
 
@@ -2441,7 +2610,7 @@ def stop_on_sigterm(signum, frame):
 def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
-    global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
+    global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE, DEBUG
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS
 
     use_utf8_output()
@@ -2461,6 +2630,7 @@ def main():
     SAVE_THUMBNAIL = not args.no_thumbnail
     SAVE_DESCRIPTION = not args.no_description
     VERBOSE       = args.verbose
+    DEBUG         = args.debug
     MIN_VIEWS     = args.views
     LIMIT         = args.limit
     DAYS          = args.days
@@ -2486,8 +2656,9 @@ def main():
     extras = [n for n, on in (("thumbnail", SAVE_THUMBNAIL),
                               ("description", SAVE_DESCRIPTION)) if on]
     print(f"  Extras  : {', '.join(extras) if extras else 'none'}")
-    print(f"  Log     : download_log.txt + download_log.json"
-          f"{'  (--verbose: full output on screen)' if VERBOSE else ''}")
+    print(f"  Log     : download_log.txt + download_log.json + download_debug.jsonl"
+          f"{'  (--verbose: full output on screen)' if VERBOSE else ''}"
+          f"{'  (--debug: trace on screen)' if DEBUG else ''}")
 
     if not os.path.isdir(DOWNLOAD_DIR):
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")
@@ -2496,6 +2667,9 @@ def main():
     LOG_FILE[0] = os.path.join(DOWNLOAD_DIR, "download_log.txt")
     LOG_JSON[0] = os.path.join(DOWNLOAD_DIR, "download_log.json")
     LOG_JSONL[0] = os.path.join(DOWNLOAD_DIR, "download_log.jsonl")
+    LOG_DEBUG[0] = os.path.join(DOWNLOAD_DIR, "download_debug.jsonl")
+    RUN_ID[0] = (datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                 + f"-{os.getpid()}")
     try:
         open(LOG_JSONL[0], "w", encoding="utf-8").close()   # this run's lines only
     except OSError:
@@ -2506,6 +2680,19 @@ def main():
     except OSError as e:
         print(f"\nNOTE: could not open the log file ({e}); continuing without it.")
         LOG_FILE[0] = None
+    try:
+        open(LOG_DEBUG[0], "w", encoding="utf-8").close()
+    except OSError as e:
+        print(f"NOTE: could not open the diagnostic log ({e}); continuing without it.")
+        LOG_DEBUG[0] = None
+
+    log_debug("run_start", directory=DOWNLOAD_DIR, links_file=LINKS_FILE,
+              cookies_present=os.path.exists(COOKIES_FILE), channel=CHANNEL_MODE,
+              min_height=MIN_HEIGHT, max_height=MAX_HEIGHT,
+              transcripts=DOWNLOAD_SUBS, sub_lang=SUB_LANG,
+              thumbnail=SAVE_THUMBNAIL, description=SAVE_DESCRIPTION,
+              yt_dlp=shutil.which("yt-dlp"), ffmpeg=shutil.which("ffmpeg"),
+              aria2c=ARIA2C, bgutil_script=bool(BGUTIL_SCRIPT))
 
     missing = [tool for tool in ("yt-dlp", "ffmpeg") if not shutil.which(tool)]
     if missing:
@@ -2658,6 +2845,7 @@ def main():
         "run_seconds": round(run_seconds, 1),
         "average_speed": (f"{human_size(STATS['bytes'] / STATS['seconds'])}/s"
                           if STATS["seconds"] > 0 else None),
+        "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
     })
 
 

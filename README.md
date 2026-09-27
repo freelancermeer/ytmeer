@@ -39,6 +39,7 @@ python3 downloader.py "/path/to/your folder" --channel
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
 | `--no-description` | Skip the description | description on |
 | `-v`, `--verbose` | Show yt-dlp's full output instead of the bar | quiet |
+| `--debug` | Echo the redacted diagnostic trace while it runs | file only |
 
 ## Channel links
 
@@ -275,7 +276,7 @@ lookups, PO tokens, transcripts and thumbnails.
 
 ### Logs
 
-Two files are written into the folder you point at:
+Three logs are written into the folder you point at:
 
 - **`download_log.txt`** — everything yt-dlp said, for when a failure needs
   looking into.
@@ -285,6 +286,11 @@ Two files are written into the folder you point at:
 - **`download_log.jsonl`** — the same records, one line each, written the moment
   a video is done rather than when the run ends. This is what the API's
   `/videos` endpoint reads.
+- **`download_debug.jsonl`** — the deep diagnostic trace. It records every
+  metadata, media, caption, thumbnail, channel-listing and ffprobe command with
+  start/finish events, duration, return code, retry route, and a redacted error
+  tail. Signed URLs, PO tokens and cookie paths are removed. Use `--debug` to
+  echo these events on screen too.
 
 Redirecting the output to a file gives you the per-video lines and nothing else
 — the bar is only drawn when there is a terminal to rewrite. `--verbose` puts
