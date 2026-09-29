@@ -276,6 +276,10 @@ def build_argv(outdir, opts, links_file=None):
         argv.append("--no-description")
     if opts["verbose"]:
         argv.append("--verbose")
+    # API jobs are background work, even when the server itself was started
+    # from a terminal. Keep the downloader's interactive selector for human
+    # CLI runs, but never let an API job wait for terminal input.
+    argv.append("--yes")
     return argv
 
 

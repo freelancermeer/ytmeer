@@ -26,6 +26,25 @@ Group the videos by channel instead:
 python3 downloader.py "/path/to/your folder" --channel
 ```
 
+Before downloading, the command expands the channels, applies the filters, and
+shows every eligible link with the number of already-completed and new videos.
+The terminal selector starts with every new video selected. Use arrow keys to
+move, press Space to deselect/select the highlighted video, `a` to select all,
+`n` to deselect all, Enter to continue, or `q` to cancel. For example:
+
+```bash
+python3 downloader.py "/Users/macintoshhd/Desktop/test/" --channel \
+  --views 10000 --days 7
+```
+
+Use `--dry-run` to print the same plan without downloading, or `--yes` to skip
+the prompt in an automated terminal job:
+
+```bash
+python3 downloader.py "/Users/macintoshhd/Desktop/test/" --channel \
+  --views 10000 --days 7 --dry-run
+```
+
 | Flag | What it does | Default |
 |------|--------------|---------|
 | `--channel` | Group videos into `<Channel Name>/` folders | off (flat) |
@@ -38,6 +57,8 @@ python3 downloader.py "/path/to/your folder" --channel
 | `--sub-lang CODE` | Transcript language | `en` |
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
 | `--no-description` | Skip the description | description on |
+| `--dry-run` | Show the filtered plan and exit | off |
+| `--yes` | Skip the confirmation prompt | prompt on interactive CLI |
 | `-v`, `--verbose` | Show yt-dlp's full output instead of the bar | quiet |
 
 ## Channel links

@@ -149,7 +149,8 @@ class TestArgv(unittest.TestCase):
     def test_the_command_line(self):
         self.assertEqual(self.argv(views=1000, limit=3)[3:],
                          ["/out", "--channel", "--views", "1000", "--limit", "3",
-                          "--min-height", "720", "--max-height", "1080", "--sub-lang", "en"])
+                          "--min-height", "720", "--max-height", "1080", "--sub-lang", "en",
+                          "--yes"])
 
     def test_zeros_emit_no_flag(self):
         argv = self.argv()
@@ -187,6 +188,9 @@ class TestArgv(unittest.TestCase):
     def test_output_is_unbuffered(self):
         # Buffered, the log would arrive in blocks and a job would look stuck.
         self.assertEqual(self.argv()[1], "-u")
+
+    def test_api_jobs_skip_the_interactive_selector(self):
+        self.assertEqual(self.argv()[-1], "--yes")
 
 
 class TestKey(unittest.TestCase):

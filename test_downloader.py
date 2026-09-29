@@ -1608,6 +1608,42 @@ class PlatformCase:
             args = d.parse_args(["/tmp/x", flag, "1000", "--limit", "3"])
             self.assertEqual((args.views, args.limit), (1000, 3))
 
+    def test_dry_run_and_yes_flags_are_available(self):
+        dry = d.parse_args(["/tmp/x", "--dry-run"])
+        yes = d.parse_args(["/tmp/x", "--yes"])
+        self.assertTrue(dry.dry_run)
+        self.assertFalse(dry.yes)
+        self.assertTrue(yes.yes)
+        self.assertFalse(yes.dry_run)
+
+    def test_plan_counts_finished_videos_without_removing_them(self):
+        saved = d.DONE_INDEX
+        d.DONE_INDEX = {"aaaaaaaaaaa": "/tmp/already"}
+        try:
+            links = [("https://www.youtube.com/watch?v=aaaaaaaaaaa", None),
+                     ("https://www.youtube.com/watch?v=bbbbbbbbbbb", None)]
+            pending, already = d.plan_links(links)
+        finally:
+            d.DONE_INDEX = saved
+        self.assertEqual(already, 1)
+        self.assertEqual(pending, [links[1]])
+
+    def test_plan_prints_every_eligible_link(self):
+        links = [(f"https://www.youtube.com/watch?v={chr(97 + i) * 11}", None)
+                 for i in range(12)]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.print_download_plan(1, links, links, 0, 0)
+        text = out.getvalue()
+        self.assertNotIn("and 2 more", text)
+        for i in range(12):
+            self.assertIn(chr(97 + i) * 11, text)
+
+    def test_dry_run_never_confirms_and_yes_confirms(self):
+        self.assertIsNone(d.choose_download_links(
+            d.parse_args(["/tmp/x", "--dry-run"]), [], []))
+        self.assertEqual(d.choose_download_links(
+            d.parse_args(["/tmp/x", "--yes"]), ["one"], []), ["one"])
+
 
 
     # ------------------------------------------------------------ --links

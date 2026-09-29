@@ -22,6 +22,8 @@ Optional flags:
     --sub-lang CODE      Transcript language code (default: en)
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
+    --dry-run            Show the download plan and exit without downloading
+    --yes                Skip the interactive confirmation prompt
 
 Examples:
     python3 downloader.py "/Users/me/Videos/YT"
@@ -457,6 +459,30 @@ def write_empty_summary(stopped=False, excluded=0):
         "excluded_by_skip_list": excluded, "links": 0, "downloaded": 0, "skipped": 0,
         "failed": sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),
         "stopped_early": stopped, "bytes": 0, "size": human_size(0),
+        "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
+        "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
+    })
+
+
+def write_plan_summary(source_links, eligible_links, planned_downloads,
+                       already_downloaded, excluded=0, dry_run=False,
+                       confirmed=False, selected_downloads=None):
+    """Persist the preflight plan when no download loop was started."""
+    write_json_log({
+        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "layout": "channel" if CHANNEL_MODE else "flat",
+        "min_views": MIN_VIEWS or None, "limit": LIMIT or None,
+        "days": DAYS or None,
+        "excluded_by_skip_list": excluded,
+        "source_links": source_links,
+        "links": eligible_links,
+        "planned_downloads": planned_downloads,
+        "selected_downloads": (planned_downloads if selected_downloads is None
+                                else selected_downloads),
+        "already_downloaded": already_downloaded,
+        "downloaded": 0, "skipped": already_downloaded, "failed": 0,
+        "dry_run": dry_run, "confirmed": confirmed,
+        "stopped_early": False, "bytes": 0, "size": human_size(0),
         "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
         "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
     })
@@ -2427,6 +2453,7 @@ def expand_sources(links):
         criteria = ", ".join(filter(None, [
             f">= {MIN_VIEWS:,} views" if MIN_VIEWS else "every video",
             f"newest {LIMIT} each" if LIMIT else "",
+            f"last {DAYS} days" if DAYS else "",
         ]))
         print(f"\n  Reading {len(channels)} channel link(s) ({criteria})...")
     elif MIN_VIEWS or LIMIT:
@@ -2526,6 +2553,152 @@ def drop_skipped(links):
     return kept, len(links) - len(kept)
 
 
+def plan_links(links):
+    """Split eligible links into new media and already-finished videos."""
+    pending, already = [], 0
+    for item in links:
+        url = item[0] if isinstance(item, tuple) else item
+        vid = video_id_from_url(url)
+        if vid and vid in DONE_INDEX:
+            already += 1
+        else:
+            pending.append(item)
+    return pending, already
+
+
+def print_download_plan(source_links, links, pending, already_downloaded, excluded):
+    """Show the exact filtered batch before any media download starts."""
+    print("\n" + "=" * 60)
+    print("  Download plan (no media downloaded yet)")
+    print("=" * 60)
+    print(f"  Source link(s)       : {source_links}")
+    print(f"  Videos after filters : {len(links)}")
+    print(f"  Already complete     : {already_downloaded}")
+    print(f"  New videos to fetch  : {len(pending)}")
+    print(f"  Skip-list exclusions : {excluded}")
+    print(f"  Mode                 : {'channel folders' if CHANNEL_MODE else 'flat folders'}")
+    print(f"  Quality              : {MAX_HEIGHT}p priority / {MIN_HEIGHT}p floor")
+    print(f"  Captions             : {'required (' + SUB_LANG + ')' if DOWNLOAD_SUBS else 'off'}")
+    if MIN_VIEWS:
+        print(f"  View filter          : >= {MIN_VIEWS:,}")
+    if DAYS:
+        print(f"  Date filter          : last {DAYS} day(s)")
+    if LIMIT:
+        print(f"  Channel limit        : newest {LIMIT} match(es) per channel")
+    if links:
+        pending_ids = {id(item) for item in pending}
+        print("  All eligible videos (new downloads start selected):")
+        for number, item in enumerate(links, 1):
+            url = item[0] if isinstance(item, tuple) else item
+            marker = "x" if id(item) in pending_ids else "="
+            state = "download" if marker == "x" else "already complete"
+            print(f"    [{marker}] {number:>3}. {redact_url(url)}  ({state})")
+    print("=" * 60)
+
+
+def select_download_links(pending):
+    """Interactively toggle every pending link with arrows and the spacebar.
+
+    Returns the selected items, or None when the user cancels. The curses UI is
+    used only for a real terminal; callers keep the non-interactive path for the
+    API and redirected jobs.
+    """
+    try:
+        import curses
+    except ImportError:
+        answer = input("  Terminal selector unavailable. Download all selected links? [y/N]: ")
+        return list(pending) if answer.strip().lower() in ("y", "yes") else None
+
+    selected = [True] * len(pending)
+
+    def draw(stdscr, current):
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        visible = max(1, height - 5)
+        top = max(0, min(current - visible + 1, len(pending) - visible))
+        stdscr.addnstr(0, 0, "Select videos to download", max(0, width - 1), curses.A_BOLD)
+        instructions = "Arrows move | Space toggle | a all | n none | Enter continue | q cancel"
+        stdscr.addnstr(1, 0, instructions, max(0, width - 1))
+        for row, index in enumerate(range(top, min(top + visible, len(pending))), 3):
+            item = pending[index]
+            url = item[0] if isinstance(item, tuple) else item
+            marker = "x" if selected[index] else " "
+            text = f"[{marker}] {index + 1:>3}. {redact_url(url)}"
+            attr = curses.A_REVERSE if index == current else curses.A_NORMAL
+            stdscr.addnstr(row, 0, text, max(0, width - 1), attr)
+        footer = f"Selected {sum(selected)}/{len(selected)}"
+        stdscr.addnstr(height - 1, 0, footer, max(0, width - 1), curses.A_BOLD)
+        stdscr.refresh()
+
+    def run(stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        current = 0
+        draw(stdscr, current)
+        while True:
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                current = max(0, current - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                current = min(len(pending) - 1, current + 1)
+            elif key == curses.KEY_PPAGE:
+                current = max(0, current - max(1, stdscr.getmaxyx()[0] - 5))
+            elif key == curses.KEY_NPAGE:
+                current = min(len(pending) - 1, current + max(1, stdscr.getmaxyx()[0] - 5))
+            elif key == ord(" "):
+                selected[current] = not selected[current]
+            elif key in (ord("a"), ord("A")):
+                selected[:] = [True] * len(selected)
+            elif key in (ord("n"), ord("N")):
+                selected[:] = [False] * len(selected)
+            elif key in (ord("q"), ord("Q"), 27):
+                return None
+            elif key in (10, 13, curses.KEY_ENTER):
+                return [item for item, keep in zip(pending, selected) if keep]
+            draw(stdscr, current)
+
+    try:
+        return curses.wrapper(run)
+    except curses.error:
+        answer = input("  Terminal selector failed. Download all selected links? [y/N]: ")
+        return list(pending) if answer.strip().lower() in ("y", "yes") else None
+
+
+def choose_download_links(args, links, pending):
+    """Return the post-selection worklist, or None when the user cancels."""
+    if args.dry_run:
+        print("  Dry run complete. Nothing was downloaded.")
+        log_debug("plan_confirmation", method="dry-run", proceeded=False)
+        return None
+    if args.yes:
+        log_debug("plan_confirmation", method="--yes", proceeded=True)
+        return links
+    if not pending:
+        log_debug("plan_confirmation", method="nothing-new", proceeded=True,
+                  selected_downloads=0)
+        return links
+    if not sys.stdin.isatty():
+        print("  Non-interactive input detected; proceeding without a prompt.")
+        log_debug("plan_confirmation", method="non-interactive", proceeded=True)
+        return links
+    chosen = select_download_links(pending)
+    if chosen is None:
+        print("  Cancelled. Nothing was downloaded.")
+        log_debug("plan_confirmation", method="selector", proceeded=False)
+        return None
+    pending_ids = {id(item) for item in pending}
+    chosen_ids = {id(item) for item in chosen}
+    selected_links = [item for item in links
+                      if id(item) not in pending_ids or id(item) in chosen_ids]
+    print(f"  Selected {len(chosen)} of {len(pending)} new video(s).")
+    log_debug("plan_confirmation", method="selector", proceeded=bool(chosen),
+              selected_downloads=len(chosen), planned_downloads=len(pending))
+    return selected_links if chosen else None
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="YouTube batch downloader (yt-dlp) - 1080p priority, 720p floor.",
@@ -2557,6 +2730,10 @@ def parse_args(argv=None):
                    help="Do NOT save the thumbnail (saved by default).")
     p.add_argument("--no-description", action="store_true",
                    help="Do NOT save the description (saved by default).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show the filtered download plan and exit without downloading.")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip the confirmation prompt and start downloading immediately.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Show yt-dlp's full output instead of the progress bar.")
     # Kept hidden for compatibility with older commands. The diagnostic trace
@@ -2703,6 +2880,7 @@ def main():
         print(f"No links found in {LINKS_FILE}. Add one link per line.")
         write_empty_summary()
         return
+    source_links = len(links)
 
     # A channel link stands for many videos, so it is expanded before anything
     # else counts links. skip.txt is applied to what comes out (channel listings
@@ -2728,6 +2906,24 @@ def main():
     DONE_INDEX = index_downloaded(DOWNLOAD_DIR)
     if DONE_INDEX:
         print(f"  Resuming: {len(DONE_INDEX)} video(s) already downloaded here.")
+
+    pending, already_downloaded = plan_links(links)
+    print_download_plan(source_links, links, pending, already_downloaded, excluded)
+    log_debug("download_plan", source_links=source_links, eligible_links=len(links),
+              planned_downloads=len(pending), already_downloaded=already_downloaded,
+              excluded=excluded, dry_run=args.dry_run)
+    if args.dry_run:
+        write_plan_summary(source_links, len(links), len(pending), already_downloaded,
+                           excluded=excluded, dry_run=True, confirmed=False)
+        return
+    selected_links = choose_download_links(args, links, pending)
+    if selected_links is None:
+        write_plan_summary(source_links, len(links), len(pending), already_downloaded,
+                           excluded=excluded, dry_run=False, confirmed=False,
+                           selected_downloads=0)
+        return
+    links = selected_links
+    selected_downloads = len(links) - already_downloaded
 
     total = len(links)
     run_started = time.monotonic()
@@ -2824,8 +3020,13 @@ def main():
         "layout": "channel" if CHANNEL_MODE else "flat",
         "min_views": MIN_VIEWS or None,
         "limit": LIMIT or None,
+        "days": DAYS or None,
         "excluded_by_skip_list": excluded,
+        "source_links": source_links,
         "links": total,
+        "planned_downloads": len(pending),
+        "selected_downloads": selected_downloads,
+        "already_downloaded": already_downloaded,
         "downloaded": counts["ok"],
         "skipped": counts["skip"],
         "failed": len(failed) + len(gone)
