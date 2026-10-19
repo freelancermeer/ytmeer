@@ -1,6 +1,30 @@
-# YouTube Video Downloader
+# ytmeer - a YouTube toolkit
 
-Batch-downloads YouTube videos in **1080p** (priority) down to **720p** (floor) using **yt-dlp**. Every video gets its own folder, with an info file and two timestamped transcripts inside. Runs on macOS and Windows; no cookies needed for public videos.
+A tool for **researching** YouTube, not only for downloading it. Built on
+**yt-dlp**. Runs on macOS and Windows; no cookies needed for public videos.
+
+Five things it does:
+
+| What you want | How to ask for it |
+|---|---|
+| **Search** YouTube, or one channel | `--search` / `GET /api/search` |
+| A video's **details** (views, subs, upload time, category) | `GET /api/video` |
+| A video's **transcript** | `--transcript` / `GET /api/transcript` |
+| A video's **comments** | `--extract-comments` / `GET /api/comments` |
+| The **video itself**, in 1080p (720p floor) | the default |
+
+**Files, or an answer.** The two are not the same request, so they do not work
+the same way:
+
+- Things whose output *is* a file - a video, and the transcript, thumbnail,
+  description and comments file saved beside it - are a **job**. Each video gets
+  its own folder with a `videoinfo.txt` inside.
+- Things whose output is **data** - a search, a video's details, its transcript,
+  its comments - come straight back **in the API response**. No job, no folder,
+  nothing left on disk to read and tidy up afterwards.
+
+So `GET /api/transcript` hands you the text; `--transcript` writes the files. Ask
+for whichever one you actually want.
 
 ## Setup
 
@@ -308,11 +332,75 @@ times worse than letting the search extraction date them — so it is not used.
 
 ## The REST API
 
-`api.py` exposes every one of these flags. Request fields mirror the flag names:
-`transcript`, `extract_comments`, `comment_limit`, `comment_replies`,
-`comment_sort`, `search`, `in_channel`, `search_count`, `sort`, `this_month`.
+### Lookups: an answer, not a job
 
-A search job needs no `links` — the search supplies them:
+Four endpoints answer in the response itself. They start no job, create no
+folder and leave no files - not even a temporary one.
+
+```bash
+curl -H "X-API-Key: $KEY" "localhost:8000/api/video?url=dQw4w9WgXcQ"
+curl -H "X-API-Key: $KEY" "localhost:8000/api/transcript?url=dQw4w9WgXcQ"
+curl -H "X-API-Key: $KEY" "localhost:8000/api/comments?url=dQw4w9WgXcQ&limit=100"
+curl -H "X-API-Key: $KEY" -G localhost:8000/api/search --data-urlencode 'query=cats'
+```
+
+A link or a bare 11-character id both work.
+
+**`GET /api/video`** - everything YouTube publishes about one video:
+
+```json
+{ "id": "dQw4w9WgXcQ", "title": "Rick Astley - Never Gonna Give You Up ...",
+  "channel": "Rick Astley", "subscribers": 4550000, "views": 1828419799,
+  "likes": 19489790, "comment_count": 2400000, "duration_text": "3m 33s",
+  "uploaded": "25 Oct 2009, 11:57:33 AM PKT", "category": "Music",
+  "captions": { "auto": ["en", "en-orig"], "manual": ["en"] },
+  "tags": ["rick astley", "..."], "description": "..." }
+```
+
+A value YouTube does not publish comes back as `null`, never `"NA"`: this is
+data, and `null` is the only way to tell "no likes" from "likes hidden".
+`captions.auto` is worth reading before asking for a transcript - only an
+auto-generated track carries word-level timings.
+
+**`GET /api/transcript`** - the text, in both shapes, with no video downloaded:
+
+```json
+{ "word_level": true, "segments": 289, "language": "en",
+  "text":  "[00:00:00] [Music] We're no strangers to love. You\n[00:00:23] know ...",
+  "words": "[00:00:00.320] [Music]\n[00:00:18.800] We're\n[00:00:19.039] no ...",
+  "note": null }
+```
+
+`text` is the grouped form and `words` is one word per line - the same two
+shapes `trans_*.txt` and `words_*.txt` have on disk, written by the same code.
+When YouTube has no auto-generated track, `words` is `null` and `note` says why
+rather than leaving you to guess.
+
+**`GET /api/comments`** - threaded, with `limit`, `replies` and `sort=top|new`:
+
+```json
+{ "total_on_video": 2400000, "fetched": 100, "top_level": 100, "replies": 0,
+  "sort": "top", "replies_included": false,
+  "threads": [ { "author": "@someone", "likes": 104000,
+                 "published": "20 Oct 2020, 05:00 AM PKT", "text": "...",
+                 "replies": [] } ] }
+```
+
+`total_on_video` against `fetched` shows what the limit left behind. 100
+top-level comments take about 7s, and about 19s with their replies.
+
+A lookup answers `422` for something that is not a video link, `502` when
+YouTube will not answer for it (private, removed, bot-gated), and `503` when
+another in-process request is already running - see the lock note below.
+
+### Jobs: when the files are the point
+
+`api.py` exposes every flag the downloader takes. Request fields mirror the
+flag names: `transcript`, `extract_comments`, `comment_limit`,
+`comment_replies`, `comment_sort`, `search`, `in_channel`, `search_count`,
+`sort`, `this_month`.
+
+A search job needs no `links` - the search supplies them:
 
 ```bash
 curl -X POST localhost:8000/api/jobs -H 'content-type: application/json' -d '{
@@ -320,6 +408,11 @@ curl -X POST localhost:8000/api/jobs -H 'content-type: application/json' -d '{
   "limit": 20, "transcript": true, "extract_comments": true
 }'
 ```
+
+`links` and `search` are two different worklists, so sending both is refused
+rather than silently downloading one of them. `this_month` is a search window
+and nothing else reads it, so it needs `search` too; to limit a download by
+date, use `days`.
 
 **`GET /api/search`** searches without downloading anything and returns the
 four fields per video:
@@ -331,16 +424,26 @@ curl -G localhost:8000/api/search \
 ```
 
 ```json
-{ "sort": "least-viewed", "window": "since 01 Oct 2026", "found": 3,
+{ "sort": "least-viewed", "window": "since 01 Oct 2026",
+  "scanned": 37, "found": 3,
   "results": [ { "rank": 1, "views": 0, "published": "19 Oct 2026, 10:46:52 PM PKT",
                  "channel": "Royal Storyline",
                  "link": "https://www.youtube.com/watch?v=jrshTn5bePc" } ] }
 ```
 
-It shares the channel preview's lock, because both reach into the downloader's
-module globals in-process, so one search or preview runs at a time and a second
-gets `503`. A date window or a date sort costs about 2s per result scanned;
-without one a search is about 0.15s per result.
+`scanned` is what the search returned and `found` is what survived the filters.
+A narrow query with a month window often finds only a handful - raise `count` to
+scan further down the results before giving up on it.
+
+**One at a time.** Every lookup and the channel preview reach into the
+downloader's module globals in-process, so they share one lock: a second request
+gets `503` rather than queueing behind a slow one. Each request resets every
+global it can set first, so a `days=30` search cannot leak into the next
+preview. A route gives up after 120s rather than holding the lock for the
+downloader's own subprocess timeout.
+
+A date window or a date sort costs about 2s per result scanned; without one a
+search is about 0.15s per result.
 
 `GET /jobs/{id}/videos` now lists `comments` alongside the video, transcript,
 words, thumbnail and description.
@@ -643,8 +746,9 @@ On Windows, install the requirements the same way, and make sure `node`,
 
 ## API
 
-A small REST API so other code can drive the downloader: start a batch, then
-collect each video the moment it finishes while the rest keep downloading.
+A small REST API so other code can drive the toolkit: look a video up and get
+the answer back, or start a batch and collect each video the moment it finishes
+while the rest keep downloading.
 
 ```bash
 python3 api.py                                  # http://127.0.0.1:8000
@@ -662,6 +766,10 @@ link as well - nothing else, no UI.
 | `GET /api/ping` | alive, and `busy` while a job runs (no key) |
 | `GET /api/health` | tools found, default folder, jobs |
 | `GET /api/preview?channel=URL&views=1000&limit=3` | the newest videos a channel link would download |
+| `GET /api/search?query=...` | search YouTube: link, views, publish date, channel |
+| `GET /api/video?url=...` | one video's details - **answers, no job** |
+| `GET /api/transcript?url=...` | one video's transcript, as text - **no job** |
+| `GET /api/comments?url=...` | one video's comments, threaded - **no job** |
 | `POST /api/jobs` | start downloading, returns `job_id` |
 | `GET /api/jobs` | all jobs |
 | `GET /api/jobs/{id}` | state, progress, summary, failures |

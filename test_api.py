@@ -146,6 +146,11 @@ class TestArgv(unittest.TestCase):
     def argv(self, **over):
         return api.build_argv("/out", api.normalize_request(dict(links="x", **over)))
 
+    def search_argv(self, **over):
+        """A search job's command line. It carries no links: the search is the
+        worklist, and sending both is refused."""
+        return api.build_argv("/out", api.normalize_request(dict(**over)))
+
     def test_the_command_line(self):
         self.assertEqual(self.argv(views=1000, limit=3)[3:],
                          ["/out", "--channel", "--views", "1000", "--limit", "3",
@@ -192,17 +197,17 @@ class TestArgv(unittest.TestCase):
             self.assertNotIn(flag, argv)
 
     def test_search_reaches_the_command_line(self):
-        argv = self.argv(search="cats", search_count=10, sort="popularity",
-                         this_month=True)
-        self.assertEqual(argv[argv.index("--search") + 1], "cats")
+        argv = self.search_argv(search="cats", search_count=10, sort="popularity",
+                                this_month=True)
+        self.assertIn("--search=cats", argv)
         self.assertEqual(argv[argv.index("--search-count") + 1], "10")
         self.assertEqual(argv[argv.index("--sort") + 1], "popularity")
         self.assertIn("--this-month", argv)
         self.assertEqual(argv[-1], "--yes")
 
     def test_in_channel_reaches_the_command_line(self):
-        argv = self.argv(search="cats",
-                         in_channel="https://www.youtube.com/@Handle")
+        argv = self.search_argv(search="cats",
+                                in_channel="https://www.youtube.com/@Handle")
         self.assertEqual(argv[argv.index("--in-channel") + 1],
                          "https://www.youtube.com/@Handle")
 
@@ -216,7 +221,20 @@ class TestArgv(unittest.TestCase):
         # The search produces the worklist, so there is nothing to supply.
         opts = api.normalize_request({"search": "cats"})
         self.assertEqual(opts["links"], "")
-        self.assertIn("--search", api.build_argv("/out", opts))
+        self.assertIn("--search=cats", api.build_argv("/out", opts))
+
+    def test_a_query_that_starts_with_a_dash_is_still_a_query(self):
+        # --search -ad reads would reach argparse as an option and kill the run.
+        argv = self.search_argv(search="-ad reads")
+        self.assertIn("--search=-ad reads", argv)
+        self.assertNotIn("-ad reads", argv)
+
+    def test_links_and_search_together_are_refused(self):
+        # A search replaces the worklist; accepting both would download
+        # something other than what was asked for.
+        with self.assertRaises(ValueError) as caught:
+            api.normalize_request({"links": "x", "search": "cats"})
+        self.assertIn("two different worklists", str(caught.exception))
 
     def test_a_job_with_neither_links_nor_search_is_refused(self):
         with self.assertRaises(ValueError) as caught:
@@ -226,8 +244,10 @@ class TestArgv(unittest.TestCase):
     def test_contradictory_options_are_refused(self):
         for payload, expected in (
                 ({"links": "x", "in_channel": "https://www.youtube.com/@H"}, "needs search"),
-                ({"links": "x", "search": "c", "in_channel": "nonsense"}, "channel link"),
-                ({"links": "x", "days": 7, "this_month": True}, "pick one"),
+                ({"search": "c", "in_channel": "nonsense"}, "channel link"),
+                ({"search": "c", "days": 7, "this_month": True}, "pick one"),
+                ({"links": "x", "this_month": True}, "needs search"),
+                ({"search": "c", "search_count": 0}, "at least 1"),
                 ({"links": "x", "transcript": True, "subs": False}, "cannot be combined"),
                 ({"links": "x", "comment_sort": "best"}, "comment_sort must be"),
                 ({"links": "x", "sort": "sideways"}, "sort must be one of"),
@@ -237,7 +257,7 @@ class TestArgv(unittest.TestCase):
             self.assertIn(expected, str(caught.exception))
 
     def test_reverse_popularity_is_an_accepted_sort(self):
-        argv = self.argv(search="cats", sort="least-viewed")
+        argv = self.search_argv(search="cats", sort="least-viewed")
         self.assertEqual(argv[argv.index("--sort") + 1], "least-viewed")
 
     def test_a_links_file_is_passed_on(self):

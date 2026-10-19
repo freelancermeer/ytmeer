@@ -89,6 +89,7 @@ WINDOWS
 """
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -148,6 +149,7 @@ SEARCH_COUNT   = 50        # results to ask YouTube for before filtering
 SORT_BY        = "relevance"   # relevance | views | date | oldest
 THIS_MONTH     = False     # --this-month: since the 1st of the current month
 IN_CHANNEL     = None      # --in-channel URL: search inside that channel only
+SEARCH_FOUND   = [0]       # results the last search returned, before filtering
 SEARCH_TIMEOUT = 900       # a dated search extracts every result it scans
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -493,6 +495,31 @@ def log_record(**fields):
             pass
 
 
+def mode_fields():
+    """The keys that say what kind of run this was and what it produced.
+
+    Every summary writer includes these, so a caller reading download_log.json
+    never has to know which of them wrote it - a search that failed before the
+    first download still says it was a search, and for what.
+    """
+    return {
+        "mode": "transcript" if TRANSCRIPT_ONLY else "download",
+        "transcripts": TRANSCRIPT_COUNT[0],
+        "comments": COMMENT_COUNT[0],
+        "search_query": SEARCH_QUERY,
+        "search_sort": SORT_BY if SEARCH_QUERY else None,
+        "search_in_channel": IN_CHANNEL,
+    }
+
+
+def failed_before_download():
+    """Links that never reached the download loop: a channel that could not be
+    listed, or a search that failed outright. Both are usually the whole reason
+    there was nothing to do, so neither may be reported as a clean empty run."""
+    return sum(1 for r in LOG_RECORDS
+               if r.get("status") in ("channel_failed", "failed"))
+
+
 def write_empty_summary(stopped=False, excluded=0):
     """The JSON log for a run that ended before downloading anything, so a caller
     always has a summary. Unreadable channels are counted as failed, since they are
@@ -501,8 +528,10 @@ def write_empty_summary(stopped=False, excluded=0):
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
         "layout": "channel" if CHANNEL_MODE else "flat",
         "min_views": MIN_VIEWS or None, "limit": LIMIT or None,
+        "days": DAYS or None,
         "excluded_by_skip_list": excluded, "links": 0, "downloaded": 0, "skipped": 0,
-        "failed": sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),
+        "failed": failed_before_download(),
+        **mode_fields(),
         "stopped_early": stopped, "bytes": 0, "size": human_size(0),
         "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
         "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
@@ -525,7 +554,9 @@ def write_plan_summary(source_links, eligible_links, planned_downloads,
         "selected_downloads": (planned_downloads if selected_downloads is None
                                 else selected_downloads),
         "already_downloaded": already_downloaded,
-        "downloaded": 0, "skipped": already_downloaded, "failed": 0,
+        "downloaded": 0, "skipped": already_downloaded,
+        "failed": failed_before_download(),
+        **mode_fields(),
         "dry_run": dry_run, "confirmed": confirmed,
         "stopped_early": False, "bytes": 0, "size": human_size(0),
         "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
@@ -1095,13 +1126,19 @@ def one_line(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def write_trans_txt(out_txt, words):
+def trans_lines(words):
     """Default style: grouped, wrapped lines with [hh:mm:ss] timestamps."""
+    for start, text in group_words_into_lines(words):
+        text = one_line(text)
+        if text:
+            yield f"{format_timestamp(start)} {text}"
+
+
+def write_trans_txt(out_txt, words):
+    """Write the default-style transcript file."""
     with open(out_txt, "w", encoding="utf-8") as f:
-        for start, text in group_words_into_lines(words):
-            text = one_line(text)
-            if text:
-                f.write(f"{format_timestamp(start)} {text}\n")
+        for line in trans_lines(words):
+            f.write(line + "\n")
 
 
 # A caption is word-level when almost every entry holds a single word. Auto-
@@ -1120,13 +1157,19 @@ def is_word_level(entries):
     return multi <= len(texts) * WORD_LEVEL_TOLERANCE
 
 
-def write_words_txt(out_txt, words):
+def words_lines(words):
     """Oneword style: one word per line with [hh:mm:ss.mmm] timestamps."""
+    for start, _end, text in words:
+        word = one_line(text)
+        if word:
+            yield f"{format_timestamp_ms(start)} {word}"
+
+
+def write_words_txt(out_txt, words):
+    """Write the one-word-per-line transcript file."""
     with open(out_txt, "w", encoding="utf-8") as f:
-        for start, _end, text in words:
-            word = one_line(text)
-            if word:
-                f.write(f"{format_timestamp_ms(start)} {word}\n")
+        for line in words_lines(words):
+            f.write(line + "\n")
 
 
 def write_words_not_found(out_txt, entries):
@@ -1283,6 +1326,18 @@ def comment_extractor_args(client=()):
     return ["--extractor-args", "youtube:" + ";".join(parts)]
 
 
+def owns_info_json(name, folder_name):
+    """Whether this .info.json is the one yt-dlp wrote for this folder.
+
+    output_template() names it after the folder, so "My Clip.info.json" belongs
+    here and so would "My Clip.en.info.json". A folder whose own name contains
+    dots still matches, which splitting on "." would not manage.
+    """
+    if not name.endswith(".info.json"):
+        return False
+    return name == f"{folder_name}.info.json" or name.startswith(f"{folder_name}.")
+
+
 def find_comments_file(folder):
     """Path to the saved comments_*.txt in the folder, or None."""
     try:
@@ -1295,17 +1350,22 @@ def find_comments_file(folder):
 
 
 def take_comments(folder):
-    """Lift the comments out of the .info.json, then delete every one of them.
+    """Lift the comments out of the .info.json this run wrote, then delete it.
 
     --write-comments has nowhere else to put them, and the file is large whether
     or not the comments are: 923 KB for ten of them, because the bulk is format
     metadata. Leaving it behind would put about a megabyte of noise in every
     video folder, so it is removed the way take_caption removes the json3.
+
+    Only files named after the folder are touched. yt-dlp writes exactly that
+    one (see output_template), and anything else ending in .info.json was put
+    there by something other than this run - it is not ours to delete.
     """
+    name = os.path.basename(folder.rstrip("/\\"))
     found = []
     try:
         found = [os.path.join(folder, n) for n in sorted(os.listdir(folder))
-                 if n.endswith(".info.json")]
+                 if owns_info_json(n, name)]
     except OSError:
         return []
     comments = []
@@ -1363,6 +1423,27 @@ def comment_time(comment):
     return str((comment or {}).get("_time_text") or "NA")
 
 
+# Everything except tab/newline/carriage-return, which one_line() already folds
+# into spaces. An escape sequence or a stray control character in a comment
+# would otherwise rewrite the file's shape around it - enough to make a reply
+# read as a top-level comment, or to repaint the terminal of whoever cats it.
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def safe_text(value):
+    """Text with control characters removed and its line breaks kept.
+
+    For data handed to a caller, where a comment's own paragraphs are worth
+    keeping - unlike a laid-out text file, where they are not (see clean_text).
+    """
+    return CONTROL_RE.sub("", str(value or ""))
+
+
+def clean_text(value):
+    """One line of text, with control characters removed."""
+    return one_line(CONTROL_RE.sub(" ", str(value or "")))
+
+
 def write_comments_txt(folder, info, comments):
     """Write comments_<folder name>.txt and return its path, or None.
 
@@ -1380,7 +1461,7 @@ def write_comments_txt(folder, info, comments):
 
     def block(comment, indent):
         pad = " " * indent
-        who = str(comment.get("author") or "unknown")
+        who = clean_text(comment.get("author")) or "unknown"
         marks = ""
         if comment.get("author_is_uploader"):
             marks += "  (uploader)"
@@ -1394,13 +1475,13 @@ def write_comments_txt(folder, info, comments):
         else:
             likes = "likes NA"
         lines = [f"{pad}{who}{marks}", f"{pad}  {likes} | {comment_time(comment)}"]
-        text = one_line(str(comment.get("text") or ""))
+        text = clean_text(comment.get("text"))
         lines += [f"{pad}  {text}" if text else f"{pad}  (no text)"]
         return "\n".join(lines)
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"Comments for: {info.get('title') or ''}\n")
-        f.write(f"Link:         {info.get('webpage_url') or ''}\n")
+        f.write(f"Comments for: {clean_text(info.get('title'))}\n")
+        f.write(f"Link:         {clean_text(info.get('webpage_url'))}\n")
         f.write(f"Sort:         {COMMENT_SORT}\n")
         f.write(f"Fetched:      {tops} comment(s), {replies} reply(ies)"
                 f"{'' if COMMENT_REPLIES else '  (replies off)'}\n")
@@ -1424,21 +1505,37 @@ def fetch_comments(folder, url):
               sort=COMMENT_SORT, limit=COMMENT_LIMIT, replies=COMMENT_REPLIES,
               routes=len(routes))
     for route_no, extra in enumerate(routes, 1):
-        cmd = base_cmd() + [
-            "--skip-download", "--no-playlist", "--ignore-no-formats-error",
-            "--write-comments", "--write-info-json", "--no-warnings",
-            "-o", output_template(folder, name),
-        ] + comment_extractor_args(extra) + ["--", url]
-        out = run_logged("comments", cmd, capture_output=True, text=True,
-                         timeout=COMMENT_TIMEOUT)
-        comments = take_comments(folder)
-        log_debug("comments_attempt", stage="comments", url=url, folder=rel(folder),
-                  route=route_no, returncode=getattr(out, "returncode", None),
-                  found=len(comments), stderr_tail=getattr(out, "stderr", ""))
-        if comments:
-            return comments
-        if not drop_rejected_cookies(getattr(out, "stderr", "") or ""):
-            continue
+        # Two attempts per route, because the second is the point of the first:
+        # when YouTube rejects cookies.txt, drop_rejected_cookies() drops it and
+        # the identical request is worth making again without it.
+        for attempt in (1, 2):
+            cmd = base_cmd() + [
+                "--skip-download", "--no-playlist", "--ignore-no-formats-error",
+                "--write-comments", "--write-info-json", "--no-warnings",
+                "-o", output_template(folder, name),
+            ] + comment_extractor_args(extra) + ["--", url]
+            try:
+                out = run_logged("comments", cmd, capture_output=True, text=True,
+                                 timeout=COMMENT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # A video with tens of thousands of comments hits the cap rather
+                # than the end. The next route is still worth trying, and letting
+                # this escape would put the whole command line in the job log.
+                log_debug("comments_attempt", stage="comments", url=url,
+                          folder=rel(folder), route=route_no, attempt=attempt,
+                          timed_out=True, found=0)
+                take_comments(folder)          # leave no half-written .info.json
+                break
+            comments = take_comments(folder)
+            log_debug("comments_attempt", stage="comments", url=url, folder=rel(folder),
+                      route=route_no, attempt=attempt,
+                      returncode=getattr(out, "returncode", None),
+                      found=len(comments), stderr_tail=getattr(out, "stderr", ""))
+            if comments:
+                return comments
+            if attempt == 1 and drop_rejected_cookies(getattr(out, "stderr", "") or ""):
+                continue
+            break
     return []
 
 
@@ -1781,9 +1878,19 @@ def find_transcripts(folder, url, info):
     if not DOWNLOAD_SUBS:
         return None, None
 
+    return write_transcripts(folder, best_caption_entries(folder, url, info))
+
+
+def best_caption_entries(folder, url, info):
+    """The best caption a video has, as parsed entries. Writes no transcript.
+
+    This is the choosing half of find_transcripts: it fetches into `folder` and
+    leaves no caption file behind, but produces no trans_/words_ files either -
+    so a caller that wants the text itself rather than the files can use it.
+    """
     entries = take_caption(folder)          # whatever came down with the video
     if is_word_level(entries):
-        return write_transcripts(folder, entries)
+        return entries
 
     fallback = entries
     tried = 0
@@ -1795,9 +1902,9 @@ def find_transcripts(folder, url, info):
             continue
         got = take_caption(folder)
         if is_word_level(got):
-            return write_transcripts(folder, got)
+            return got
         fallback = fallback or got
-    return write_transcripts(folder, fallback)
+    return fallback
 
 
 def update_info_counts(folder, info):
@@ -1836,14 +1943,23 @@ def update_info_counts(folder, info):
 
 
 def update_info_extras(folder, thumbnail, description):
-    """Add/refresh the Thumbnail: and Description: lines in an existing videoinfo.txt."""
+    """Add/refresh the Thumbnail: and Description: lines in an existing videoinfo.txt.
+
+    Only the lines this run is going to rewrite are dropped. --transcript forces
+    SAVE_THUMBNAIL off, and removing a line it then declines to replace would
+    erase a finished download's record of a thumbnail it really does have.
+    """
     info = os.path.join(folder, "videoinfo.txt")
     if not os.path.exists(info):
+        return
+    replacing = tuple(label for label, on in (("Thumbnail:", SAVE_THUMBNAIL),
+                                              ("Description:", SAVE_DESCRIPTION)) if on)
+    if not replacing:
         return
     try:
         with open(info, "r", encoding="utf-8") as f:
             kept = [ln for ln in f.read().splitlines()
-                    if not ln.startswith(("Thumbnail:", "Description:"))]
+                    if not ln.startswith(replacing)]
     except OSError:
         return
     if SAVE_THUMBNAIL:
@@ -1855,17 +1971,31 @@ def update_info_extras(folder, thumbnail, description):
 
 
 def update_info_comments(folder, path, count, state):
-    """Add or refresh the single Comments: line in an existing videoinfo.txt."""
+    """Add or refresh the single Comments: line in an existing videoinfo.txt.
+
+    "off" means this run was never asked for comments, so whatever an earlier
+    run recorded stays: replacing it with "none" would claim the video has no
+    comments when the file sitting beside it says otherwise.
+    """
+    if state == "off":
+        return
     info_path = os.path.join(folder, "videoinfo.txt")
     if not os.path.exists(info_path):
         return
     try:
         with open(info_path, "r", encoding="utf-8") as f:
-            kept = [ln for ln in f.read().splitlines()
-                    if not ln.startswith("Comments:")]
+            lines = f.read().splitlines()
     except OSError:
         return
-    kept.append(f"Comments: {comments_line(path, count, state)}")
+    line = f"Comments: {comments_line(path, count, state)}"
+    old = next((ln for ln in lines if ln.startswith("Comments:")), "")
+    # A re-run that merely found the file already there reports a count of 0,
+    # because it fetched nothing. The count the original fetch recorded is the
+    # true one, so for the same file the old line wins.
+    if path and not count and old.startswith(f"Comments: {os.path.basename(path)}"):
+        line = old
+    kept = [ln for ln in lines if not ln.startswith("Comments:")]
+    kept.append(line)
     try:
         with open(info_path, "w", encoding="utf-8") as f:
             f.write("\n".join(kept) + "\n")
@@ -1873,18 +2003,42 @@ def update_info_comments(folder, path, count, state):
         pass
 
 
+def existing_transcripts(folder):
+    """The transcript files already in the folder, as (trans, words).
+
+    (None, None) when there is no trans_ file. Used to recognise work that is
+    already done, so a run asked for something else about the same video - its
+    comments, say - does not fetch the caption all over again.
+    """
+    existing = find_transcript_file(folder)
+    if not existing:
+        return None, None
+    name = os.path.basename(existing)
+    for prefix in ("words_", "words_not_found_"):
+        companion = os.path.join(folder, name.replace("trans_", prefix, 1))
+        if os.path.exists(companion):
+            return existing, companion
+    return existing, None
+
+
+def files_size(*paths):
+    """Total bytes of the named files, skipping any that are absent."""
+    total = 0
+    for path in paths:
+        try:
+            total += os.path.getsize(path) if path else 0
+        except OSError:
+            pass
+    return total
+
+
 def download_subs(folder, url):
     """Backfill: build the transcripts for an already-downloaded video."""
     if not DOWNLOAD_SUBS:
         return None, None
-    existing = find_transcript_file(folder)
-    if existing:
-        name = os.path.basename(existing)
-        for prefix in ("words_", "words_not_found_"):
-            companion = os.path.join(folder, name.replace("trans_", prefix, 1))
-            if os.path.exists(companion):
-                return existing, companion
-        return existing, None
+    trans, words = existing_transcripts(folder)
+    if trans:
+        return trans, words
     info, _ = fetch_info(url)          # tells us which caption track to ask for
     return build_transcripts(folder, url, info)
 
@@ -2000,6 +2154,11 @@ def find_video_file(folder: str):
 # same video is often listed twice with different tracking suffixes
 # (…?v=ABC and …?v=ABC&pp=XYZ). Keying on the id makes those one video.
 VIDEO_ID_RE = re.compile(r"(?:v=|/shorts/|/embed/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+
+def watch_url(vid):
+    """The canonical watch link for a video id - the one form the whole tool uses."""
+    return f"https://www.youtube.com/watch?v={vid}"
 
 
 def video_id_from_url(url):
@@ -2123,8 +2282,14 @@ def index_transcribed(base):
         if fields.get("Status") not in (TRANSCRIPT_STATUS, "OK"):
             continue
         vid = video_id_from_url(fields.get("Link", ""))
-        if vid and vid not in index and find_transcript_file(folder):
-            index[vid] = folder
+        if not vid or vid in index or not find_transcript_file(folder):
+            continue
+        # The transcript is there, but this run also wants comments and this
+        # folder has none. Counting it as done would skip the video and write no
+        # comments at all, with nothing in the output to say why.
+        if EXTRACT_COMMENTS and not find_comments_file(folder):
+            continue
+        index[vid] = folder
     return index
 
 
@@ -2206,10 +2371,18 @@ def skip_finished(folder, url, bar=None):
     wants_desc = SAVE_DESCRIPTION and not find_description(folder)
     wants_counts = any(k not in fields for k in ("Views", "Subscribers",
                                                  "Uploaded", "Category"))
+    # Comments asked for after the video was already downloaded are filled in
+    # here too, so an existing library gains them without downloading again.
+    wants_comments = EXTRACT_COMMENTS and not find_comments_file(folder)
+
+    # One metadata lookup for everything that needs it. It is by far the
+    # slowest step in a skip, and backfilling a description and the comments in
+    # the same pass used to make the identical request twice.
+    info = None
+    if wants_desc or wants_counts or wants_comments:
+        info, _ = fetch_info(url)
+
     if wants_thumb or wants_desc or wants_counts:
-        info = None
-        if wants_desc or wants_counts:
-            info, _ = fetch_info(url)
         thumb, desc = build_extras(folder, url, info)
         for path in (thumb, desc):
             if path:
@@ -2219,11 +2392,8 @@ def skip_finished(folder, url, bar=None):
             update_info_counts(folder, info)
             note("      + views and subscriber count")
 
-    # Comments asked for after the video was already downloaded: fetched here,
-    # so an existing library gains them without being downloaded again.
-    if EXTRACT_COMMENTS and not find_comments_file(folder):
-        cinfo, _ = fetch_info(url)
-        cpath, ccount, cstate = build_comments(folder, url, cinfo)
+    if wants_comments:
+        cpath, ccount, cstate = build_comments(folder, url, info)
         update_info_comments(folder, cpath, ccount, cstate)
         if cpath:
             note(f"      + {os.path.basename(cpath)}")
@@ -2546,7 +2716,12 @@ def transcript_only(folder, url, vid, title, info, bar):
     endpoint's own rate limit - exactly what the end-of-batch sweep is for.
     """
     started = time.monotonic()
-    trans, words = build_transcripts(folder, url, info)
+    # Normally there is nothing here yet. There is when the video was already
+    # transcribed and this run wants its comments as well, and re-fetching the
+    # caption for a file already on disk would be a network call for nothing.
+    trans, words = existing_transcripts(folder)
+    if not trans:
+        trans, words = build_transcripts(folder, url, info)
     elapsed = time.monotonic() - started
 
     # A folder that already holds a video was made by a full download (one run
@@ -2575,7 +2750,9 @@ def transcript_only(folder, url, vid, title, info, bar):
     # description, out of metadata already fetched, and starts no subprocess.
     thumb, desc = build_extras(folder, url, info)
     cpath, ccount, cstate = build_comments(folder, url, info)
-    size = folder_size(folder)
+    # Only what this mode wrote. folder_size() would include a video file left
+    # by an earlier full download and report it as this run's output.
+    size = files_size(trans, words, desc, cpath)
     got = "".join(c for c, path in (("T", trans),
                                     ("W", words and "not_found" not in words),
                                     ("d", desc), ("c", cpath)) if path)
@@ -2684,21 +2861,31 @@ def search_flat(query, count):
     return [e for e in (data.get("entries") or []) if e], None
 
 
-def search_dated(query, count, since):
-    """The dated route: one non-flat listing that filters and dates in one pass.
+def search_dated(query, count, since=None):
+    """The dated route: one non-flat listing that dates - and filters - in a pass.
 
-    --dateafter makes yt-dlp skip anything older while it extracts, so the
-    output is already inside the window and carries timestamps. Returns
-    (items, error); each item has id/title/views/channel/epoch.
+    With a window, --dateafter makes yt-dlp skip anything older while it
+    extracts, so the output is already inside the window and carries
+    timestamps. Without one - a date sort and no window - the flag is simply
+    left off: this route is needed for the timestamps it returns, not for a
+    filter, and inventing a floor would put the oldest videos on a title out of
+    reach of the sort that exists to find them.
+
+    Returns (items, error); each item has id/title/views/channel/epoch.
     """
-    days = max(1, int((time.time() - since) / 86400) + 1)
     cmd = base_cmd() + [
         "--no-warnings", "--ignore-errors", "--skip-download",
-        "--dateafter", f"today-{days}days",
         "--playlist-end", str(max(1, count)),
-        "--print", "%(id)s\t%(timestamp)s\t%(view_count)s\t%(channel)s\t%(title)s",
-        "--", search_target(query, count),
+        # live_status comes before the title so the title stays last: it is the
+        # one field that can itself contain a tab, and the parse below gives the
+        # last field whatever remains of the line.
+        "--print", "%(id)s\t%(timestamp)s\t%(view_count)s\t%(live_status)s"
+                   "\t%(channel)s\t%(title)s",
     ]
+    if since is not None:
+        days = max(1, int((time.time() - since) / 86400) + 1)
+        cmd += ["--dateafter", f"today-{days}days"]
+    cmd += ["--", search_target(query, count)]
     try:
         out = run_logged("search_dated", cmd, capture_output=True, text=True,
                          timeout=SEARCH_TIMEOUT)
@@ -2708,17 +2895,21 @@ def search_dated(query, count, since):
         return [], f"Could not run yt-dlp: {e}"
     items = []
     for line in (out.stdout or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) < 5 or len(parts[0]) != 11:
+        parts = line.split("\t", 5)
+        if len(parts) < 6 or len(parts[0]) != 11:
             continue
-        vid, stamp, views, channel, title = parts[0], parts[1], parts[2], parts[3], parts[4]
+        vid, stamp, views, live, channel, title = parts
         items.append({
             "id": vid,
-            "url": f"https://www.youtube.com/watch?v={vid}",
+            "url": watch_url(vid),
             "title": title or "Unknown Title",
             "channel": channel if channel != "NA" else "",
             "views": int(views) if views.isdigit() else None,
             "epoch": int(stamp) if stamp.isdigit() else None,
+            # Carried so the live/upcoming rule can be applied to this route
+            # too; without it a premiere or an in-progress stream would pass
+            # the filter that exists to keep them out.
+            "live_status": None if live == "NA" else live,
         })
     if not items and out.returncode != 0:
         msg = (out.stderr or "").strip().splitlines()
@@ -2748,18 +2939,22 @@ def sort_items(items):
 def search_items(query):
     """Run the search and return (items, error), filtered, sorted and capped."""
     since, label = search_window()
+    # A date sort needs upload dates, which only this route returns; a window
+    # needs them too. Either reason is enough to take it.
     needs_dates = since is not None or SORT_BY in ("date", "oldest")
-    log_debug("search_start", stage="search", query=query, count=SEARCH_COUNT,
-              sort=SORT_BY, days=DAYS, this_month=THIS_MONTH, in_channel=IN_CHANNEL,
+    log_debug("search_start", stage="search", query=redact_text(query),
+              count=SEARCH_COUNT, sort=SORT_BY, days=DAYS, this_month=THIS_MONTH,
+              in_channel=redact_url(IN_CHANNEL) if IN_CHANNEL else None,
               views=MIN_VIEWS, limit=LIMIT, dated_route=needs_dates)
 
     if needs_dates:
-        # --sort date with no window still needs the dates; a year is a
-        # generous floor that keeps the one-pass route and its timestamps.
-        floor = since if since is not None else time.time() - 365 * 86400
-        items, err = search_dated(query, SEARCH_COUNT, floor)
+        items, err = search_dated(query, SEARCH_COUNT, since)
         if since is not None:
-            items = [i for i in items if i.get("epoch") and i["epoch"] >= since]
+            # --dateafter is accurate to the day, so the window is tightened
+            # here to the exact second. An item whose timestamp YouTube declined
+            # to print is kept: --dateafter already accepted it, and dropping a
+            # real result over a missing field would shrink every dated search.
+            items = [i for i in items if i.get("epoch") is None or i["epoch"] >= since]
     else:
         entries, err = search_flat(query, SEARCH_COUNT)
         items = []
@@ -2769,7 +2964,7 @@ def search_items(query):
                 continue
             items.append({
                 "id": vid,
-                "url": f"https://www.youtube.com/watch?v={vid}",
+                "url": watch_url(vid),
                 "title": entry.get("title") or "Unknown Title",
                 "channel": entry.get("channel") or entry.get("uploader") or "",
                 "views": entry.get("view_count"),
@@ -2784,17 +2979,24 @@ def search_items(query):
     # for channel listings; a search result is judged by the same rules.
     items = [i for i in items if wanted_entry({"view_count": i.get("views"),
                                                "live_status": i.get("live_status")})[0]]
-    seen, unique = set(), []
+    seen, unique, excluded = set(), [], 0
     for item in items:
-        if item["id"] in seen or item["id"] in SKIP_IDS:
+        if item["id"] in seen:
+            continue
+        if item["id"] in SKIP_IDS:
+            excluded += 1                 # reported like a channel listing's
             continue
         seen.add(item["id"])
         unique.append(item)
     items = sort_items(unique)
     if LIMIT:
         items = items[:LIMIT]
-    log_debug("search_finish", stage="search", query=query, found=found,
-              kept=len(items), window=label)
+    skipped_by_list[0] += excluded
+    # What the search returned, kept apart from what survived the filters: the
+    # log record needs both, and only this function ever sees the first.
+    SEARCH_FOUND[0] = found
+    log_debug("search_finish", stage="search", query=redact_text(query), found=found,
+              kept=len(items), excluded_by_skip_list=excluded, window=label)
     return items, None
 
 
@@ -2839,14 +3041,39 @@ def write_search_results(path, query, items, label):
 
 
 def write_search_links(path, query, items, label):
-    """Write the links file the rest of the run then reads."""
+    """Write the links file the rest of the run then reads.
+
+    Every line that is meant to be a comment is flattened to one line first. A
+    title - or a query - carrying a newline would otherwise end its "# " comment
+    early and leave whatever followed standing on a line of its own, which this
+    file's reader treats as a link to download. The links themselves are rebuilt
+    from the video id rather than copied, so only a real watch URL can appear.
+    """
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# search: {query}\n")
-        f.write(f"# sort: {SORT_BY}{'  window: ' + label if label else ''}\n")
+        f.write(f"# search: {one_line(query)}\n")
+        f.write(f"# sort: {SORT_BY}{'  window: ' + one_line(label) if label else ''}\n")
         f.write(f"# found: {len(items)} video(s)\n")
         for item in items:
-            f.write(f"# {item['title']}\n{item['url']}\n")
+            vid = item.get("id") or ""
+            if not BARE_ID_RE.match(vid):
+                continue
+            f.write(f"# {one_line(item.get('title'))}\n{watch_url(vid)}\n")
     return path
+
+
+def clear_search_answers():
+    """Delete the previous search's answers.
+
+    A search that fails or matches nothing must not leave the last one's
+    search_links.txt and search_results.json sitting in the folder: they read
+    exactly like this search's answer, and the links file is what a later run
+    would download.
+    """
+    for name in ("search_links.txt", "search_results.json"):
+        try:
+            os.remove(os.path.join(DOWNLOAD_DIR, name))
+        except OSError:
+            pass
 
 
 def print_search_results(items, label):
@@ -2881,12 +3108,15 @@ def run_search(args):
     items, err = search_items(query)
     if err:
         print(f"\n  Search failed: {err}")
+        clear_search_answers()
         log_record(url=f"ytsearch:{query}", status="failed", error=err)
         return None
     if not items:
         print("\n  Nothing matched. Try a wider window, fewer filters, or "
               "a bigger --search-count.")
-        log_record(url=f"ytsearch:{query}", status="search", found=0, kept=0)
+        clear_search_answers()
+        log_record(url=f"ytsearch:{query}", status="search",
+                   found=SEARCH_FOUND[0], kept=0)
         return None
     print_search_results(items, label)
     # Always its own file, never the --links path. A search result is a
@@ -2900,9 +3130,182 @@ def run_search(args):
           f" and {os.path.basename(results)}")
     # "search" is not in the API's DONE or FAILED sets on purpose: the expansion
     # is visible to a caller without being counted as a video either way.
-    log_record(url=f"ytsearch:{query}", status="search", found=len(items),
+    log_record(url=f"ytsearch:{query}", status="search", found=SEARCH_FOUND[0],
                kept=len(items), links_file=os.path.basename(path))
     return path
+
+
+# ======================== answers, not files ===============================
+# Downloading is only one of the things this tool is for. Asking what a video
+# is, what it says, or what people said about it produces an answer, not a
+# folder - so these functions fetch it and hand the data straight back, leaving
+# nothing on disk. They are what the REST API serves: a caller that wants a
+# video's comments wants the comments, not a directory it must then read and
+# tidy up. Everything here writes nothing permanent and starts no job.
+
+
+@contextlib.contextmanager
+def scratch_dir():
+    """A throwaway folder, removed whatever happens inside it.
+
+    The fetch steps are all built around a video's own folder, so the functions
+    below lend them one and then take it away again.
+    """
+    folder = tempfile.mkdtemp(prefix="ytmeer_")
+    try:
+        yield folder
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def caption_tracks(info):
+    """Which English caption tracks a video has: {"auto": [...], "manual": [...]}.
+
+    Worth knowing before asking for the transcript: "auto" is the track timed
+    per word, and a video with only "manual" tracks cannot produce a word-level
+    transcript at all (see write_words_not_found).
+    """
+    out = {}
+    for key, name in (("automatic_captions", "auto"), ("subtitles", "manual")):
+        tracks = (info or {}).get(key) or {}
+        out[name] = sorted(code for code in tracks
+                           if code == SUB_LANG or code.startswith(f"{SUB_LANG}-"))
+    return out
+
+
+def details_of(info):
+    """One video's metadata, as the fields this tool is actually asked for.
+
+    A missing value stays None rather than becoming "NA": this is data, and a
+    caller can tell the difference between "no likes" and "likes not published"
+    only if the absence survives. The printed forms (uploaded, duration_text)
+    come along because they are the awkward ones to derive - the upload time is
+    converted to PKT here exactly as videoinfo.txt records it.
+    """
+    info = info or {}
+    vid = info.get("id")
+    seconds = info.get("duration")
+    return {
+        "id": vid,
+        "link": info.get("webpage_url") or (watch_url(vid) if vid else None),
+        "title": info.get("title"),
+        "description": safe_text(info.get("description")) or None,
+        "channel": info.get("channel") or info.get("uploader"),
+        "channel_id": info.get("channel_id"),
+        "channel_url": info.get("channel_url") or info.get("uploader_url"),
+        "subscribers": info.get("channel_follower_count"),
+        "views": info.get("view_count"),
+        "likes": info.get("like_count"),
+        "comment_count": info.get("comment_count"),
+        "duration": seconds,
+        "duration_text": human_time(seconds) if isinstance(seconds, (int, float)) else None,
+        "uploaded": upload_time_pkt(info),
+        "upload_epoch": info.get("timestamp"),
+        "category": category_or_na(info),
+        "categories": list(info.get("categories") or []),
+        "tags": list(info.get("tags") or []),
+        "thumbnail": info.get("thumbnail"),
+        "live_status": info.get("live_status"),
+        "availability": info.get("availability"),
+        "age_limit": info.get("age_limit"),
+        "captions": caption_tracks(info),
+    }
+
+
+def video_details(url):
+    """(details, error) for one video. Reads metadata only; writes nothing."""
+    info, err = fetch_info(url)
+    if not info:
+        return None, err or "Could not read this video"
+    return details_of(info), None
+
+
+# Said in the answer rather than in a file, for the same reason
+# write_words_not_found says it in the folder: a caller asking for word timings
+# deserves to be told they do not exist, not handed a silent null.
+NO_WORD_TIMINGS = (
+    "No word-level transcript exists for this video. YouTube times captions per "
+    "word only in its auto-generated track, and this video does not have one - "
+    "it carries broadcast closed captions, which are timed one phrase at a time. "
+    "The phrase-level text is in \"text\"."
+)
+
+
+def video_transcript(url):
+    """(transcript, error) for one video: the text itself, in both forms.
+
+    No files are left anywhere. "text" is the grouped, wrapped transcript and
+    "words" is one word per line - the same two shapes trans_/words_ have on
+    disk, because they are produced by the same code.
+    """
+    info, err = fetch_info(url)
+    if not info:
+        return None, err or "Could not read this video"
+    with scratch_dir() as folder:
+        entries = best_caption_entries(folder, url, info)
+    if not entries:
+        return None, required_caption_error()
+    word_level = is_word_level(entries)
+    return {
+        "id": info.get("id"),
+        "link": info.get("webpage_url"),
+        "title": info.get("title"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "language": SUB_LANG,
+        "word_level": word_level,
+        "segments": len(entries),
+        "duration": info.get("duration"),
+        "text": "\n".join(trans_lines(entries)),
+        "words": "\n".join(words_lines(entries)) if word_level else None,
+        "note": None if word_level else NO_WORD_TIMINGS,
+    }, None
+
+
+def comment_data(comment):
+    """One comment as data. Its own text keeps its line breaks."""
+    return {
+        "id": comment.get("id"),
+        "author": safe_text(comment.get("author")) or None,
+        "author_is_uploader": bool(comment.get("author_is_uploader")),
+        "author_is_verified": bool(comment.get("author_is_verified")),
+        "pinned": bool(comment.get("is_pinned")),
+        "likes": comment.get("like_count"),
+        "published": comment_time(comment),
+        "published_epoch": comment.get("timestamp"),
+        "text": safe_text(comment.get("text")),
+    }
+
+
+def video_comments(url):
+    """(comments, error) for one video: threaded, as data, leaving no files.
+
+    Threaded rather than flat for the same reason the text file is: a reply read
+    without the comment it answers is usually meaningless. COMMENT_LIMIT,
+    COMMENT_SORT and COMMENT_REPLIES decide what is fetched, exactly as they do
+    for a download.
+    """
+    info, err = fetch_info(url)
+    if not info:
+        return None, err or "Could not read this video"
+    with scratch_dir() as folder:
+        comments = fetch_comments(folder, url)
+    threads = thread_comments(comments)
+    return {
+        "id": info.get("id"),
+        "link": info.get("webpage_url"),
+        "title": info.get("title"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "sort": COMMENT_SORT,
+        "replies_included": COMMENT_REPLIES,
+        # What the video claims to have, against what this fetch asked for: a
+        # caller comparing 100 to 54,000 can see the limit did its job.
+        "total_on_video": info.get("comment_count"),
+        "fetched": len(comments),
+        "top_level": len(threads),
+        "replies": len(comments) - len(threads),
+        "threads": [dict(comment_data(top), replies=[comment_data(k) for k in kids])
+                    for top, kids in threads],
+    }, None
 
 
 # ====================== channel links & the skip list ======================
@@ -3101,7 +3504,7 @@ def list_channel_recent(url, deadline=None):
             continue
 
         seen.add(vid)
-        links.append(f"https://www.youtube.com/watch?v={vid}")
+        links.append(watch_url(vid))
 
         if LIMIT and len(links) >= LIMIT:
             break
@@ -3162,7 +3565,7 @@ def list_channel_videos(url, deadline=None):
                 counts["skipped"] += 1
                 continue
             seen.add(vid)
-            links.append(f"https://www.youtube.com/watch?v={vid}")
+            links.append(watch_url(vid))
             if LIMIT and len(links) >= LIMIT:
                 break
         if LIMIT and len(links) >= LIMIT:
@@ -3202,7 +3605,9 @@ def expand_sources(links):
             f"last {DAYS} days" if DAYS else "",
         ]))
         print(f"\n  Reading {len(channels)} channel link(s) ({criteria})...")
-    elif MIN_VIEWS or LIMIT:
+    elif (MIN_VIEWS or LIMIT) and not SEARCH_QUERY:
+        # Not during a search: search_items() applies both to the results, so
+        # saying they were ignored would be the opposite of what happened.
         print("\n  NOTE: --views/--limit only apply to channel links, and "
               "links.txt has none.")
 
@@ -3450,19 +3855,35 @@ def parse_args(argv=None):
         description="YouTube batch downloader (yt-dlp) - 1080p priority, 720p floor.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    def count(value):
+        """A count flag's value: a whole number, never negative.
+
+        Several of these read 0 as "no limit", so a negative one slipping
+        through would quietly mean the opposite of what was asked - a
+        --comment-limit of -1 would fetch every comment there is.
+        """
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+        if number < 0:
+            raise argparse.ArgumentTypeError(
+                f"cannot be negative (got {number}); 0 means no limit")
+        return number
+
     p.add_argument("directory",
                    help="Folder containing cookies.txt and links.txt (videos download here too).")
     p.add_argument("--channel", action="store_true",
                    help="Group videos by channel: <dir>/<Channel Name>/<Video Title>/")
     p.add_argument("--min-height", type=int, default=720, help="Quality floor (default 720).")
     p.add_argument("--max-height", type=int, default=1080, help="Quality ceiling (default 1080).")
-    p.add_argument("--views", "--view", "--min-views", type=int, default=0,
+    p.add_argument("--views", "--view", "--min-views", type=count, default=0,
                    dest="views", metavar="N",
                    help="Channel links: only videos with at least N views.")
-    p.add_argument("--limit", type=int, default=0, metavar="N",
+    p.add_argument("--limit", type=count, default=0, metavar="N",
                    help="Channel links: stop after the newest N matching "
                         "videos (default: the whole channel).")
-    p.add_argument("--days", type=int, default=0, metavar="N",
+    p.add_argument("--days", type=count, default=0, metavar="N",
                    help="Only download videos uploaded in the last N days (0 = any time).")
     p.add_argument("--search", metavar="QUERY", default=None,
                    help="Search YouTube for QUERY and use the results as the "
@@ -3470,7 +3891,7 @@ def parse_args(argv=None):
     p.add_argument("--in-channel", metavar="URL", default=None, dest="in_channel",
                    help="With --search: search inside this channel only, using "
                         "the channel's own search tab.")
-    p.add_argument("--search-count", type=int, default=50, metavar="N",
+    p.add_argument("--search-count", type=count, default=50, metavar="N",
                    dest="search_count",
                    help="Results to ask YouTube for before filtering (default 50).")
     p.add_argument("--sort", "--sort-by", dest="sort", default="relevance",
@@ -3495,7 +3916,7 @@ def parse_args(argv=None):
     p.add_argument("--extract-comments", action="store_true",
                    dest="extract_comments",
                    help="Also save each video's comments to comments_<name>.txt.")
-    p.add_argument("--comment-limit", type=int, default=100, metavar="N",
+    p.add_argument("--comment-limit", type=count, default=100, metavar="N",
                    dest="comment_limit",
                    help="Top-level comments per video (default 100; 0 = every one).")
     p.add_argument("--comment-replies", action="store_true",
@@ -3518,12 +3939,22 @@ def parse_args(argv=None):
     # is now always written; no flag is needed.
     p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.search is not None and not args.search.strip():
+        # An empty --search used to fall through to links.txt, which downloads
+        # something quite different from what was asked for.
+        p.error("--search needs something to search for.")
     if args.in_channel and not args.search:
         p.error("--in-channel says where to search; it needs --search QUERY too.")
     if args.in_channel and not is_channel_url(args.in_channel):
         p.error(f"--in-channel wants a channel link, not {args.in_channel!r}.")
     if args.days and args.this_month:
         p.error("--days and --this-month are two different windows. Pick one.")
+    if args.this_month and not args.search:
+        # --this-month is a search window and nothing else reads it, so without
+        # --search it would be accepted and then ignored - and the run would
+        # download every video in links.txt, month or no month.
+        p.error("--this-month is a search window; it needs --search QUERY too. "
+                "To limit a download by date use --days N.")
     if args.transcript and args.no_subs:
         # --transcript asks for a transcript and --no-subs says build none.
         # Together the run would fetch metadata for every video and write
@@ -3835,11 +4266,17 @@ def main():
         for u in failed:
             print(f"    - {u}")
 
-    if counts["ok"]:
+    if counts["ok"] and TRANSCRIPT_ONLY:
+        # No media was fetched, so "Downloaded N video(s), 0 B" would describe
+        # a different run from the one that just happened.
+        print(f"  Wrote {TRANSCRIPT_COUNT[0]} transcript(s) - no video was downloaded")
+    elif counts["ok"]:
         rate = (f"  ({human_size(STATS['bytes'] / STATS['seconds'])}/s average)"
                 if STATS["seconds"] > 0 else "")
         print(f"  Downloaded {counts['ok']} video(s), {human_size(STATS['bytes'])} "
               f"in {human_time(STATS['seconds'])} of downloading{rate}")
+    if COMMENT_COUNT[0]:
+        print(f"  Saved {COMMENT_COUNT[0]} comment(s)")
     run_seconds = time.monotonic() - run_started
     print(f"  Total run time: {human_time(run_seconds)}")
     print("=" * 60)
@@ -3856,12 +4293,8 @@ def main():
         "planned_downloads": len(pending),
         "selected_downloads": selected_downloads,
         "already_downloaded": already_downloaded,
-        "mode": "transcript" if TRANSCRIPT_ONLY else "download",
-        "search_query": SEARCH_QUERY,
-        "search_sort": SORT_BY if SEARCH_QUERY else None,
-        "search_in_channel": IN_CHANNEL,
+        **mode_fields(),
         "downloaded": 0 if TRANSCRIPT_ONLY else counts["ok"],
-        "transcripts": TRANSCRIPT_COUNT[0],
         "skipped": counts["skip"],
         "failed": len(failed) + len(gone)
                   + sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),

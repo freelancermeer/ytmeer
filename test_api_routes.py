@@ -152,7 +152,8 @@ class TestRoutes(unittest.TestCase):
     def test_docs_list_every_endpoint(self):
         paths = self.c.get("/api/openapi.json").json()["paths"]
         self.assertEqual(sorted(paths), sorted([
-            "/api/ping", "/api/health", "/api/preview", "/api/search", "/api/jobs",
+            "/api/ping", "/api/health", "/api/preview", "/api/search",
+            "/api/video", "/api/transcript", "/api/comments", "/api/jobs",
             "/api/jobs/{job_id}", "/api/jobs/{job_id}/videos",
             "/api/jobs/{job_id}/stop", "/api/jobs/{job_id}/files",
             "/api/jobs/{job_id}/files/{path}"]))
@@ -474,11 +475,175 @@ class TestRoutes(unittest.TestCase):
             time.sleep(0.3)
             r = self.c.get("/api/preview?channel=y", headers=self.h)
             self.assertEqual(r.status_code, 503)
-            self.assertIn("another channel preview", r.json()["detail"])
+            self.assertIn("still running", r.json()["detail"])
             first.join()
             self.assertEqual(self.c.get("/api/preview?channel=z", headers=self.h).status_code, 200)
         finally:
             d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT = saved
+
+    # ------------------------------------------------- lookups, not jobs
+    def _stub(self, **functions):
+        """Swap downloader functions for the duration of one test."""
+        d = api.downloader
+        saved = {name: getattr(d, name) for name in functions}
+        for name, fn in functions.items():
+            setattr(d, name, fn)
+        self.addCleanup(lambda: [setattr(d, n, f) for n, f in saved.items()])
+
+    def test_video_details_come_back_in_the_response(self):
+        self._stub(video_details=lambda url: ({"id": "a" * 11, "views": 42}, None))
+        r = self.c.get("/api/video?url=https://youtu.be/aaaaaaaaaaa", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["views"], 42)
+        # No job and nothing on disk: a lookup is an answer, not a download.
+        self.assertEqual(self.c.get("/api/jobs", headers=self.h).json(), [])
+
+    def test_a_bare_video_id_is_accepted(self):
+        seen = {}
+
+        def details(url):
+            seen["url"] = url
+            return {"id": "a" * 11}, None
+
+        self._stub(video_details=details)
+        r = self.c.get("/api/video?url=" + "a" * 11, headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen["url"], "https://www.youtube.com/watch?v=" + "a" * 11)
+
+    def test_a_lookup_refuses_something_that_is_not_a_video(self):
+        for url in ("", "https://www.youtube.com/@Handle", "not a link"):
+            for path in ("/api/video", "/api/transcript", "/api/comments"):
+                r = self.c.get(f"{path}?url={url}", headers=self.h)
+                self.assertEqual(r.status_code, 422, f"{path} {url!r}")
+
+    def test_a_video_youtube_will_not_answer_for_is_a_502(self):
+        self._stub(video_details=lambda url: (None, "Video unavailable"))
+        r = self.c.get("/api/video?url=https://youtu.be/aaaaaaaaaaa", headers=self.h)
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("unavailable", r.json()["detail"])
+
+    def test_the_transcript_comes_back_as_text(self):
+        self._stub(video_transcript=lambda url: (
+            {"id": "a" * 11, "word_level": True,
+             "text": "[00:00:00] hello there", "words": "[00:00:00.000] hello"}, None))
+        r = self.c.get("/api/transcript?url=https://youtu.be/aaaaaaaaaaa", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("hello there", r.json()["text"])
+        self.assertIn("hello", r.json()["words"])
+
+    def test_the_transcript_route_passes_the_language_on(self):
+        seen = {}
+
+        def transcript(url):
+            seen["lang"] = api.downloader.SUB_LANG
+            return {"id": "a" * 11, "text": "", "words": None}, None
+
+        self._stub(video_transcript=transcript)
+        self.assertEqual(self.c.get("/api/transcript?url=" + "a" * 11
+                                    + "&sub_lang=pt-BR", headers=self.h).status_code, 200)
+        self.assertEqual(seen["lang"], "pt-BR")
+        self.assertEqual(self.c.get("/api/transcript?url=" + "a" * 11
+                                    + "&sub_lang=not a code", headers=self.h).status_code, 422)
+
+    def test_comments_come_back_threaded(self):
+        self._stub(video_comments=lambda url: (
+            {"id": "a" * 11, "fetched": 2, "top_level": 1, "replies": 1,
+             "threads": [{"text": "top", "replies": [{"text": "reply"}]}]}, None))
+        r = self.c.get("/api/comments?url=https://youtu.be/aaaaaaaaaaa", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["threads"][0]["replies"][0]["text"], "reply")
+
+    def test_the_comments_route_passes_its_settings_on(self):
+        seen = {}
+
+        def comments(url):
+            d = api.downloader
+            seen.update(limit=d.COMMENT_LIMIT, sort=d.COMMENT_SORT,
+                        replies=d.COMMENT_REPLIES)
+            return {"id": "a" * 11, "threads": []}, None
+
+        self._stub(video_comments=comments)
+        r = self.c.get("/api/comments?url=" + "a" * 11
+                       + "&limit=5&sort=new&replies=true", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen, {"limit": 5, "sort": "new", "replies": True})
+        self.assertEqual(self.c.get("/api/comments?url=" + "a" * 11 + "&sort=best",
+                                    headers=self.h).status_code, 422)
+        self.assertEqual(self.c.get("/api/comments?url=" + "a" * 11 + "&limit=-1",
+                                    headers=self.h).status_code, 422)
+
+    def test_a_lookup_needs_the_key(self):
+        for path in ("/api/video", "/api/transcript", "/api/comments"):
+            self.assertEqual(self.c.get(f"{path}?url=" + "a" * 11).status_code, 401, path)
+
+    def test_a_search_window_does_not_leak_into_the_next_lookup(self):
+        # /api/search used to leave DAYS behind, so the next channel preview
+        # quietly listed only that week.
+        d = api.downloader
+        self._stub(search_items=lambda q: ([], None),
+                   is_channel_url=lambda url: True,
+                   channel_videos_url=lambda url: url,
+                   list_channel_videos=lambda url, deadline=None: ([], "Ch", None))
+        seen = {}
+        real_list = d.list_channel_videos
+
+        def listing(url, deadline=None):
+            seen["days"] = d.DAYS
+            return real_list(url, deadline)
+
+        d.list_channel_videos = listing
+        self.assertEqual(self.c.get("/api/search?query=cats&days=7",
+                                    headers=self.h).status_code, 200)
+        self.assertEqual(self.c.get("/api/preview?channel=https://www.youtube.com/@X",
+                                    headers=self.h).status_code, 200)
+        self.assertEqual(seen["days"], 0, "the preview must not inherit days=7")
+
+    # ------------------------------- regressions: every flag over HTTP
+    def test_every_flag_can_actually_be_posted(self):
+        # The ten new flags were wired through normalize_request and build_argv
+        # but not through JobRequest, which forbids extra fields - so over HTTP
+        # every one of them was a 422.
+        body = {"links": "https://youtu.be/aaaaaaaaaaa", "transcript": True,
+                "extract_comments": True, "comment_limit": 50,
+                "comment_replies": True, "comment_sort": "new"}
+        r = self.c.post("/api/jobs", json=body, headers=self.h)
+        self.assertEqual(r.status_code, 202, r.text)
+
+    def test_a_search_only_job_can_actually_be_posted(self):
+        # JobRequest.links was required, so a search job was impossible to send.
+        body = {"search": "faceless channel ideas", "this_month": True,
+                "sort": "popularity", "search_count": 100, "limit": 20,
+                "in_channel": None}
+        r = self.c.post("/api/jobs", json=body, headers=self.h)
+        self.assertEqual(r.status_code, 202, r.text)
+
+    def test_the_schema_offers_every_flag(self):
+        schema = self.c.get("/api/openapi.json").json()
+        props = schema["components"]["schemas"]["JobRequest"]["properties"]
+        for field in api.DEFAULTS:
+            self.assertIn(field, props, f"{field} is missing from the request schema")
+        self.assertIn("links", props)
+        self.assertEqual(sorted(props), sorted(list(api.DEFAULTS) + ["links"]))
+
+    def test_the_schema_constrains_the_two_sort_fields(self):
+        props = (self.c.get("/api/openapi.json").json()
+                 ["components"]["schemas"]["JobRequest"]["properties"])
+        self.assertEqual(props["sort"]["enum"], list(api.SORTS))
+        self.assertEqual(props["comment_sort"]["enum"], list(api.COMMENT_SORTS))
+
+    def test_a_typo_is_still_refused(self):
+        # extra="forbid" must stay: "view" for "views" would quietly fetch a
+        # whole channel.
+        r = self.c.post("/api/jobs", json={"links": "x", "transcripts": True},
+                        headers=self.h)
+        self.assertEqual(r.status_code, 422)
+
+    def test_the_search_expansion_is_not_reported_as_a_video(self):
+        records = [{"url": "ytsearch:cats", "status": "search", "found": 9, "kept": 3},
+                   {"url": "https://www.youtube.com/@Ch", "status": "channel", "videos": 3},
+                   {"url": "https://youtu.be/aaaaaaaaaaa", "status": "ok"}]
+        self.assertEqual([r["url"] for r in api.video_records(records)],
+                         ["https://youtu.be/aaaaaaaaaaa"])
 
     def test_a_blocked_run_says_so(self):
         os.environ["FAKE_MODE"] = "blocked"

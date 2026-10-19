@@ -72,9 +72,14 @@ class PlatformCase:
         d.THIS_MONTH = False
         d.IN_CHANNEL = None
         d.DAYS = 0
+        # Module state like any other: without this a summary written by one
+        # test counts the channel failures logged by another.
+        self._records = list(d.LOG_RECORDS)
+        d.LOG_RECORDS.clear()
         d.skipped_by_list[0] = 0
         d.TRANSCRIPT_COUNT[0] = 0
         d.COMMENT_COUNT[0] = 0
+        d.SEARCH_FOUND[0] = 0
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
@@ -85,6 +90,7 @@ class PlatformCase:
          d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
          d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
          d.DAYS) = self._saved
+        d.LOG_RECORDS[:] = self._records
 
     # ------------------------------------------------------------------ search
     def test_search_target_is_youtube_wide_by_default(self):
@@ -160,8 +166,10 @@ class PlatformCase:
         self.assertEqual([i["views"] for i in d.sort_items(items)], [1, 999, 5])
 
     def test_links_file_carries_the_titles_as_comments(self):
-        items = [{"url": "https://www.youtube.com/watch?v=aaaaaaaaaaa", "title": "One"},
-                 {"url": "https://www.youtube.com/watch?v=bbbbbbbbbbb", "title": "Two"}]
+        items = [{"id": "aaaaaaaaaaa", "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                  "title": "One"},
+                 {"id": "bbbbbbbbbbb", "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                  "title": "Two"}]
         with tempfile.TemporaryDirectory() as base:
             path = d.write_search_links(os.path.join(base, "search_links.txt"),
                                         "cats", items, "last 7 days")
@@ -322,7 +330,9 @@ class PlatformCase:
     def test_taking_comments_removes_the_info_json(self):
         # It is ~923 KB even for ten comments, because the bulk is format
         # metadata - about a megabyte of noise per folder if it is left behind.
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "clip")
+            os.makedirs(folder)
             with open(os.path.join(folder, "clip.info.json"), "w") as f:
                 json.dump({"comments": [self._comment("a")], "formats": [1, 2]}, f)
             got = d.take_comments(folder)
@@ -330,11 +340,35 @@ class PlatformCase:
             self.assertEqual([n for n in os.listdir(folder) if n.endswith(".info.json")], [])
 
     def test_taking_comments_survives_a_broken_info_json(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "clip")
+            os.makedirs(folder)
             with open(os.path.join(folder, "clip.info.json"), "w") as f:
                 f.write("{not json")
             self.assertEqual(d.take_comments(folder), [])
             self.assertEqual(os.listdir(folder), [], "the bad file is still removed")
+
+    def test_taking_comments_leaves_an_info_json_it_did_not_write(self):
+        # The folder may hold metadata some other tool put there. Deleting it
+        # was data loss for a file this run never asked yt-dlp to produce.
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "clip")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "clip.info.json"), "w") as f:
+                json.dump({"comments": [self._comment("a")]}, f)
+            with open(os.path.join(folder, "notes.info.json"), "w") as f:
+                json.dump({"mine": True}, f)
+            self.assertEqual([c["id"] for c in d.take_comments(folder)], ["a"])
+            self.assertEqual(sorted(os.listdir(folder)), ["notes.info.json"])
+
+    def test_taking_comments_handles_a_folder_name_with_dots(self):
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "S01.E02.Finale")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "S01.E02.Finale.info.json"), "w") as f:
+                json.dump({"comments": [self._comment("a")]}, f)
+            self.assertEqual([c["id"] for c in d.take_comments(folder)], ["a"])
+            self.assertEqual(os.listdir(folder), [])
 
     def test_comments_line_states(self):
         self.assertEqual(d.comments_line("/x/comments_A.txt", 37, "saved"),
@@ -2110,6 +2144,503 @@ class PlatformCase:
                 del d.LOG_RECORDS[before:]
         self.assertEqual(records_during_backfill, [before])   # nothing yet
         self.assertEqual(after, before + 1)                    # then exactly one
+
+    # ------------------------------------------------- answers, not files
+    def test_scratch_dir_is_always_removed(self):
+        with d.scratch_dir() as folder:
+            kept = folder
+            open(os.path.join(folder, "junk.json"), "w").close()
+            self.assertTrue(os.path.isdir(folder))
+        self.assertFalse(os.path.exists(kept))
+
+    def test_scratch_dir_is_removed_after_a_failure(self):
+        kept = None
+        with self.assertRaises(RuntimeError):
+            with d.scratch_dir() as folder:
+                kept = folder
+                raise RuntimeError("boom")
+        self.assertFalse(os.path.exists(kept))
+
+    def test_details_of_keeps_an_absence_as_none(self):
+        # This is data, not a text file: "NA" would be indistinguishable from a
+        # video whose likes really are zero.
+        got = d.details_of({"id": "aaaaaaaaaaa", "title": "T"})
+        self.assertEqual(got["id"], "aaaaaaaaaaa")
+        self.assertEqual(got["link"], "https://www.youtube.com/watch?v=aaaaaaaaaaa")
+        for key in ("views", "likes", "subscribers", "duration", "upload_epoch",
+                    "thumbnail", "description"):
+            self.assertIsNone(got[key], key)
+
+    def test_details_of_maps_the_fields_a_lookup_is_for(self):
+        got = d.details_of({
+            "id": "aaaaaaaaaaa", "webpage_url": "https://youtu.be/aaaaaaaaaaa",
+            "title": "Clip", "channel": "Chan", "channel_follower_count": 1234,
+            "view_count": 5678, "like_count": 90, "comment_count": 12,
+            "duration": 125, "timestamp": 1700000000, "categories": ["News"],
+            "tags": ["a", "b"], "description": "line one\nline two",
+        })
+        self.assertEqual(got["link"], "https://youtu.be/aaaaaaaaaaa")
+        self.assertEqual((got["channel"], got["subscribers"]), ("Chan", 1234))
+        self.assertEqual((got["views"], got["likes"], got["comment_count"]),
+                         (5678, 90, 12))
+        self.assertEqual(got["duration_text"], d.human_time(125))
+        self.assertEqual(got["category"], "News")
+        self.assertEqual(got["tags"], ["a", "b"])
+        self.assertIn("line two", got["description"])     # line breaks survive
+        self.assertTrue(got["uploaded"])                   # converted to PKT
+
+    def test_caption_tracks_lists_only_the_wanted_language(self):
+        info = {"automatic_captions": {"en": [{"ext": "json3"}], "fr": [{}]},
+                "subtitles": {"en-GB": [{}], "de": [{}]}}
+        self.assertEqual(d.caption_tracks(info), {"auto": ["en"], "manual": ["en-GB"]})
+
+    def test_the_transcript_text_is_the_same_text_the_file_gets(self):
+        # One source of truth: the API's "text" and trans_*.txt cannot drift.
+        entries = [(0.0, 0.4, "hello"), (0.5, 0.9, "there")]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "t.txt")
+            d.write_trans_txt(path, entries)
+            self.assertEqual(open(path, encoding="utf-8").read(),
+                             "\n".join(d.trans_lines(entries)) + "\n")
+            path = os.path.join(folder, "w.txt")
+            d.write_words_txt(path, entries)
+            self.assertEqual(open(path, encoding="utf-8").read(),
+                             "\n".join(d.words_lines(entries)) + "\n")
+
+    def test_video_transcript_returns_text_and_leaves_no_files(self):
+        entries = [(0.0, 0.4, "hello"), (0.5, 0.9, "there")]
+        made = []
+        saved = (d.fetch_info, d.best_caption_entries)
+        d.fetch_info = lambda url, *a, **k: ({"id": "aaaaaaaaaaa", "title": "Clip",
+                                              "webpage_url": url}, None)
+
+        def entries_for(folder, url, info):
+            made.append(folder)
+            return entries
+
+        d.best_caption_entries = entries_for
+        try:
+            got, err = d.video_transcript("https://youtu.be/aaaaaaaaaaa")
+        finally:
+            d.fetch_info, d.best_caption_entries = saved
+        self.assertIsNone(err)
+        self.assertTrue(got["word_level"])
+        self.assertEqual(got["segments"], 2)
+        self.assertIn("hello", got["text"])
+        self.assertIn("hello", got["words"])
+        self.assertIsNone(got["note"])
+        self.assertEqual([f for f in made if os.path.exists(f)], [],
+                         "the scratch folder must not survive the call")
+
+    def test_video_transcript_says_why_there_are_no_word_timings(self):
+        phrases = [(0.0, 2.0, "a whole phrase at once"), (2.0, 4.0, "and another one")]
+        saved = (d.fetch_info, d.best_caption_entries)
+        d.fetch_info = lambda url, *a, **k: ({"id": "a" * 11}, None)
+        d.best_caption_entries = lambda folder, url, info: phrases
+        try:
+            got, err = d.video_transcript("https://youtu.be/aaaaaaaaaaa")
+        finally:
+            d.fetch_info, d.best_caption_entries = saved
+        self.assertIsNone(err)
+        self.assertFalse(got["word_level"])
+        self.assertIsNone(got["words"])
+        self.assertIn("auto-generated", got["note"])
+        self.assertIn("whole phrase", got["text"])
+
+    def test_video_transcript_reports_a_video_it_cannot_read(self):
+        saved = d.fetch_info
+        d.fetch_info = lambda url, *a, **k: (None, "Video unavailable")
+        try:
+            got, err = d.video_transcript("https://youtu.be/aaaaaaaaaaa")
+        finally:
+            d.fetch_info = saved
+        self.assertIsNone(got)
+        self.assertEqual(err, "Video unavailable")
+
+    def test_video_comments_threads_the_answer_and_leaves_no_files(self):
+        flat = [self._comment("1", parent="root", text="top"),
+                self._comment("1.1", parent="1", text="reply"),
+                self._comment("2", parent="root", text="other")]
+        made = []
+        saved = (d.fetch_info, d.fetch_comments)
+        d.fetch_info = lambda url, *a, **k: ({"id": "a" * 11, "title": "Clip",
+                                              "comment_count": 4321}, None)
+
+        def comments_for(folder, url):
+            made.append(folder)
+            return flat
+
+        d.fetch_comments = comments_for
+        d.COMMENT_SORT, d.COMMENT_REPLIES = "new", True
+        try:
+            got, err = d.video_comments("https://youtu.be/aaaaaaaaaaa")
+        finally:
+            d.fetch_info, d.fetch_comments = saved
+        self.assertIsNone(err)
+        self.assertEqual((got["fetched"], got["top_level"], got["replies"]), (3, 2, 1))
+        self.assertEqual(got["total_on_video"], 4321)
+        self.assertEqual((got["sort"], got["replies_included"]), ("new", True))
+        self.assertEqual([t["text"] for t in got["threads"]], ["top", "other"])
+        self.assertEqual([r["text"] for r in got["threads"][0]["replies"]], ["reply"])
+        self.assertEqual([f for f in made if os.path.exists(f)], [])
+
+    def test_comment_data_keeps_a_comments_own_paragraphs(self):
+        got = d.comment_data(self._comment("1", text="one\n\ntwo\x07three"))
+        self.assertIn("one\n\ntwo", got["text"])     # line breaks are the comment's
+        self.assertNotIn("\x07", got["text"])         # control characters are not
+
+    def test_safe_text_and_clean_text_differ_only_in_line_breaks(self):
+        self.assertEqual(d.safe_text("a\x00b\nc"), "ab\nc")
+        self.assertEqual(d.clean_text("a\x00b\nc"), "a b c")
+        self.assertEqual(d.clean_text(None), "")
+
+    # ------------------------------------------- regressions: videoinfo.txt
+    def _info_file(self, folder, *lines):
+        path = os.path.join(folder, "videoinfo.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def test_a_transcript_run_keeps_a_finished_downloads_thumbnail_record(self):
+        # --transcript forces SAVE_THUMBNAIL off. Stripping a line it then
+        # declines to rewrite deleted the record of a thumbnail really on disk.
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._info_file(folder, "Title:      Clip",
+                                   "Thumbnail:  Clip.jpg",
+                                   "Description: Clip.txt")
+            d.SAVE_THUMBNAIL = False
+            d.SAVE_DESCRIPTION = True
+            d.update_info_extras(folder, None, os.path.join(folder, "Clip.txt"))
+            body = open(path, encoding="utf-8").read()
+        self.assertIn("Thumbnail:  Clip.jpg", body)
+        self.assertIn("Description: Clip.txt", body)
+
+    def test_update_info_extras_writes_nothing_when_both_are_off(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._info_file(folder, "Thumbnail:  Clip.jpg")
+            d.SAVE_THUMBNAIL = d.SAVE_DESCRIPTION = False
+            d.update_info_extras(folder, None, None)
+            self.assertEqual(open(path, encoding="utf-8").read(),
+                             "Thumbnail:  Clip.jpg\n")
+
+    def test_comments_off_leaves_a_real_comments_record_alone(self):
+        # A --transcript run over a folder downloaded with --extract-comments
+        # replaced its true record with "Comments: none".
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._info_file(folder, "Title:    Clip",
+                                   "Comments: comments_Clip.txt (100 fetched)")
+            d.update_info_comments(folder, None, 0, "off")
+            self.assertIn("comments_Clip.txt (100 fetched)",
+                          open(path, encoding="utf-8").read())
+
+    def test_a_rerun_keeps_a_comment_count_it_cannot_recount(self):
+        # Finding the file already there fetches nothing, so the count is 0; the
+        # count the original fetch recorded is the true one.
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._info_file(folder, "Comments: comments_Clip.txt (100 fetched)")
+            d.update_info_comments(folder, os.path.join(folder, "comments_Clip.txt"),
+                                   0, "saved")
+            self.assertIn("comments_Clip.txt (100 fetched)",
+                          open(path, encoding="utf-8").read())
+
+    def test_a_fresh_fetch_replaces_the_comments_record(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._info_file(folder, "Comments: comments_Clip.txt (100 fetched)")
+            d.update_info_comments(folder, os.path.join(folder, "comments_Clip.txt"),
+                                   250, "saved")
+            body = open(path, encoding="utf-8").read()
+        self.assertIn("(250 fetched)", body)
+        self.assertNotIn("(100 fetched)", body)
+
+    def test_a_failed_fetch_is_recorded_as_failed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._info_file(folder, "Comments: none")
+            d.update_info_comments(folder, None, 0, "failed")
+            self.assertIn("Comments: failed", open(path, encoding="utf-8").read())
+
+    # ------------------------------------------- regressions: comment fetching
+    def _fetch_comments(self, outcomes, rejected_on=()):
+        """Drive fetch_comments with a scripted outcome per attempt.
+
+        Each outcome is a list of comments to "find", or the string "timeout".
+        rejected_on names the attempt numbers whose stderr looks like YouTube
+        rejecting cookies.txt.
+        """
+        calls = []
+        saved = (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
+                 d.po_token_first[0])
+        d.po_token_first[0] = False          # two routes, so escalation is visible
+        state = {"n": 0}
+
+        def run(cmd, **kw):
+            state["n"] += 1
+            calls.append(state["n"])
+            if outcomes[state["n"] - 1] == "timeout":
+                raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        d.subprocess.run = run
+        d.take_comments = lambda folder: (
+            [] if state["n"] == 0 or outcomes[state["n"] - 1] == "timeout"
+            else list(outcomes[state["n"] - 1]))
+        d.drop_rejected_cookies = lambda text: state["n"] in rejected_on
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got = d.fetch_comments(folder, "https://youtu.be/aaaaaaaaaaa")
+        finally:
+            (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
+             d.po_token_first[0]) = saved
+        return got, calls
+
+    def test_a_rejected_cookie_file_really_is_retried(self):
+        # The retry used to be a no-op: both branches of the test continued to
+        # the next route, so the request was never made again without cookies.
+        got, calls = self._fetch_comments([[], [self._comment("1")]], rejected_on=(1,))
+        self.assertEqual([c["id"] for c in got], ["1"])
+        self.assertEqual(calls, [1, 2], "the same route must be tried again")
+
+    def test_a_route_is_not_retried_when_cookies_were_not_the_problem(self):
+        got, calls = self._fetch_comments([[], [], [], []])
+        self.assertEqual(got, [])
+        self.assertEqual(calls, [1, 2], "one attempt per route, two routes")
+
+    def test_a_comment_timeout_moves_on_to_the_next_route(self):
+        # An uncaught TimeoutExpired skipped the PO-token route altogether and
+        # put the whole command line in the log.
+        got, calls = self._fetch_comments(["timeout", [self._comment("1")]])
+        self.assertEqual([c["id"] for c in got], ["1"])
+        self.assertEqual(calls, [1, 2])
+
+    def test_every_route_timing_out_returns_no_comments(self):
+        got, calls = self._fetch_comments(["timeout", "timeout"])
+        self.assertEqual(got, [])
+        self.assertEqual(calls, [1, 2])
+
+    def test_a_control_character_cannot_rearrange_the_comments_file(self):
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "Clip")
+            os.makedirs(folder)
+            path = d.write_comments_txt(
+                folder, {"title": "T"},
+                [self._comment("1", author="ev\nil", text="a\nb\x1b[31m")])
+            lines = open(path, encoding="utf-8").read().splitlines()
+        self.assertIn("ev il", "\n".join(lines))
+        self.assertNotIn("\x1b", "\n".join(lines))
+        # The author's newline must not have produced an extra record line.
+        self.assertEqual(sum(1 for ln in lines if ln.startswith("[1] ")), 1)
+
+    # ------------------------------------------------ regressions: search
+    def _dated(self, stdout, returncode=0):
+        """Run search_dated against a scripted yt-dlp, returning (items, cmd)."""
+        seen = {}
+        saved = d.subprocess.run
+
+        def run(cmd, **kw):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, returncode, stdout, "")
+
+        d.subprocess.run = run
+        try:
+            items, err = d.search_dated("cats", 10, None if "no_window" in stdout
+                                        else time.time() - 7 * 86400)
+        finally:
+            d.subprocess.run = saved
+        return items, err, seen["cmd"]
+
+    def test_the_dated_route_reads_live_status(self):
+        # The live/upcoming rule read a key this route never produced, so every
+        # premiere and in-progress stream sailed through it.
+        line = "aaaaaaaaaaa\t1700000000\t500\tis_live\tChan\tA Title"
+        items, err, _cmd = self._dated(line + "\n")
+        self.assertIsNone(err)
+        self.assertEqual(items[0]["live_status"], "is_live")
+
+    def test_the_dated_route_reads_na_live_status_as_unknown(self):
+        line = "aaaaaaaaaaa\t1700000000\t500\tNA\tChan\tA Title"
+        items, _err, _cmd = self._dated(line + "\n")
+        self.assertIsNone(items[0]["live_status"])
+
+    def test_a_tab_inside_a_title_does_not_truncate_it(self):
+        line = "aaaaaaaaaaa\t1700000000\t500\tnot_live\tChan\tPart A\tPart B"
+        items, _err, _cmd = self._dated(line + "\n")
+        self.assertEqual(items[0]["title"], "Part A\tPart B")
+
+    def test_the_dated_route_asks_for_a_window_only_when_there_is_one(self):
+        _items, _err, cmd = self._dated("")
+        self.assertIn("--dateafter", cmd)
+        # "no_window" makes the helper pass since=None: a date sort with no
+        # window needs this route for its timestamps, not for a filter.
+        _items, _err, cmd = self._dated("no_window")
+        self.assertNotIn("--dateafter", cmd)
+
+    def test_sorting_by_date_no_longer_invents_a_window(self):
+        # It used to apply a silent 365-day floor, which put the oldest videos
+        # on a title out of reach of the sort meant to find them.
+        for sort in ("date", "oldest"):
+            d.SORT_BY = sort
+            self.assertEqual(d.search_window(), (None, ""), sort)
+
+    def _search_items(self, items, dated=True):
+        """search_items over a scripted route, returning (kept, found, excluded)."""
+        saved = (d.search_dated, d.search_flat)
+        d.search_dated = lambda q, c, since=None: (list(items), None)
+        d.search_flat = lambda q, c: ([dict(i, view_count=i.get("views")) for i in items], None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                kept, err = d.search_items("cats")
+        finally:
+            d.search_dated, d.search_flat = saved
+        return kept, err, d.SEARCH_FOUND[0], d.skipped_by_list[0]
+
+    def test_a_dated_search_keeps_a_result_with_no_timestamp(self):
+        # --dateafter already accepted it; dropping it over a field YouTube
+        # declined to print silently shrank every dated search.
+        d.DAYS = 7
+        now = time.time()
+        kept, err, _found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "A",
+             "views": 5, "epoch": int(now - 3600)},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "B",
+             "views": 5, "epoch": None},
+        ])
+        self.assertIsNone(err)
+        self.assertEqual([i["id"] for i in kept], ["a" * 11, "b" * 11])
+
+    def test_a_dated_search_still_drops_what_is_outside_the_window(self):
+        d.DAYS = 7
+        kept, _err, _found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "A",
+             "views": 5, "epoch": int(time.time() - 3600)},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "B",
+             "views": 5, "epoch": int(time.time() - 90 * 86400)},
+        ])
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+
+    def test_a_search_counts_what_the_skip_list_kept_out(self):
+        d.SKIP_IDS = {"b" * 11}
+        kept, _err, found, skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "A", "views": 5},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "B", "views": 5},
+        ], dated=False)
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+        self.assertEqual((found, skipped), (2, 1))
+
+    def test_a_search_records_what_it_scanned_not_only_what_it_kept(self):
+        d.MIN_VIEWS = 100
+        kept, _err, found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "A", "views": 500},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "B", "views": 5},
+        ], dated=False)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(found, 2, "found must be what the search returned")
+
+    def test_a_live_stream_never_reaches_a_dated_searchs_results(self):
+        d.DAYS = 7
+        now = int(time.time() - 3600)
+        kept, _err, _found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "A",
+             "views": 5, "epoch": now, "live_status": "not_live"},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "B",
+             "views": 5, "epoch": now, "live_status": "is_live"},
+            {"id": "c" * 11, "url": d.watch_url("c" * 11), "title": "C",
+             "views": 5, "epoch": now, "live_status": "is_upcoming"},
+        ])
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+
+    def test_a_newline_cannot_inject_a_link_into_the_links_file(self):
+        # "# <title>" ended early and what followed stood on a line of its own,
+        # which the links reader treats as a video to download.
+        items = [{"id": "a" * 11, "url": d.watch_url("a" * 11),
+                  "title": "Real\nhttps://evil.example/pwned"}]
+        with tempfile.TemporaryDirectory() as base:
+            path = d.write_search_links(os.path.join(base, "search_links.txt"),
+                                        "cats\nhttps://evil.example/query",
+                                        items, "last 7 days\nhttps://evil.example/w")
+            self.assertEqual(d.read_links(path), [d.watch_url("a" * 11)])
+            self.assertNotIn("evil.example", "\n".join(d.read_links(path)))
+
+    def test_only_a_real_video_id_becomes_a_link(self):
+        items = [{"id": "a" * 11, "url": "x", "title": "Good"},
+                 {"id": "../../etc", "url": "x", "title": "Bad"},
+                 {"id": "", "url": "x", "title": "Empty"}]
+        with tempfile.TemporaryDirectory() as base:
+            path = d.write_search_links(os.path.join(base, "search_links.txt"),
+                                        "cats", items, "")
+            self.assertEqual(d.read_links(path), [d.watch_url("a" * 11)])
+
+    def test_a_search_that_matches_nothing_clears_the_last_ones_answers(self):
+        with tempfile.TemporaryDirectory() as base:
+            saved = d.DOWNLOAD_DIR
+            d.DOWNLOAD_DIR = base
+            try:
+                for name in ("search_links.txt", "search_results.json"):
+                    with open(os.path.join(base, name), "w") as f:
+                        f.write("stale")
+                d.clear_search_answers()
+                self.assertEqual(os.listdir(base), [])
+                d.clear_search_answers()          # absent files are not an error
+            finally:
+                d.DOWNLOAD_DIR = saved
+
+    # --------------------------------------- regressions: the flags themselves
+    def test_a_negative_count_is_refused(self):
+        for flag in ("--comment-limit", "--search-count", "--views", "--limit",
+                     "--days"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit, msg=f"{flag} -1 should be refused"):
+                    d.parse_args(["/tmp", flag, "-1"])
+
+    def test_a_zero_count_is_still_accepted(self):
+        self.assertEqual(d.parse_args(["/tmp", "--comment-limit", "0"]).comment_limit, 0)
+
+    def test_an_empty_query_is_refused(self):
+        for value in ("", "   "):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    d.parse_args(["/tmp", f"--search={value}"])
+
+    def test_this_month_without_a_search_is_refused(self):
+        # It is a search window and nothing else reads it, so the run used to
+        # accept it and then download every video in links.txt regardless.
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--this-month"])
+        self.assertTrue(d.parse_args(["/tmp", "--search", "x", "--this-month"]).this_month)
+
+    # ------------------------------------------- regressions: the summaries
+    def _summary(self, writer):
+        with tempfile.TemporaryDirectory() as base:
+            saved = (d.LOG_JSON[0], d.DOWNLOAD_DIR)
+            d.LOG_JSON[0] = os.path.join(base, "download_log.json")
+            d.DOWNLOAD_DIR = base
+            try:
+                writer()
+                with open(d.LOG_JSON[0], encoding="utf-8") as f:
+                    return json.load(f)["run"]
+            finally:
+                d.LOG_JSON[0], d.DOWNLOAD_DIR = saved
+
+    def test_a_failed_search_is_not_reported_as_a_clean_empty_run(self):
+        d.SEARCH_QUERY = "cats"
+        d.log_record(url="ytsearch:cats", status="failed", error="Search failed")
+        summary = self._summary(d.write_empty_summary)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["search_query"], "cats")
+
+    def test_every_summary_writer_says_what_kind_of_run_it_was(self):
+        d.TRANSCRIPT_ONLY = True
+        d.SEARCH_QUERY = "cats"
+        d.SORT_BY = "views"
+        keys = ("mode", "transcripts", "comments", "search_query", "search_sort",
+                "search_in_channel")
+        for writer in (d.write_empty_summary,
+                       lambda: d.write_plan_summary(1, 1, 1, 0)):
+            summary = self._summary(writer)
+            for key in keys:
+                self.assertIn(key, summary, f"{writer} should write {key}")
+            self.assertEqual(summary["mode"], "transcript")
+            self.assertEqual(summary["search_sort"], "views")
 
 
 class TestMacOS(PlatformCase, unittest.TestCase):

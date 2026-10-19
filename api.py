@@ -10,6 +10,10 @@ Every endpoint, with a form to try each one, is on one page: /api/docs
     GET    /api/ping                        alive?  (no key)
     GET    /api/health                      tools found, default folder, jobs
     GET    /api/preview?channel=URL         what a channel link would download
+    GET    /api/search?query=...            search: link, views, date, channel
+    GET    /api/video?url=...               one video's details
+    GET    /api/transcript?url=...          one video's transcript, as text
+    GET    /api/comments?url=...            one video's comments, threaded
     POST   /api/jobs                        start downloading       -> job_id
     GET    /api/jobs                        all jobs
     GET    /api/jobs/{id}                   state, progress, summary, failures
@@ -21,6 +25,12 @@ Every endpoint, with a form to try each one, is on one page: /api/docs
 
 Send the key in an X-API-Key header. A generated key is saved to .api_key beside
 this file, so a restart keeps the same one; --new-key replaces it.
+
+Asking about a video is not a download. /api/video, /api/transcript,
+/api/comments and /api/search answer in the response itself: no job, no folder,
+and nothing left on disk afterwards. Downloading is a job, because a video file
+has to live somewhere - and a job can do the rest too, when the files are what
+you want (--transcript, --extract-comments).
 
 A download is a job, not a request: POST /api/jobs answers straight away and the
 work carries on in the background. /videos?since=N hands over each video as soon
@@ -34,6 +44,7 @@ and tests - without it.
 """
 
 import collections
+import contextlib
 import hashlib
 import json
 import os
@@ -91,7 +102,15 @@ CLASH_SUFFIX_RE = re.compile(r" \[[A-Za-z0-9_-]{11}\]$")
 
 
 class PreviewBusy(Exception):
-    """Another channel preview still holds the lock."""
+    """Another in-process request still holds the downloader's globals."""
+
+
+class LookupFailed(Exception):
+    """YouTube would not answer for this video: private, removed, or bot-gated.
+
+    Not a 422 - the request was fine - and not a 500 either, since nothing here
+    went wrong. The routes answer it with 502: the upstream did not deliver.
+    """
 
 API_KEY = [None]
 PUBLIC_URL = [None]                    # the Gradio share link, when served with --share
@@ -216,6 +235,11 @@ def normalize_request(payload):
     if not links and not searching:
         raise ValueError("links is required: video links, channel links or both "
                          "(or set search to let a YouTube search supply them)")
+    if links and searching:
+        # A search replaces the worklist rather than adding to it, so accepting
+        # both would silently download something other than what was asked for.
+        raise ValueError("links and search are two different worklists; a search "
+                         "produces its own. Send one or the other")
     # yt-dlp would read "--exec ..." as an option, not a link.
     bad = next((line for line in links.splitlines()
                 if line.startswith("-") and not downloader.BARE_ID_RE.match(line)), None)
@@ -258,12 +282,18 @@ def normalize_request(payload):
     for field in ("search", "in_channel"):
         if opts[field] is not None:
             opts[field] = str(opts[field]).strip() or None
+    if opts["search"] and opts["search_count"] < 1:
+        raise ValueError("search_count must be at least 1 (results to ask for)")
     if opts["in_channel"] and not opts["search"]:
         raise ValueError("in_channel says where to search; it needs search too")
     if opts["in_channel"] and not downloader.is_channel_url(opts["in_channel"]):
         raise ValueError(f"in_channel wants a channel link, got {opts['in_channel']!r}")
     if opts["days"] and opts["this_month"]:
         raise ValueError("days and this_month are two different windows; pick one")
+    if opts["this_month"] and not opts["search"]:
+        # Nothing but a search reads it, so a job would accept it and ignore it.
+        raise ValueError("this_month is a search window; it needs search too. "
+                         "To limit a download by date use days")
     if opts["transcript"] and not opts["subs"]:
         raise ValueError("transcript IS the transcript, so it cannot be combined "
                          "with subs=false")
@@ -323,7 +353,10 @@ def build_argv(outdir, opts, links_file=None):
         if opts["comment_replies"]:
             argv.append("--comment-replies")
     if opts["search"]:
-        argv += ["--search", opts["search"],
+        # --search=QUERY, not --search QUERY: a query that begins with "-"
+        # ("-ad reads" say) would otherwise reach argparse as an option and
+        # kill the run before it started.
+        argv += [f"--search={opts['search']}",
                  "--search-count", str(opts["search_count"]),
                  "--sort", opts["sort"]]
         if opts["in_channel"]:
@@ -392,8 +425,14 @@ def read_stream(outdir):
 
 
 def video_records(records):
-    """The records that are about a video; channel records describe an expansion."""
-    return [r for r in records if r.get("status") not in ("channel", "channel_failed")]
+    """The records that are about a video.
+
+    A channel record and a search record both describe where the worklist came
+    from, not a video in it: returning one from /videos would hand a caller a
+    row with no folder and no files, counted among the finished videos.
+    """
+    return [r for r in records
+            if r.get("status") not in ("channel", "channel_failed", "search")]
 
 
 
@@ -779,47 +818,93 @@ def shutdown_jobs(timeout=15):
     while time.time() < deadline and any(j["state"] in ACTIVE for j in jobs):
         time.sleep(0.2)
 
-def preview_channel(channel, views=0, limit=20, skip=""):
-    """What a channel link expands to, without downloading anything.
+# Every downloader global an in-process route is allowed to set, with the value
+# it is reset to first. Without the reset a request inherits the last one's
+# settings: a search for the last 7 days left DAYS=7 behind, and the next
+# channel preview then quietly listed only that week.
+ROUTE_GLOBALS = {
+    "MIN_VIEWS": 0, "LIMIT": 0, "DAYS": 0, "THIS_MONTH": False, "SKIP_IDS": set(),
+    "SEARCH_QUERY": None, "IN_CHANNEL": None, "SEARCH_COUNT": 50,
+    "SORT_BY": "relevance",
+    "SUB_LANG": "en", "DOWNLOAD_SUBS": True, "TRANSCRIPT_ONLY": False,
+    "EXTRACT_COMMENTS": False, "COMMENT_LIMIT": 100, "COMMENT_REPLIES": False,
+    "COMMENT_SORT": "top",
+    # Each route sets its own budget below; these are the downloader's own.
+    "SEARCH_TIMEOUT": 900, "COMMENT_TIMEOUT": 600,
+}
+# What a route may spend before it gives up, so it cannot hold the lock for the
+# downloader's own 15-minute subprocess timeout while every other caller waits.
+ROUTE_SECONDS = 120
 
-    Its own lock, not the jobs' one: a listing can take minutes, and nothing about
-    the running jobs should wait for it.
+
+@contextlib.contextmanager
+def downloader_globals(wait=None, **overrides):
+    """Hold the downloader's module globals for one in-process request.
+
+    Everything a route can set is put back to the downloader's own default
+    first, so no request is answered using what the previous caller asked for.
+
+    One at a time, and never a queue: a request abandoned by a proxy keeps its
+    work running, and anything waiting behind it would time out too.
     """
+    # Read now, not bound as a default: a default argument would fix the value
+    # at import and ignore a PREVIEW_WAIT set afterwards.
+    if not PREVIEW_LOCK.acquire(timeout=PREVIEW_WAIT if wait is None else wait):
+        raise PreviewBusy("another search, preview or lookup is still running; "
+                          "try again in a minute, or ask for less")
+    try:
+        for name, value in ROUTE_GLOBALS.items():
+            # A fresh copy: a route that mutated a shared set would corrupt the
+            # baseline for every request after it.
+            setattr(downloader, name, value.copy() if hasattr(value, "copy") else value)
+        downloader.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")  # as a job would
+        downloader.use_cookies[0] = True      # a replaced cookies.txt gets its chance
+        for name, value in overrides.items():
+            setattr(downloader, name, value)
+        yield downloader
+    finally:
+        PREVIEW_LOCK.release()
+
+
+def _skip_ids(skip):
+    """The video ids in a skip list, which may be links, bare ids, or both."""
+    d = downloader
+    return {v for v in (d.video_id_from_url(x) or
+                        (x if d.BARE_ID_RE.match(x) else None)
+                        for x in _lines(skip).split()) if v}
+
+
+def one_url(value, what):
+    """The single link a lookup route was given. Raises ValueError."""
+    url = _lines(value).strip().split("\n")[0].strip()
+    if not url:
+        raise ValueError(f"{what} is required")
+    if downloader.BARE_ID_RE.match(url):
+        return downloader.watch_url(url)
+    if not downloader.video_id_from_url(url):
+        raise ValueError(f"not a video link or 11-character id: {url[:100]!r}")
+    return url
+
+
+def preview_channel(channel, views=0, limit=20, skip=""):
+    """What a channel link expands to, without downloading anything."""
     url = _lines(channel).strip().split("\n")[0].strip()
     if not url:
         raise ValueError("channel is required")
     d = downloader
     if not d.is_channel_url(url):
         raise ValueError(f"not a channel link: {url}")
-    # One listing at a time (they share downloader's module globals), but never a
-    # queue: a request abandoned by a proxy keeps its listing running, and anything
-    # waiting behind it would time out too.
-    if not PREVIEW_LOCK.acquire(timeout=PREVIEW_WAIT):
-        raise PreviewBusy("another channel preview is still running; try again in a "
-                          "minute, or with a smaller limit")
-    try:
-        d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")   # as a job would
-        d.use_cookies[0] = True           # a replaced cookies.txt gets its chance
-        d.MIN_VIEWS, d.LIMIT = int(views or 0), int(limit or 0)
-        d.SKIP_IDS = {v for v in (d.video_id_from_url(x) or
-                                  (x if d.BARE_ID_RE.match(x) else None)
-                                  for x in _lines(skip).split()) if v}
-        found, name, err = d.list_channel_videos(url, deadline=time.monotonic() + PREVIEW_SECONDS)
-    finally:
-        PREVIEW_LOCK.release()
+    with downloader_globals(MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
+                            SKIP_IDS=_skip_ids(skip)):
+        found, name, err = d.list_channel_videos(
+            url, deadline=time.monotonic() + PREVIEW_SECONDS)
     return {"channel": name or None, "tab_read": d.channel_videos_url(url),
             "matched": len(found), "videos": found, "error": err}
 
 
 def search_youtube(query, in_channel="", count=50, sort="relevance", days=0,
                    this_month=False, views=0, limit=0, skip=""):
-    """Search results - link, views, publish date and channel - downloading nothing.
-
-    Shares preview's lock rather than taking its own: both reach into
-    downloader's module globals, so two of them at once would read each other's
-    settings. Everything this sets is set on every call, never left to whatever
-    the previous caller happened to want.
-    """
+    """Search results - link, views, publish date and channel - downloading nothing."""
     query = _lines(query).strip()
     if not query:
         raise ValueError("query is required")
@@ -831,32 +916,67 @@ def search_youtube(query, in_channel="", count=50, sort="relevance", days=0,
         raise ValueError(f"sort must be one of {', '.join(SORTS)}, got {sort!r}")
 
     d = downloader
-    if not PREVIEW_LOCK.acquire(timeout=PREVIEW_WAIT):
-        raise PreviewBusy("another search or channel preview is still running; "
-                          "try again in a minute, or with a smaller count")
-    try:
-        d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")   # as a job would
-        d.use_cookies[0] = True
-        d.SEARCH_QUERY = query
-        d.IN_CHANNEL = in_channel or None
-        d.SEARCH_COUNT = max(1, int(count or 1))
-        d.SORT_BY = "views" if sort == "popularity" else sort
-        d.DAYS = int(days or 0)
-        d.THIS_MONTH = bool(this_month)
-        d.MIN_VIEWS = int(views or 0)
-        d.LIMIT = int(limit or 0)
-        d.SKIP_IDS = {v for v in (d.video_id_from_url(x) or
-                                  (x if d.BARE_ID_RE.match(x) else None)
-                                  for x in _lines(skip).split()) if v}
+    with downloader_globals(
+            SEARCH_QUERY=query, IN_CHANNEL=in_channel or None,
+            SEARCH_COUNT=max(1, int(count or 1)),
+            SORT_BY="views" if sort == "popularity" else sort,
+            DAYS=int(days or 0), THIS_MONTH=bool(this_month),
+            MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
+            SKIP_IDS=_skip_ids(skip), SEARCH_TIMEOUT=ROUTE_SECONDS):
         items, err = d.search_items(query)
         _since, window = d.search_window()
         rows = [d.search_row(item, number) for number, item in enumerate(items, 1)]
-        sort_used, channel_used = d.SORT_BY, d.IN_CHANNEL
-    finally:
-        PREVIEW_LOCK.release()
+        sort_used, channel_used, scanned = d.SORT_BY, d.IN_CHANNEL, d.SEARCH_FOUND[0]
     return {"query": query, "in_channel": channel_used, "sort": sort_used,
-            "window": window or None, "found": len(rows), "results": rows,
-            "error": err}
+            "window": window or None, "scanned": scanned, "found": len(rows),
+            "results": rows, "error": err}
+
+
+# --------------------------------------------------- answers, not jobs
+# Three things a caller asks about a video - what it is, what it says, what
+# people said about it - are answers, not downloads. Each is fetched and
+# returned here and now: no job, no folder, no files to collect afterwards.
+# Downloading is still a job, because a video file has to live somewhere.
+
+def video_info(url):
+    """One video's details. Nothing is downloaded and no files are written."""
+    url = one_url(url, "url")
+    with downloader_globals():
+        details, err = downloader.video_details(url)
+    if err:
+        raise LookupFailed(err)
+    return details
+
+
+def video_transcript(url, sub_lang="en"):
+    """One video's transcript, as text, in both the grouped and per-word forms."""
+    url = one_url(url, "url")
+    if not SUB_LANG_RE.fullmatch(str(sub_lang or "en")):
+        raise ValueError(f"sub_lang must be a language code such as en or pt-BR, "
+                         f"got {sub_lang!r}")
+    with downloader_globals(SUB_LANG=str(sub_lang or "en"), DOWNLOAD_SUBS=True):
+        transcript, err = downloader.video_transcript(url)
+    if err:
+        raise LookupFailed(err)
+    return transcript
+
+
+def video_comments(url, limit=100, replies=False, sort="top"):
+    """One video's comments, threaded, as data."""
+    url = one_url(url, "url")
+    if sort not in COMMENT_SORTS:
+        raise ValueError(f"sort must be one of {', '.join(COMMENT_SORTS)}, got {sort!r}")
+    limit = int(limit or 0)
+    if limit < 0:
+        raise ValueError("limit cannot be negative")
+    if limit > INT_MAX["comment_limit"]:
+        raise ValueError(f"limit is too large (at most {INT_MAX['comment_limit']})")
+    with downloader_globals(COMMENT_LIMIT=limit, COMMENT_REPLIES=bool(replies),
+                            COMMENT_SORT=sort, COMMENT_TIMEOUT=ROUTE_SECONDS):
+        comments, err = downloader.video_comments(url)
+    if err:
+        raise LookupFailed(err)
+    return comments
 
 
 def tools_present():
@@ -866,17 +986,29 @@ def tools_present():
 
 # ------------------------------------------------------------------- server
 def build_app():
+    from typing import Literal
+
     from fastapi import Depends, FastAPI, HTTPException, Query, Security
     from fastapi.responses import FileResponse
     from fastapi.security import APIKeyHeader
     from pydantic import BaseModel, ConfigDict, Field
 
     class JobRequest(BaseModel):
-        model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
-            "links": ["https://www.youtube.com/@SomeChannel"],
-            "views": 1000, "limit": 3}]})
-        links: str | list[str] = Field(
-            ..., description="Video links, channel links or both - a list, or one per line.")
+        # extra="forbid" stays: "view" for "views" would otherwise look accepted
+        # and quietly fetch a whole channel. Every flag the downloader takes is
+        # therefore declared here - a field missing from this model cannot be
+        # sent at all, whatever normalize_request() and build_argv() do with it.
+        model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [
+            {"links": ["https://www.youtube.com/@SomeChannel"],
+             "views": 1000, "limit": 3},
+            {"search": "faceless channel ideas", "this_month": True,
+             "sort": "popularity", "search_count": 100, "limit": 20,
+             "transcript": True, "extract_comments": True},
+        ]})
+        links: str | list[str] | None = Field(
+            None, description="Video links, channel links or both - a list, or one "
+                              "per line. Not needed when search is set, which "
+                              "produces the worklist instead.")
         skip: str | list[str] | None = Field(
             None, description="Never download these (links or 11-character ids). Replaces the "
                               "folder's skip.txt; leave it out to keep the one already there.")
@@ -899,6 +1031,29 @@ def build_app():
         thumbnail: bool = Field(True, description="Save the thumbnail.")
         description: bool = Field(True, description="Save the description.")
         verbose: bool = Field(False, description="Put yt-dlp's full output in the job log.")
+        transcript: bool = Field(False, description="Transcript only: write the "
+                                 "transcript files and never download the video.")
+        extract_comments: bool = Field(False, description="Also save each video's "
+                                       "comments to comments_<name>.txt.")
+        comment_limit: int = Field(100, ge=0, le=INT_MAX["comment_limit"],
+                                   description="Top-level comments per video. "
+                                   "0 = every one.")
+        comment_replies: bool = Field(False, description="Also fetch the replies "
+                                      "under those comments.")
+        comment_sort: Literal[COMMENT_SORTS] = Field(
+            "top", description="Comment order: top (YouTube's ranking) or new.")
+        search: str | None = Field(None, description="Search YouTube for this and "
+                                   "use the results as the worklist, instead of links.")
+        in_channel: str | None = Field(None, description="With search: search inside "
+                                       "this channel only, using its own search tab.")
+        search_count: int = Field(50, ge=1, le=INT_MAX["search_count"],
+                                  description="Results to ask YouTube for before "
+                                  "filtering.")
+        sort: Literal[SORTS] = Field("relevance", description="Order the search "
+                                     "results. popularity is views; least-viewed "
+                                     "is reverse popularity.")
+        this_month: bool = Field(False, description="Search window: since the 1st "
+                                 "of this month. Use days for any other window.")
 
     header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -986,6 +1141,64 @@ def build_app():
                                   this_month, views, limit, skip)
         except ValueError as e:
             raise unprocessable(str(e), "query", "query")
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/video", tags=["lookups"], dependencies=keyed)
+    def get_video(url: str = Query(..., description="A video link, or an "
+                                   "11-character video id.")):
+        """One video's details: views, subscribers, upload time in PKT, category,
+        duration, tags, description and which caption tracks it has. Nothing is
+        downloaded, no job is started and no files are written - the answer is in
+        this response."""
+        try:
+            return video_info(url)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", "url")
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/transcript", tags=["lookups"], dependencies=keyed)
+    def get_transcript(url: str = Query(..., description="A video link, or an "
+                                        "11-character video id."),
+                       sub_lang: str = Query("en", description="Language code, "
+                                             "such as en or pt-BR.")):
+        """A video's transcript as text, without downloading the video. "text" is
+        the grouped form with [hh:mm:ss] stamps and "words" is one word per line;
+        "words" is null, with the reason in "note", when YouTube has no
+        auto-generated track for the video - only that track carries word timings."""
+        try:
+            return video_transcript(url, sub_lang)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", "url")
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/comments", tags=["lookups"], dependencies=keyed)
+    def get_comments(url: str = Query(..., description="A video link, or an "
+                                      "11-character video id."),
+                     limit: int = Query(100, ge=0, le=INT_MAX["comment_limit"],
+                                        description="Top-level comments to fetch. "
+                                        "0 = every one, which on a busy video is "
+                                        "tens of thousands."),
+                     replies: bool = Query(False, description="Also fetch the "
+                                           "replies under those comments."),
+                     sort: str = Query("top", description="top (YouTube's "
+                                       "ranking) or new.")):
+        """A video's comments, threaded, in this response - no job and no files.
+        Each thread carries the author, likes, time in PKT and text, with its
+        replies nested under it. 100 top-level comments take about 7 s, and about
+        19 s with their replies."""
+        try:
+            return video_comments(url, limit, replies, sort)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", "url")
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
 
