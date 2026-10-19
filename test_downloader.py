@@ -12,6 +12,7 @@ video-id matching, resume indexing, caption selection, transcript formatting.
 """
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -47,7 +48,9 @@ class PlatformCase:
                        d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
                        d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE,
                        d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
-                       d.COMMENT_REPLIES, d.COMMENT_SORT)
+                       d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
+                       d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
+                       d.DAYS)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -63,6 +66,12 @@ class PlatformCase:
         d.COMMENT_LIMIT = 100
         d.COMMENT_REPLIES = False
         d.COMMENT_SORT = "top"
+        d.SEARCH_QUERY = None
+        d.SEARCH_COUNT = 50
+        d.SORT_BY = "relevance"
+        d.THIS_MONTH = False
+        d.IN_CHANNEL = None
+        d.DAYS = 0
         d.skipped_by_list[0] = 0
         d.TRANSCRIPT_COUNT[0] = 0
         d.COMMENT_COUNT[0] = 0
@@ -73,7 +82,114 @@ class PlatformCase:
          d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
          d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE,
          d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
-         d.COMMENT_REPLIES, d.COMMENT_SORT) = self._saved
+         d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
+         d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
+         d.DAYS) = self._saved
+
+    # ------------------------------------------------------------------ search
+    def test_search_target_is_youtube_wide_by_default(self):
+        self.assertEqual(d.search_target("cats", 25), "ytsearch25:cats")
+
+    def test_a_query_may_contain_a_colon(self):
+        # Only the first colon separates the prefix from the query.
+        self.assertEqual(d.search_target("kash patel: the hearing", 5),
+                         "ytsearch5:kash patel: the hearing")
+
+    def test_search_target_follows_in_channel(self):
+        d.IN_CHANNEL = "https://www.youtube.com/@Handle"
+        self.assertEqual(d.search_target("cats", 25),
+                         "https://www.youtube.com/@Handle/search?query=cats")
+
+    def test_channel_search_url_encodes_and_drops_a_tab(self):
+        base = "https://www.youtube.com/@Handle"
+        self.assertEqual(d.channel_search_url(base, "two words"),
+                         base + "/search?query=two%20words")
+        for tail in ("/videos", "/shorts", "/streams", "/search", "/about", "/"):
+            self.assertEqual(d.channel_search_url(base + tail, "x"),
+                             base + "/search?query=x",
+                             f"a trailing {tail} should not be kept")
+
+    def test_search_window_from_days(self):
+        d.DAYS = 30
+        since, label = d.search_window()
+        self.assertEqual(label, "last 30 days")
+        self.assertAlmostEqual(since, time.time() - 30 * 86400, delta=5)
+
+    def test_search_window_this_month_starts_at_the_first(self):
+        d.THIS_MONTH = True
+        since, label = d.search_window()
+        start = datetime.datetime.fromtimestamp(since)
+        self.assertEqual((start.day, start.hour, start.minute), (1, 0, 0))
+        self.assertIn(start.strftime("%b %Y"), label)
+
+    def test_no_window_by_default(self):
+        self.assertEqual(d.search_window(), (None, ""))
+
+    def test_sort_by_views_puts_the_most_watched_first(self):
+        items = [{"views": 10}, {"views": 900}, {"views": 50}]
+        d.SORT_BY = "views"
+        self.assertEqual([i["views"] for i in d.sort_items(items)], [900, 50, 10])
+
+    def test_an_unmeasured_count_sorts_last(self):
+        # A video YouTube declined to count must not outrank one it did.
+        d.SORT_BY = "views"
+        items = [{"views": None}, {"views": 5}]
+        self.assertEqual([i["views"] for i in d.sort_items(items)], [5, None])
+
+    def test_sort_by_date_and_oldest(self):
+        items = [{"epoch": 100}, {"epoch": 300}, {"epoch": 200}]
+        d.SORT_BY = "date"
+        self.assertEqual([i["epoch"] for i in d.sort_items(items)], [300, 200, 100])
+        d.SORT_BY = "oldest"
+        self.assertEqual([i["epoch"] for i in d.sort_items(items)], [100, 200, 300])
+
+    def test_relevance_keeps_youtubes_own_order(self):
+        items = [{"views": 1}, {"views": 999}, {"views": 5}]
+        d.SORT_BY = "relevance"
+        self.assertEqual([i["views"] for i in d.sort_items(items)], [1, 999, 5])
+
+    def test_links_file_carries_the_titles_as_comments(self):
+        items = [{"url": "https://www.youtube.com/watch?v=aaaaaaaaaaa", "title": "One"},
+                 {"url": "https://www.youtube.com/watch?v=bbbbbbbbbbb", "title": "Two"}]
+        with tempfile.TemporaryDirectory() as base:
+            path = d.write_search_links(os.path.join(base, "search_links.txt"),
+                                        "cats", items, "last 7 days")
+            body = open(path, encoding="utf-8").read()
+            self.assertIn("# search: cats", body)
+            self.assertIn("window: last 7 days", body)
+            self.assertIn("# One\nhttps://www.youtube.com/watch?v=aaaaaaaaaaa", body)
+            # the file the run then reads must yield exactly the two links
+            self.assertEqual(d.read_links(path), [i["url"] for i in items])
+
+    def test_search_flag_defaults(self):
+        args = d.parse_args(["/tmp"])
+        self.assertIsNone(args.search)
+        self.assertIsNone(args.in_channel)
+        self.assertEqual(args.search_count, 50)
+        self.assertEqual(args.sort, "relevance")
+        self.assertFalse(args.this_month)
+
+    def test_popularity_is_accepted_as_a_spelling_of_views(self):
+        self.assertEqual(d.parse_args(["/tmp", "--sort", "popularity"]).sort,
+                         "popularity")
+
+    def test_in_channel_needs_a_query(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--in-channel",
+                              "https://www.youtube.com/@Handle"])
+
+    def test_in_channel_rejects_a_video_link(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--search", "x", "--in-channel",
+                              "https://www.youtube.com/watch?v=aaaaaaaaaaa"])
+
+    def test_two_windows_are_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--search", "x", "--days", "7",
+                              "--this-month"])
 
     # ---------------------------------------------------------------- comments
     @staticmethod

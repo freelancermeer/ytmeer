@@ -55,6 +55,16 @@ python3 downloader.py "/Users/macintoshhd/Desktop/test/" --channel \
 | `--days N` | Only download videos uploaded in the last N days | 0 (any time) |
 | `--no-subs` | Skip the transcripts | transcripts on |
 | `--sub-lang CODE` | Transcript language | `en` |
+| `--transcript` | Transcript only, never download the video | off |
+| `--extract-comments` | Also save `comments_<name>.txt` | off |
+| `--comment-limit N` | Top-level comments per video (0 = all) | `100` |
+| `--comment-replies` | Also fetch the replies under those comments | off |
+| `--comment-sort S` | `top` (YouTube's ranking) or `new` | `top` |
+| `--search QUERY` | Search YouTube and use the results as the links | off |
+| `--in-channel URL` | With `--search`: search inside that channel only | YouTube-wide |
+| `--search-count N` | Results to ask for before filtering | `50` |
+| `--sort ORDER` | `relevance`, `views`/`popularity`, `date`, `oldest` | `relevance` |
+| `--this-month` | Search window: since the 1st of this month | off |
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
 | `--no-description` | Skip the description | description on |
 | `--dry-run` | Show the filtered plan and exit | off |
@@ -187,6 +197,92 @@ Every one of these fields is always written, reading **NA** when YouTube does
 not report it — some channels hide their subscriber count — so anything reading
 the file finds the same shape each time. Videos downloaded before these existed
 pick the lines up on the next run.
+
+## Transcript only
+
+`--transcript` makes the transcript the product instead of a by-product: the
+metadata and the caption are fetched, the media download never runs, and the
+thumbnail is skipped. On one video that was **4s against ~32s** for the full
+download.
+
+```bash
+python3 downloader.py "/path/to/folder" --transcript
+```
+
+The folder records `Status: TRANSCRIPT` and `Quality: NA (transcript only)`,
+which the normal resume index will not accept, so **asking for the video later
+still downloads it**. The mode keeps its own index, so re-running `--transcript`
+skips what it already transcribed — and a folder left by a full download counts
+as transcribed too, since its `trans_` file is already there.
+
+## Comments
+
+```bash
+python3 downloader.py "/path/to/folder" --extract-comments
+```
+
+`comments_<Video Title>.txt` holds the **top 100** comments, threaded, with
+author, like count and a readable time. Replies are off by default and
+`--comment-replies` turns them on.
+
+The default is also the fastest shape, which is worth knowing because the
+obvious spelling is a trap. `max_comments` counts replies toward its total:
+
+| Asked for | Time | What came back |
+|---|---|---|
+| `100` total | 10.8s | **28** real comments, 72 replies |
+| 100 top-level, replies off | **7.4s** | **100** real comments |
+| 100 top-level + replies | 18.6s | 100 comments, 155 replies |
+
+Comments can never fail a video: a rate limit loses the comments and keeps
+everything else. A video with comments disabled reads `none`, which is a normal
+state and not an error. Videos already downloaded gain their comments on a
+later run without being fetched again.
+
+## Search
+
+```bash
+# YouTube-wide, most watched first
+python3 downloader.py "/path/to/folder" --search "kash patel hearing" --sort popularity
+
+# last 30 days, newest first
+python3 downloader.py "/path/to/folder" --search "kash patel hearing" --days 30 --sort date
+
+# inside one channel only
+python3 downloader.py "/path/to/folder" --search "epstein" \
+    --in-channel "https://www.youtube.com/@ForbesBreakingNews"
+```
+
+The titles and links are printed, written to `search_links.txt`, and then the
+run continues exactly as if that file had been your `links.txt` — so
+`--dry-run`, the preflight selector, `skip.txt` and resume all apply. Add
+`--transcript` or `--extract-comments` and the search feeds straight into them.
+
+`--views` and `--limit` filter the results, and `--in-channel` uses the
+channel's **own search tab**, which indexes its back catalogue rather than
+whatever a site-wide search happens to surface.
+
+### Why the filters are applied locally
+
+YouTube's own search filters are not reachable through yt-dlp. Its
+`youtube:search_url` extractor keeps the `search_query` and **drops the `sp=`
+parameter** that carries them — a "last hour only" filter returned the identical
+video ids as no filter at all, and "sort by views" returned them unsorted.
+`ytsearchdate:` is not supported by this yt-dlp either.
+
+So every filter and every sort is applied here. That is the better answer
+anyway: **`--days 30` is exactly 30 days**, where YouTube's "this month" covers
+one day on the 1st.
+
+Two routes, chosen by whether a date is needed, because the cost gap is large:
+
+| Route | When | Measured |
+|---|---|---|
+| Flat listing | no date filter or date sort | **1.5s** / 10 results |
+| Non-flat + `--dateafter` | a date window, or `--sort date`/`oldest` | **22.7s** / 12 scanned |
+
+Resolving dates one video at a time was measured at **10.8s per video** — five
+times worse than letting the search extraction date them — so it is not used.
 
 ## Thumbnail and description
 

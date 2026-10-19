@@ -25,6 +25,11 @@ Optional flags:
     --comment-limit N    Top-level comments per video (default: 100; 0 = all)
     --comment-replies    Also fetch the replies under those comments
     --comment-sort S     top (default) or new
+    --search QUERY       Search YouTube and use the results as the links
+    --in-channel URL     With --search: search inside that channel only
+    --search-count N     Results to ask for before filtering (default: 50)
+    --sort ORDER         relevance (default) | views/popularity | date | oldest
+    --this-month         Search window: since the 1st of this month
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
     --dry-run            Show the download plan and exit without downloading
@@ -62,6 +67,14 @@ SKIP LIST
     11-character id) per line, # for comments. They are never downloaded, and a
     skipped video does not use up a --limit slot. A run says how many it left out.
 
+SEARCH
+    YouTube's own search filters are unreachable: yt-dlp drops the sp= parameter
+    that carries them, so every filter and sort here is applied locally - which
+    also makes "last 30 days" exactly 30 days rather than a coarse month bucket.
+    No date asked for means one cheap flat listing; a date window or a date sort
+    uses one non-flat listing with --dateafter, which filters and dates in the
+    same pass.
+
 RESUME
     Finished videos are indexed by video id at startup — in BOTH layouts — so a
     re-run skips them without any network call, even if you switch modes or the
@@ -89,7 +102,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 # These are filled in from command-line arguments in main().
 LINKS_FILE     = "links.txt"
@@ -128,6 +141,13 @@ COMMENT_COUNT   = [0]      # comments written this run, for the summary
 # comments and 18.6s with their replies. The cap is what stops a video with tens
 # of thousands of them from holding up the batch.
 COMMENT_TIMEOUT = 600
+
+SEARCH_QUERY   = None      # --search QUERY: run a YouTube search first
+SEARCH_COUNT   = 50        # results to ask YouTube for before filtering
+SORT_BY        = "relevance"   # relevance | views | date | oldest
+THIS_MONTH     = False     # --this-month: since the 1st of the current month
+IN_CHANNEL     = None      # --in-channel URL: search inside that channel only
+SEARCH_TIMEOUT = 900       # a dated search extracts every result it scans
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2596,6 +2616,241 @@ def transcript_only(folder, url, vid, title, info, bar):
     return "ok"
 
 
+# ============================== search =====================================
+# YouTube's own search filters are NOT reachable from here. yt-dlp's
+# youtube:search_url extractor parses out the search_query and drops the sp=
+# parameter that carries them: a "last hour only" sp returned the identical
+# video ids as no filter at all, and a "sort by views" sp returned them
+# unsorted. "ytsearchdate:" is not supported by this yt-dlp either. So every
+# filter and every sort below is applied here, which also means "last 30 days"
+# is exactly 30 days rather than YouTube's coarse "this month" bucket.
+#
+# Two routes, because the cost difference is large and measured:
+#   - no date needed: one --flat-playlist listing. 1.5s for 10 results, and it
+#     already carries view_count, duration, channel and live_status.
+#   - date needed: one non-flat listing with --dateafter, which filters AND
+#     returns timestamps in the same pass. 22.7s for 12 results scanned.
+# Resolving dates one watch URL at a time was measured at 10.8s per video -
+# five times worse than letting the search extraction do it - so it is not used.
+
+def search_window():
+    """The date floor for a search: (since_epoch, label). (None, "") if none."""
+    if DAYS:
+        return time.time() - DAYS * 86400, f"last {DAYS} days"
+    if THIS_MONTH:
+        now = datetime.datetime.now()
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return first.timestamp(), f"since {first.strftime('%d %b %Y')}"
+    return None, ""
+
+
+def channel_search_url(channel, query):
+    """A channel's own search tab: <channel>/search?query=<query>.
+
+    YouTube searches only inside that channel there, which is a different answer
+    from a site-wide search filtered by uploader - it is the channel's own index,
+    so it finds older videos a site-wide search would never surface.
+    """
+    base = (channel or "").split("?")[0].split("#")[0].rstrip("/")
+    tail = base.rsplit("/", 1)[-1].lower()
+    if tail in VIDEO_TABS or tail in OTHER_TABS or tail == "search":
+        base = base.rsplit("/", 1)[0]        # drop a tab that is already there
+    return f"{base}/search?query={quote(query)}"
+
+
+def search_target(query, count):
+    """What to hand yt-dlp for this search.
+
+    With --in-channel that is the channel's search tab; otherwise yt-dlp's own
+    ytsearchN: pseudo-URL, where only the first colon separates the prefix from
+    the query, so the query may contain colons of its own.
+    """
+    if IN_CHANNEL:
+        return channel_search_url(IN_CHANNEL, query)
+    return f"ytsearch{max(1, count)}:{query}"
+
+
+def search_flat(query, count):
+    """The cheap route: one flat listing. Returns (entries, error).
+
+    No upload dates - a flat search entry simply has none - but view_count,
+    duration, channel and live_status are all there, which is everything the
+    non-date filters need.
+    """
+    data, err = channel_page(search_target(query, count), 1, max(1, count))
+    if err:
+        return [], err
+    return [e for e in (data.get("entries") or []) if e], None
+
+
+def search_dated(query, count, since):
+    """The dated route: one non-flat listing that filters and dates in one pass.
+
+    --dateafter makes yt-dlp skip anything older while it extracts, so the
+    output is already inside the window and carries timestamps. Returns
+    (items, error); each item has id/title/views/channel/epoch.
+    """
+    days = max(1, int((time.time() - since) / 86400) + 1)
+    cmd = base_cmd() + [
+        "--no-warnings", "--ignore-errors", "--skip-download",
+        "--dateafter", f"today-{days}days",
+        "--playlist-end", str(max(1, count)),
+        "--print", "%(id)s\t%(timestamp)s\t%(view_count)s\t%(channel)s\t%(title)s",
+        "--", search_target(query, count),
+    ]
+    try:
+        out = run_logged("search_dated", cmd, capture_output=True, text=True,
+                         timeout=SEARCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return [], "Timed out while searching"
+    except OSError as e:
+        return [], f"Could not run yt-dlp: {e}"
+    items = []
+    for line in (out.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5 or len(parts[0]) != 11:
+            continue
+        vid, stamp, views, channel, title = parts[0], parts[1], parts[2], parts[3], parts[4]
+        items.append({
+            "id": vid,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "title": title or "Unknown Title",
+            "channel": channel if channel != "NA" else "",
+            "views": int(views) if views.isdigit() else None,
+            "epoch": int(stamp) if stamp.isdigit() else None,
+        })
+    if not items and out.returncode != 0:
+        msg = (out.stderr or "").strip().splitlines()
+        return [], (msg[-1] if msg else "Search failed")
+    return items, None
+
+
+def sort_items(items):
+    """Order the results. "relevance" keeps the order YouTube returned them in.
+
+    A missing count or date sorts last rather than first, so an entry YouTube
+    declined to measure never outranks one it did.
+    """
+    if SORT_BY == "views":
+        return sorted(items, key=lambda i: (i.get("views") is None, -(i.get("views") or 0)))
+    if SORT_BY == "date":
+        return sorted(items, key=lambda i: (i.get("epoch") is None, -(i.get("epoch") or 0)))
+    if SORT_BY == "oldest":
+        return sorted(items, key=lambda i: (i.get("epoch") is None, i.get("epoch") or 0))
+    return items
+
+
+def search_items(query):
+    """Run the search and return (items, error), filtered, sorted and capped."""
+    since, label = search_window()
+    needs_dates = since is not None or SORT_BY in ("date", "oldest")
+    log_debug("search_start", stage="search", query=query, count=SEARCH_COUNT,
+              sort=SORT_BY, days=DAYS, this_month=THIS_MONTH, in_channel=IN_CHANNEL,
+              views=MIN_VIEWS, limit=LIMIT, dated_route=needs_dates)
+
+    if needs_dates:
+        # --sort date with no window still needs the dates; a year is a
+        # generous floor that keeps the one-pass route and its timestamps.
+        floor = since if since is not None else time.time() - 365 * 86400
+        items, err = search_dated(query, SEARCH_COUNT, floor)
+        if since is not None:
+            items = [i for i in items if i.get("epoch") and i["epoch"] >= since]
+    else:
+        entries, err = search_flat(query, SEARCH_COUNT)
+        items = []
+        for entry in entries:
+            vid = entry.get("id") or ""
+            if len(vid) != 11:
+                continue
+            items.append({
+                "id": vid,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "title": entry.get("title") or "Unknown Title",
+                "channel": entry.get("channel") or entry.get("uploader") or "",
+                "views": entry.get("view_count"),
+                "epoch": None,
+                "live_status": entry.get("live_status"),
+            })
+    if err:
+        return [], err
+
+    found = len(items)
+    # wanted_entry() already decides the view floor and the live/upcoming rule
+    # for channel listings; a search result is judged by the same rules.
+    items = [i for i in items if wanted_entry({"view_count": i.get("views"),
+                                               "live_status": i.get("live_status")})[0]]
+    seen, unique = set(), []
+    for item in items:
+        if item["id"] in seen or item["id"] in SKIP_IDS:
+            continue
+        seen.add(item["id"])
+        unique.append(item)
+    items = sort_items(unique)
+    if LIMIT:
+        items = items[:LIMIT]
+    log_debug("search_finish", stage="search", query=query, found=found,
+              kept=len(items), window=label)
+    return items, None
+
+
+def write_search_links(path, query, items, label):
+    """Write the links file the rest of the run then reads."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# search: {query}\n")
+        f.write(f"# sort: {SORT_BY}{'  window: ' + label if label else ''}\n")
+        f.write(f"# found: {len(items)} video(s)\n")
+        for item in items:
+            f.write(f"# {item['title']}\n{item['url']}\n")
+    return path
+
+
+def print_search_results(items, label):
+    """The titles and links, which is what a search is for."""
+    print(f"\n  Search results (sort: {SORT_BY}"
+          f"{', ' + label if label else ''}): {len(items)} video(s)")
+    for number, item in enumerate(items, 1):
+        views = count_or_na(item.get("views"))
+        when = (upload_time_pkt({"timestamp": item["epoch"]}).split(",")[0]
+                if item.get("epoch") else "")
+        head = f"  {number:>3}. {views:>12} views"
+        print(f"{head}{'  ' + when if when else ''}  {item['title']}")
+        print(f"       {item['url']}"
+              f"{'   [' + item['channel'] + ']' if item.get('channel') else ''}")
+
+
+def run_search(args):
+    """Do the search and write its links file. Returns the path, or None to stop."""
+    query = (args.search or "").strip()
+    if not query:
+        print("\nERROR: --search needs something to search for.")
+        return None
+    since, label = search_window()
+    print(f"\n  Searching {'in ' + IN_CHANNEL if IN_CHANNEL else 'YouTube'} "
+          f"for: {query}")
+    if label:
+        print(f"  Window  : {label}")
+    items, err = search_items(query)
+    if err:
+        print(f"\n  Search failed: {err}")
+        log_record(url=f"ytsearch:{query}", status="failed", error=err)
+        return None
+    if not items:
+        print("\n  Nothing matched. Try a wider window, fewer filters, or "
+              "a bigger --search-count.")
+        log_record(url=f"ytsearch:{query}", status="search", found=0, kept=0)
+        return None
+    print_search_results(items, label)
+    path = (os.path.expanduser(args.links) if args.links
+            else os.path.join(DOWNLOAD_DIR, "search_links.txt"))
+    write_search_links(path, query, items, label)
+    print(f"\n  Wrote {len(items)} link(s) to {os.path.basename(path)}")
+    # "search" is not in the API's DONE or FAILED sets on purpose: the expansion
+    # is visible to a caller without being counted as a video either way.
+    log_record(url=f"ytsearch:{query}", status="search", found=len(items),
+               kept=len(items), links_file=os.path.basename(path))
+    return path
+
+
 # ====================== channel links & the skip list ======================
 # links.txt may name a whole channel instead of a single video. Those links are
 # expanded here - into the video links that clear --views, newest first, cut off
@@ -3155,6 +3410,21 @@ def parse_args(argv=None):
                         "videos (default: the whole channel).")
     p.add_argument("--days", type=int, default=0, metavar="N",
                    help="Only download videos uploaded in the last N days (0 = any time).")
+    p.add_argument("--search", metavar="QUERY", default=None,
+                   help="Search YouTube for QUERY and use the results as the "
+                        "links (filters: --days/--this-month, --views, --limit).")
+    p.add_argument("--in-channel", metavar="URL", default=None, dest="in_channel",
+                   help="With --search: search inside this channel only, using "
+                        "the channel's own search tab.")
+    p.add_argument("--search-count", type=int, default=50, metavar="N",
+                   dest="search_count",
+                   help="Results to ask YouTube for before filtering (default 50).")
+    p.add_argument("--sort", "--sort-by", dest="sort", default="relevance",
+                   choices=("relevance", "views", "popularity", "date", "oldest"),
+                   help="Order the search results: relevance (default), views "
+                        "(popularity), date (newest first) or oldest.")
+    p.add_argument("--this-month", action="store_true", dest="this_month",
+                   help="Search window: since the 1st of the current month.")
     p.add_argument("--cookies", metavar="FILE",
                    help="Use this cookies.txt instead of <directory>/cookies.txt.")
     p.add_argument("--links", metavar="FILE",
@@ -3192,6 +3462,12 @@ def parse_args(argv=None):
     # is now always written; no flag is needed.
     p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.in_channel and not args.search:
+        p.error("--in-channel says where to search; it needs --search QUERY too.")
+    if args.in_channel and not is_channel_url(args.in_channel):
+        p.error(f"--in-channel wants a channel link, not {args.in_channel!r}.")
+    if args.days and args.this_month:
+        p.error("--days and --this-month are two different windows. Pick one.")
     if args.transcript and args.no_subs:
         # --transcript asks for a transcript and --no-subs says build none.
         # Together the run would fetch metadata for every video and write
@@ -3243,6 +3519,7 @@ def main():
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY
     global EXTRACT_COMMENTS, COMMENT_LIMIT, COMMENT_REPLIES, COMMENT_SORT
+    global SEARCH_QUERY, SEARCH_COUNT, SORT_BY, THIS_MONTH, IN_CHANNEL
 
     use_utf8_output()
     args = parse_args()
@@ -3263,6 +3540,12 @@ def main():
     COMMENT_LIMIT = max(0, args.comment_limit)
     COMMENT_REPLIES = args.comment_replies
     COMMENT_SORT = args.comment_sort
+    SEARCH_QUERY = args.search
+    SEARCH_COUNT = max(1, args.search_count)
+    # "popularity" is what a person calls it; "views" is what it sorts on.
+    SORT_BY = "views" if args.sort == "popularity" else args.sort
+    THIS_MONTH = args.this_month
+    IN_CHANNEL = args.in_channel
     # Nobody asking for a transcript wants a .jpg; the description is kept
     # because it is written from metadata already fetched and costs no request.
     SAVE_THUMBNAIL = not args.no_thumbnail and not TRANSCRIPT_ONLY
@@ -3289,6 +3572,10 @@ def main():
     if EXTRACT_COMMENTS:
         print(f"  Comments: {COMMENT_LIMIT or 'all'} top-level, sort {COMMENT_SORT}"
               f", replies {'on' if COMMENT_REPLIES else 'off'}")
+    if SEARCH_QUERY:
+        where = f" in {IN_CHANNEL}" if IN_CHANNEL else " on YouTube"
+        print(f"  Search  : {SEARCH_QUERY}{where}  (ask for {SEARCH_COUNT}, "
+              f"sort {SORT_BY})")
     if MIN_VIEWS or LIMIT or DAYS:
         print(f"  Channels: {f'>= {MIN_VIEWS:,} views' if MIN_VIEWS else 'every video'}"
               f"{f', newest {LIMIT} each' if LIMIT else ''}"
@@ -3346,6 +3633,16 @@ def main():
         print("\nNOTE: no cookies.txt in the folder - that is fine for public "
               "videos.\n      Add one only for private / members-only / "
               "age-restricted videos.")
+
+    # A search replaces links.txt as the source: it writes its results to a
+    # links file and the rest of the run - skip list, plan, preflight, download -
+    # proceeds exactly as if that file had been there all along.
+    if SEARCH_QUERY:
+        found = run_search(args)
+        if not found:
+            write_empty_summary()       # every return from main() leaves a summary
+            return
+        LINKS_FILE = found
 
     links = read_links(LINKS_FILE)
     if not links:
@@ -3504,6 +3801,9 @@ def main():
         "selected_downloads": selected_downloads,
         "already_downloaded": already_downloaded,
         "mode": "transcript" if TRANSCRIPT_ONLY else "download",
+        "search_query": SEARCH_QUERY,
+        "search_sort": SORT_BY if SEARCH_QUERY else None,
+        "search_in_channel": IN_CHANNEL,
         "downloaded": 0 if TRANSCRIPT_ONLY else counts["ok"],
         "transcripts": TRANSCRIPT_COUNT[0],
         "skipped": counts["skip"],

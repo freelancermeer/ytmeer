@@ -371,6 +371,7 @@ def folder_files(folder):
         "words": os.path.join(folder, words[0]) if words else None,
         "thumbnail": downloader.find_thumbnail(folder),
         "description": downloader.find_description(folder),
+        "comments": downloader.find_comments_file(folder),
         "info": info if os.path.exists(info) else None,
     }
 
