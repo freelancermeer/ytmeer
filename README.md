@@ -63,7 +63,7 @@ python3 downloader.py "/Users/macintoshhd/Desktop/test/" --channel \
 | `--search QUERY` | Search YouTube and use the results as the links | off |
 | `--in-channel URL` | With `--search`: search inside that channel only | YouTube-wide |
 | `--search-count N` | Results to ask for before filtering | `50` |
-| `--sort ORDER` | `relevance`, `views`/`popularity`, `date`, `oldest` | `relevance` |
+| `--sort ORDER` | `relevance`, `views`/`popularity`, `least-viewed`, `date`, `oldest` | `relevance` |
 | `--this-month` | Search window: since the 1st of this month | off |
 | `--no-thumbnail` | Skip the thumbnail | thumbnail on |
 | `--no-description` | Skip the description | description on |
@@ -262,6 +262,28 @@ run continues exactly as if that file had been your `links.txt` — so
 channel's **own search tab**, which indexes its back catalogue rather than
 whatever a site-wide search happens to surface.
 
+### What a search gives you
+
+Four things per video, which is what a search is for:
+
+```
+  1.       45,644 views    18 Oct 2026   Royal Hub
+       DO NOT TOUCH MY BROTHER! Charlotte SHIELDS Louis From Laura Lopes...
+       https://www.youtube.com/watch?v=GEWoZaUI7nU
+```
+
+Alongside the printed table the run writes two files into the folder:
+
+- **`search_links.txt`** — the links, with each title as a comment. This is what
+  the download step then reads.
+- **`search_results.json`** — the same results machine-readably: `link`,
+  `views`, `published` (exact time, PKT), `published_epoch`, `channel`, `title`,
+  `rank`.
+
+`--sort least-viewed` is reverse popularity: the weakest performers on a title
+first. On one title this month that reads 0 views, 1 view, then 45,644 — three
+channels, the same angle, wildly different results.
+
 ### Why the filters are applied locally
 
 YouTube's own search filters are not reachable through yt-dlp. Its
@@ -283,6 +305,45 @@ Two routes, chosen by whether a date is needed, because the cost gap is large:
 
 Resolving dates one video at a time was measured at **10.8s per video** — five
 times worse than letting the search extraction date them — so it is not used.
+
+## The REST API
+
+`api.py` exposes every one of these flags. Request fields mirror the flag names:
+`transcript`, `extract_comments`, `comment_limit`, `comment_replies`,
+`comment_sort`, `search`, `in_channel`, `search_count`, `sort`, `this_month`.
+
+A search job needs no `links` — the search supplies them:
+
+```bash
+curl -X POST localhost:8000/api/jobs -H 'content-type: application/json' -d '{
+  "search": "kash patel hearing", "this_month": true, "sort": "popularity",
+  "limit": 20, "transcript": true, "extract_comments": true
+}'
+```
+
+**`GET /api/search`** searches without downloading anything and returns the
+four fields per video:
+
+```bash
+curl -G localhost:8000/api/search \
+  --data-urlencode 'query=kash patel hearing' \
+  -d this_month=true -d sort=least-viewed -d limit=10
+```
+
+```json
+{ "sort": "least-viewed", "window": "since 01 Oct 2026", "found": 3,
+  "results": [ { "rank": 1, "views": 0, "published": "19 Oct 2026, 10:46:52 PM PKT",
+                 "channel": "Royal Storyline",
+                 "link": "https://www.youtube.com/watch?v=jrshTn5bePc" } ] }
+```
+
+It shares the channel preview's lock, because both reach into the downloader's
+module globals in-process, so one search or preview runs at a time and a second
+gets `503`. A date window or a date sort costs about 2s per result scanned;
+without one a search is about 0.15s per result.
+
+`GET /jobs/{id}/videos` now lists `comments` alongside the video, transcript,
+words, thumbnail and description.
 
 ## Thumbnail and description
 

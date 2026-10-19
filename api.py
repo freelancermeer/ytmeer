@@ -165,13 +165,30 @@ DEFAULTS = {
     "skip": None, "outdir": None, "channel": True, "views": 0, "limit": 0, "days": 0,
     "min_height": 720, "max_height": 1080, "subs": True, "sub_lang": "en",
     "thumbnail": True, "description": True, "verbose": False,
+    # transcript only: no media is fetched, so no video file is produced
+    "transcript": False,
+    # comments; the limit counts top-level comments, replies are extra
+    "extract_comments": False, "comment_limit": 100, "comment_replies": False,
+    "comment_sort": "top",
+    # search; "search" replaces links as the source, "in_channel" narrows it to
+    # one channel's own search tab
+    "search": None, "in_channel": None, "search_count": 50,
+    "sort": "relevance", "this_month": False,
 }
-INT_FIELDS = ("views", "limit", "days", "min_height", "max_height")
+INT_FIELDS = ("views", "limit", "days", "min_height", "max_height",
+              "comment_limit", "search_count")
 # Limits to keep integer bounds safe for Pydantic v1 vs v2, and SQLite's ability to
 # write it - a limit of 10**20 used to turn GET /api/jobs into a 500 for everyone.
-INT_MAX = {"views": 10**12, "limit": 10**6, "days": 10**5, "min_height": 10**4, "max_height": 10**4}
+INT_MAX = {"views": 10**12, "limit": 10**6, "days": 10**5, "min_height": 10**4,
+           "max_height": 10**4,
+           # A comment page is about 20 comments and a search page about 20
+           # results; these keep one job from paging YouTube indefinitely.
+           "comment_limit": 10**5, "search_count": 10**4}
 SUB_LANG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,34}$")   # anchored for the schema too
-BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose")
+BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose",
+               "transcript", "extract_comments", "comment_replies", "this_month")
+COMMENT_SORTS = ("top", "new")
+SORTS = ("relevance", "views", "popularity", "least-viewed", "date", "oldest")
 
 
 def _lines(value):
@@ -193,8 +210,12 @@ def normalize_request(payload):
     # that is all comments is refused now rather than "finishing" with nothing.
     links = "\n".join(line.strip() for line in _lines(payload.pop("links", None)).splitlines()
                       if line.strip() and not line.strip().startswith("#"))
-    if not links:
-        raise ValueError("links is required: video links, channel links or both")
+    # A search produces its own worklist, so a search job needs no links. Any
+    # other job still does - an empty one would "finish" having done nothing.
+    searching = str(payload.get("search") or "").strip()
+    if not links and not searching:
+        raise ValueError("links is required: video links, channel links or both "
+                         "(or set search to let a YouTube search supply them)")
     # yt-dlp would read "--exec ..." as an option, not a link.
     bad = next((line for line in links.splitlines()
                 if line.startswith("-") and not downloader.BARE_ID_RE.match(line)), None)
@@ -229,6 +250,23 @@ def normalize_request(payload):
         opts[field] = bool(opts[field])
     if opts["skip"] is not None:
         opts["skip"] = _lines(opts["skip"])
+    if opts["comment_sort"] not in COMMENT_SORTS:
+        raise ValueError(f"comment_sort must be one of {', '.join(COMMENT_SORTS)}, "
+                         f"got {opts['comment_sort']!r}")
+    if opts["sort"] not in SORTS:
+        raise ValueError(f"sort must be one of {', '.join(SORTS)}, got {opts['sort']!r}")
+    for field in ("search", "in_channel"):
+        if opts[field] is not None:
+            opts[field] = str(opts[field]).strip() or None
+    if opts["in_channel"] and not opts["search"]:
+        raise ValueError("in_channel says where to search; it needs search too")
+    if opts["in_channel"] and not downloader.is_channel_url(opts["in_channel"]):
+        raise ValueError(f"in_channel wants a channel link, got {opts['in_channel']!r}")
+    if opts["days"] and opts["this_month"]:
+        raise ValueError("days and this_month are two different windows; pick one")
+    if opts["transcript"] and not opts["subs"]:
+        raise ValueError("transcript IS the transcript, so it cannot be combined "
+                         "with subs=false")
     opts["sub_lang"] = str(opts["sub_lang"] or "en")
     if not SUB_LANG_RE.fullmatch(opts["sub_lang"]):
         raise ValueError(f"sub_lang must be a language code such as en or pt-BR, "
@@ -276,6 +314,22 @@ def build_argv(outdir, opts, links_file=None):
         argv.append("--no-description")
     if opts["verbose"]:
         argv.append("--verbose")
+    if opts["transcript"]:
+        argv.append("--transcript")
+    if opts["extract_comments"]:
+        argv += ["--extract-comments",
+                 "--comment-limit", str(opts["comment_limit"]),
+                 "--comment-sort", opts["comment_sort"]]
+        if opts["comment_replies"]:
+            argv.append("--comment-replies")
+    if opts["search"]:
+        argv += ["--search", opts["search"],
+                 "--search-count", str(opts["search_count"]),
+                 "--sort", opts["sort"]]
+        if opts["in_channel"]:
+            argv += ["--in-channel", opts["in_channel"]]
+        if opts["this_month"]:
+            argv.append("--this-month")
     # API jobs are background work, even when the server itself was started
     # from a terminal. Keep the downloader's interactive selector for human
     # CLI runs, but never let an API job wait for terminal input.
@@ -757,6 +811,54 @@ def preview_channel(channel, views=0, limit=20, skip=""):
             "matched": len(found), "videos": found, "error": err}
 
 
+def search_youtube(query, in_channel="", count=50, sort="relevance", days=0,
+                   this_month=False, views=0, limit=0, skip=""):
+    """Search results - link, views, publish date and channel - downloading nothing.
+
+    Shares preview's lock rather than taking its own: both reach into
+    downloader's module globals, so two of them at once would read each other's
+    settings. Everything this sets is set on every call, never left to whatever
+    the previous caller happened to want.
+    """
+    query = _lines(query).strip()
+    if not query:
+        raise ValueError("query is required")
+    if in_channel and not downloader.is_channel_url(in_channel):
+        raise ValueError(f"in_channel wants a channel link, got {in_channel!r}")
+    if days and this_month:
+        raise ValueError("days and this_month are two different windows; pick one")
+    if sort not in SORTS:
+        raise ValueError(f"sort must be one of {', '.join(SORTS)}, got {sort!r}")
+
+    d = downloader
+    if not PREVIEW_LOCK.acquire(timeout=PREVIEW_WAIT):
+        raise PreviewBusy("another search or channel preview is still running; "
+                          "try again in a minute, or with a smaller count")
+    try:
+        d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")   # as a job would
+        d.use_cookies[0] = True
+        d.SEARCH_QUERY = query
+        d.IN_CHANNEL = in_channel or None
+        d.SEARCH_COUNT = max(1, int(count or 1))
+        d.SORT_BY = "views" if sort == "popularity" else sort
+        d.DAYS = int(days or 0)
+        d.THIS_MONTH = bool(this_month)
+        d.MIN_VIEWS = int(views or 0)
+        d.LIMIT = int(limit or 0)
+        d.SKIP_IDS = {v for v in (d.video_id_from_url(x) or
+                                  (x if d.BARE_ID_RE.match(x) else None)
+                                  for x in _lines(skip).split()) if v}
+        items, err = d.search_items(query)
+        _since, window = d.search_window()
+        rows = [d.search_row(item, number) for number, item in enumerate(items, 1)]
+        sort_used, channel_used = d.SORT_BY, d.IN_CHANNEL
+    finally:
+        PREVIEW_LOCK.release()
+    return {"query": query, "in_channel": channel_used, "sort": sort_used,
+            "window": window or None, "found": len(rows), "results": rows,
+            "error": err}
+
+
 def tools_present():
     return {t: downloader.shutil.which(t) is not None
             for t in ("yt-dlp", "ffmpeg", "ffprobe", "aria2c", "node", "deno")}
@@ -854,6 +956,36 @@ def build_app():
             return preview_channel(channel, views, limit, skip)
         except ValueError as e:
             raise unprocessable(str(e), "query", "channel")
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/search", tags=["channels"], dependencies=keyed)
+    def search(query: str = Query(..., description="What to search YouTube for."),
+               in_channel: str = Query("", description="Search inside this channel "
+                                       "only, using its own search tab."),
+               count: int = Query(50, ge=1, le=INT_MAX["search_count"],
+                                  description="Results to ask YouTube for before "
+                                  "filtering."),
+               sort: str = Query("relevance", description="relevance, views, "
+                                 "popularity, least-viewed, date or oldest."),
+               days: int = Query(0, ge=0, le=INT_MAX["days"],
+                                 description="Only videos from the last N days."),
+               this_month: bool = Query(False, description="Only videos since the "
+                                        "1st of this month."),
+               views: int = Query(0, ge=0, le=INT_MAX["views"],
+                                  description="Drop results under N views."),
+               limit: int = Query(0, ge=0, le=INT_MAX["limit"],
+                                  description="Keep only the first N results."),
+               skip: str = Query("", description="Links or ids to leave out.")):
+        """Search YouTube and get back each video's link, views, publish date and
+        channel. Nothing is downloaded. A date window or a date sort costs about
+        2 s per result scanned; without one the search is about 0.15 s per result.
+        One search or channel preview runs at a time; another gets 503."""
+        try:
+            return search_youtube(query, in_channel, count, sort, days,
+                                  this_month, views, limit, skip)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", "query")
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
 

@@ -165,6 +165,81 @@ class TestArgv(unittest.TestCase):
         self.assertNotIn("--channel", argv)
         self.assertNotIn("--sub-lang", argv)
 
+    def test_transcript_only_reaches_the_command_line(self):
+        argv = self.argv(transcript=True)
+        self.assertIn("--transcript", argv)
+        self.assertEqual(argv[-1], "--yes", "--yes must stay last")
+
+    def test_comment_flags_travel_together(self):
+        argv = self.argv(extract_comments=True, comment_limit=30,
+                         comment_sort="new", comment_replies=True)
+        self.assertIn("--extract-comments", argv)
+        self.assertEqual(argv[argv.index("--comment-limit") + 1], "30")
+        self.assertEqual(argv[argv.index("--comment-sort") + 1], "new")
+        self.assertIn("--comment-replies", argv)
+
+    def test_replies_stay_off_unless_asked(self):
+        argv = self.argv(extract_comments=True)
+        self.assertIn("--extract-comments", argv)
+        self.assertNotIn("--comment-replies", argv)
+        self.assertEqual(argv[argv.index("--comment-limit") + 1], "100",
+                         "top 100 is the default")
+
+    def test_no_comment_flags_when_comments_are_off(self):
+        argv = self.argv()
+        for flag in ("--extract-comments", "--comment-limit", "--comment-sort",
+                     "--comment-replies"):
+            self.assertNotIn(flag, argv)
+
+    def test_search_reaches_the_command_line(self):
+        argv = self.argv(search="cats", search_count=10, sort="popularity",
+                         this_month=True)
+        self.assertEqual(argv[argv.index("--search") + 1], "cats")
+        self.assertEqual(argv[argv.index("--search-count") + 1], "10")
+        self.assertEqual(argv[argv.index("--sort") + 1], "popularity")
+        self.assertIn("--this-month", argv)
+        self.assertEqual(argv[-1], "--yes")
+
+    def test_in_channel_reaches_the_command_line(self):
+        argv = self.argv(search="cats",
+                         in_channel="https://www.youtube.com/@Handle")
+        self.assertEqual(argv[argv.index("--in-channel") + 1],
+                         "https://www.youtube.com/@Handle")
+
+    def test_no_search_flags_without_a_query(self):
+        argv = self.argv()
+        for flag in ("--search", "--search-count", "--sort", "--this-month",
+                     "--in-channel"):
+            self.assertNotIn(flag, argv)
+
+    def test_a_search_job_needs_no_links(self):
+        # The search produces the worklist, so there is nothing to supply.
+        opts = api.normalize_request({"search": "cats"})
+        self.assertEqual(opts["links"], "")
+        self.assertIn("--search", api.build_argv("/out", opts))
+
+    def test_a_job_with_neither_links_nor_search_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            api.normalize_request({})
+        self.assertIn("links is required", str(caught.exception))
+
+    def test_contradictory_options_are_refused(self):
+        for payload, expected in (
+                ({"links": "x", "in_channel": "https://www.youtube.com/@H"}, "needs search"),
+                ({"links": "x", "search": "c", "in_channel": "nonsense"}, "channel link"),
+                ({"links": "x", "days": 7, "this_month": True}, "pick one"),
+                ({"links": "x", "transcript": True, "subs": False}, "cannot be combined"),
+                ({"links": "x", "comment_sort": "best"}, "comment_sort must be"),
+                ({"links": "x", "sort": "sideways"}, "sort must be one of"),
+        ):
+            with self.assertRaises(ValueError, msg=f"{payload} should be refused") as caught:
+                api.normalize_request(payload)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_reverse_popularity_is_an_accepted_sort(self):
+        argv = self.argv(search="cats", sort="least-viewed")
+        self.assertEqual(argv[argv.index("--sort") + 1], "least-viewed")
+
     def test_a_links_file_is_passed_on(self):
         opts = api.normalize_request({"links": "x"})
         argv = api.build_argv("/out", opts, "/tmp/job.txt")

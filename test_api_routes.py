@@ -152,7 +152,7 @@ class TestRoutes(unittest.TestCase):
     def test_docs_list_every_endpoint(self):
         paths = self.c.get("/api/openapi.json").json()["paths"]
         self.assertEqual(sorted(paths), sorted([
-            "/api/ping", "/api/health", "/api/preview", "/api/jobs",
+            "/api/ping", "/api/health", "/api/preview", "/api/search", "/api/jobs",
             "/api/jobs/{job_id}", "/api/jobs/{job_id}/videos",
             "/api/jobs/{job_id}/stop", "/api/jobs/{job_id}/files",
             "/api/jobs/{job_id}/files/{path}"]))

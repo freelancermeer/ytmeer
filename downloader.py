@@ -28,7 +28,8 @@ Optional flags:
     --search QUERY       Search YouTube and use the results as the links
     --in-channel URL     With --search: search inside that channel only
     --search-count N     Results to ask for before filtering (default: 50)
-    --sort ORDER         relevance (default) | views/popularity | date | oldest
+    --sort ORDER         relevance (default) | views/popularity |
+                         least-viewed (reverse) | date | oldest
     --this-month         Search window: since the 1st of this month
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
@@ -2733,6 +2734,10 @@ def sort_items(items):
     """
     if SORT_BY == "views":
         return sorted(items, key=lambda i: (i.get("views") is None, -(i.get("views") or 0)))
+    if SORT_BY == "least-viewed":
+        # Reverse popularity: the weakest performers on a title first, which is
+        # what shows an angle nobody has managed to make work yet.
+        return sorted(items, key=lambda i: (i.get("views") is None, i.get("views") or 0))
     if SORT_BY == "date":
         return sorted(items, key=lambda i: (i.get("epoch") is None, -(i.get("epoch") or 0)))
     if SORT_BY == "oldest":
@@ -2793,6 +2798,46 @@ def search_items(query):
     return items, None
 
 
+def search_row(item, rank):
+    """One search result as the four things a search is actually for:
+    where it is, how it did, when it went up, and whose it is."""
+    epoch = item.get("epoch")
+    return {
+        "rank": rank,
+        "id": item.get("id"),
+        "link": item.get("url"),
+        "title": item.get("title"),
+        "channel": item.get("channel") or None,
+        "views": item.get("views"),
+        "published": upload_time_pkt({"timestamp": epoch}) if epoch else None,
+        "published_epoch": epoch,
+    }
+
+
+def write_search_results(path, query, items, label):
+    """The machine-readable form of the result table.
+
+    The printed table is for reading and the links file is for the downloader;
+    neither is parseable, and the four fields per video are the point of a
+    search, so they also go out as JSON.
+    """
+    rows = [search_row(item, number) for number, item in enumerate(items, 1)]
+    payload = {
+        "query": query,
+        "in_channel": IN_CHANNEL,
+        "sort": SORT_BY,
+        "window": label or None,
+        "found": len(rows),
+        "results": rows,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"  (could not write {os.path.basename(path)}: {e})")
+    return path
+
+
 def write_search_links(path, query, items, label):
     """Write the links file the rest of the run then reads."""
     with open(path, "w", encoding="utf-8") as f:
@@ -2805,17 +2850,21 @@ def write_search_links(path, query, items, label):
 
 
 def print_search_results(items, label):
-    """The titles and links, which is what a search is for."""
+    """The table: views, publish date, channel and link for every result.
+
+    Those four are what a search is for, so each is printed for every video and
+    a missing one reads NA rather than being left out - a blank column would be
+    read as zero views or an unknown channel.
+    """
     print(f"\n  Search results (sort: {SORT_BY}"
           f"{', ' + label if label else ''}): {len(items)} video(s)")
     for number, item in enumerate(items, 1):
-        views = count_or_na(item.get("views"))
-        when = (upload_time_pkt({"timestamp": item["epoch"]}).split(",")[0]
-                if item.get("epoch") else "")
-        head = f"  {number:>3}. {views:>12} views"
-        print(f"{head}{'  ' + when if when else ''}  {item['title']}")
-        print(f"       {item['url']}"
-              f"{'   [' + item['channel'] + ']' if item.get('channel') else ''}")
+        row = search_row(item, number)
+        when = row["published"].split(",")[0] if row["published"] else "date NA"
+        print(f"  {number:>3}. {count_or_na(row['views']):>12} views   "
+              f"{when:>12}   {row['channel'] or 'channel NA'}")
+        print(f"       {row['title']}")
+        print(f"       {row['link']}")
 
 
 def run_search(args):
@@ -2840,10 +2889,15 @@ def run_search(args):
         log_record(url=f"ytsearch:{query}", status="search", found=0, kept=0)
         return None
     print_search_results(items, label)
-    path = (os.path.expanduser(args.links) if args.links
-            else os.path.join(DOWNLOAD_DIR, "search_links.txt"))
+    # Always its own file, never the --links path. A search result is a
+    # different thing from a curated list, and writing over someone's
+    # links.txt to store it would destroy the input they chose.
+    path = os.path.join(DOWNLOAD_DIR, "search_links.txt")
     write_search_links(path, query, items, label)
-    print(f"\n  Wrote {len(items)} link(s) to {os.path.basename(path)}")
+    results = write_search_results(os.path.join(DOWNLOAD_DIR, "search_results.json"),
+                                   query, items, label)
+    print(f"\n  Wrote {len(items)} link(s) to {os.path.basename(path)}"
+          f" and {os.path.basename(results)}")
     # "search" is not in the API's DONE or FAILED sets on purpose: the expansion
     # is visible to a caller without being counted as a video either way.
     log_record(url=f"ytsearch:{query}", status="search", found=len(items),
@@ -3420,9 +3474,11 @@ def parse_args(argv=None):
                    dest="search_count",
                    help="Results to ask YouTube for before filtering (default 50).")
     p.add_argument("--sort", "--sort-by", dest="sort", default="relevance",
-                   choices=("relevance", "views", "popularity", "date", "oldest"),
+                   choices=("relevance", "views", "popularity", "least-viewed",
+                            "date", "oldest"),
                    help="Order the search results: relevance (default), views "
-                        "(popularity), date (newest first) or oldest.")
+                        "(popularity), least-viewed (reverse popularity), "
+                        "date (newest first) or oldest.")
     p.add_argument("--this-month", action="store_true", dest="this_month",
                    help="Search window: since the 1st of the current month.")
     p.add_argument("--cookies", metavar="FILE",

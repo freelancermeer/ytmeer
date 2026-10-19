@@ -130,6 +130,17 @@ class PlatformCase:
         d.SORT_BY = "views"
         self.assertEqual([i["views"] for i in d.sort_items(items)], [900, 50, 10])
 
+    def test_reverse_popularity_puts_the_least_watched_first(self):
+        items = [{"views": 900}, {"views": 10}, {"views": 50}]
+        d.SORT_BY = "least-viewed"
+        self.assertEqual([i["views"] for i in d.sort_items(items)], [10, 50, 900])
+
+    def test_an_unmeasured_count_sorts_last_either_direction(self):
+        # Also for least-viewed: an unknown count is not "zero views".
+        d.SORT_BY = "least-viewed"
+        items = [{"views": None}, {"views": 5}]
+        self.assertEqual([i["views"] for i in d.sort_items(items)], [5, None])
+
     def test_an_unmeasured_count_sorts_last(self):
         # A video YouTube declined to count must not outrank one it did.
         d.SORT_BY = "views"
@@ -161,6 +172,32 @@ class PlatformCase:
             # the file the run then reads must yield exactly the two links
             self.assertEqual(d.read_links(path), [i["url"] for i in items])
 
+    def test_a_search_never_overwrites_a_curated_links_file(self):
+        # The search result is its own artifact. Storing it over the file the
+        # user chose as input would destroy that input.
+        import argparse as _ap
+        with tempfile.TemporaryDirectory() as base:
+            curated = os.path.join(base, "my_links.txt")
+            with open(curated, "w", encoding="utf-8") as f:
+                f.write("https://www.youtube.com/watch?v=aaaaaaaaaaa\n")
+            d.DOWNLOAD_DIR = base
+            d.SEARCH_QUERY = "cats"
+            items = [{"id": "b" * 11, "title": "Two",
+                      "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                      "views": 1, "epoch": None, "channel": ""}]
+            real_items, real_rec = d.search_items, d.log_record
+            d.search_items = lambda q: (items, None)
+            d.log_record = lambda **kw: None
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    written = d.run_search(_ap.Namespace(search="cats", links=curated))
+            finally:
+                d.search_items, d.log_record = real_items, real_rec
+            self.assertEqual(os.path.basename(written), "search_links.txt")
+            self.assertEqual(open(curated, encoding="utf-8").read(),
+                             "https://www.youtube.com/watch?v=aaaaaaaaaaa\n",
+                             "the curated file must be untouched")
+
     def test_search_flag_defaults(self):
         args = d.parse_args(["/tmp"])
         self.assertIsNone(args.search)
@@ -168,6 +205,10 @@ class PlatformCase:
         self.assertEqual(args.search_count, 50)
         self.assertEqual(args.sort, "relevance")
         self.assertFalse(args.this_month)
+
+    def test_least_viewed_is_a_sort_choice(self):
+        self.assertEqual(d.parse_args(["/tmp", "--sort", "least-viewed"]).sort,
+                         "least-viewed")
 
     def test_popularity_is_accepted_as_a_spelling_of_views(self):
         self.assertEqual(d.parse_args(["/tmp", "--sort", "popularity"]).sort,
