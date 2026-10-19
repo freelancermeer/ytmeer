@@ -46,7 +46,8 @@ class PlatformCase:
                        d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
                        d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
                        d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE,
-                       d.TRANSCRIPT_ONLY)
+                       d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
+                       d.COMMENT_REPLIES, d.COMMENT_SORT)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -58,15 +59,156 @@ class PlatformCase:
         d.LIMIT = 0
         d.SKIP_IDS = set()
         d.TRANSCRIPT_ONLY = False
+        d.EXTRACT_COMMENTS = False
+        d.COMMENT_LIMIT = 100
+        d.COMMENT_REPLIES = False
+        d.COMMENT_SORT = "top"
         d.skipped_by_list[0] = 0
         d.TRANSCRIPT_COUNT[0] = 0
+        d.COMMENT_COUNT[0] = 0
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
          d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
          d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
          d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE,
-         d.TRANSCRIPT_ONLY) = self._saved
+         d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
+         d.COMMENT_REPLIES, d.COMMENT_SORT) = self._saved
+
+    # ---------------------------------------------------------------- comments
+    @staticmethod
+    def _comment(cid, parent="root", text="hi", likes=0, stamp=None, **extra):
+        c = {"id": cid, "parent": parent, "text": text, "like_count": likes,
+             "author": f"@{cid}"}
+        if stamp is not None:
+            c["timestamp"] = stamp
+        c.update(extra)
+        return c
+
+    def test_comment_args_travel_in_one_extractor_pair(self):
+        # yt-dlp keys extractor args by extractor, so a second "youtube:" pair
+        # replaces the first. Client and comment settings must share one pair or
+        # whichever came first is silently dropped.
+        flags = d.comment_extractor_args(d.PO_TOKEN_FLAGS)
+        self.assertEqual(flags.count("--extractor-args"), 1)
+        pair = flags[flags.index("--extractor-args") + 1]
+        self.assertTrue(pair.startswith("youtube:"))
+        self.assertIn("player_client=mweb,default", pair)
+        self.assertIn("comment_sort=top", pair)
+        self.assertIn("max_comments=", pair)
+
+    def test_comment_args_without_a_client(self):
+        pair = d.comment_extractor_args([])[1]
+        self.assertNotIn("player_client", pair)
+        self.assertIn("comment_sort=top", pair)
+
+    def test_replies_off_by_default_and_on_with_the_flag(self):
+        # Measured: 100 top-level with no replies took 7.4s, while a plain
+        # "100 comments" took 10.8s and came back 28 real ones and 72 replies.
+        d.COMMENT_REPLIES = False
+        self.assertIn("max_comments=all,100,0,0", d.comment_extractor_args([])[1])
+        d.COMMENT_REPLIES = True
+        self.assertIn("max_comments=all,100,all,all", d.comment_extractor_args([])[1])
+
+    def test_comment_limit_zero_means_every_comment(self):
+        d.COMMENT_LIMIT = 0
+        self.assertIn("max_comments=all,all,0,0", d.comment_extractor_args([])[1])
+
+    def test_threading_groups_replies_under_their_comment(self):
+        flat = [self._comment("a"), self._comment("r1", parent="a"),
+                self._comment("b"), self._comment("r2", parent="a")]
+        threads = d.thread_comments(flat)
+        self.assertEqual([t[0]["id"] for t in threads], ["a", "b"])
+        self.assertEqual([r["id"] for r in threads[0][1]], ["r1", "r2"])
+        self.assertEqual(threads[1][1], [])
+
+    def test_a_reply_whose_parent_was_capped_is_not_lost(self):
+        # Capping the parents can leave a reply whose comment was never fetched.
+        threads = d.thread_comments([self._comment("a"),
+                                     self._comment("orphan", parent="gone")])
+        self.assertEqual(len(threads), 2, "the orphan is promoted, not dropped")
+        self.assertIn("orphan", [t[0]["id"] for t in threads])
+
+    def test_comment_time_prefers_the_timestamp(self):
+        self.assertEqual(d.comment_time({"timestamp": 1778622302}),
+                         "13 May 2026, 02:45 AM PKT")
+
+    def test_comment_time_falls_back_then_gives_up(self):
+        self.assertEqual(d.comment_time({"_time_text": "2 weeks ago"}), "2 weeks ago")
+        self.assertEqual(d.comment_time({"timestamp": "nope"}), "NA")
+        self.assertEqual(d.comment_time({}), "NA")
+
+    def test_comments_file_is_threaded_and_labelled(self):
+        d.EXTRACT_COMMENTS = True
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "My Clip")
+            os.makedirs(folder)
+            flat = [self._comment("a", likes=1, stamp=1778622302),
+                    self._comment("r", parent="a", likes=5),
+                    self._comment("b", likes=12, author_is_uploader=True)]
+            path = d.write_comments_txt(folder, {"title": "T", "webpage_url": "u"}, flat)
+            self.assertEqual(os.path.basename(path), "comments_My Clip.txt")
+            body = open(path, encoding="utf-8").read()
+            self.assertIn("Sort:         top", body)
+            self.assertIn("2 comment(s), 1 reply(ies)", body)
+            self.assertIn("(replies off)", body)
+            self.assertIn("1 like |", body, "one like is not 1 likes")
+            self.assertIn("12 likes |", body)
+            self.assertIn("(uploader)", body)
+            self.assertIn("\n      @r", body, "a reply is indented under its comment")
+
+    def test_no_comments_file_when_there_are_no_comments(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertIsNone(d.write_comments_txt(folder, {}, []))
+            self.assertIsNone(d.find_comments_file(folder))
+
+    def test_taking_comments_removes_the_info_json(self):
+        # It is ~923 KB even for ten comments, because the bulk is format
+        # metadata - about a megabyte of noise per folder if it is left behind.
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "clip.info.json"), "w") as f:
+                json.dump({"comments": [self._comment("a")], "formats": [1, 2]}, f)
+            got = d.take_comments(folder)
+            self.assertEqual([c["id"] for c in got], ["a"])
+            self.assertEqual([n for n in os.listdir(folder) if n.endswith(".info.json")], [])
+
+    def test_taking_comments_survives_a_broken_info_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "clip.info.json"), "w") as f:
+                f.write("{not json")
+            self.assertEqual(d.take_comments(folder), [])
+            self.assertEqual(os.listdir(folder), [], "the bad file is still removed")
+
+    def test_comments_line_states(self):
+        self.assertEqual(d.comments_line("/x/comments_A.txt", 37, "saved"),
+                         "comments_A.txt (37 fetched)")
+        self.assertEqual(d.comments_line(None, 0, "none"), "none")
+        self.assertEqual(d.comments_line(None, 0, "failed"), "failed")
+
+    def test_comments_are_skipped_entirely_when_off(self):
+        d.EXTRACT_COMMENTS = False
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(d.build_comments(folder, "u", {}), (None, 0, "off"))
+            self.assertEqual(os.listdir(folder), [])
+
+    def test_a_comment_failure_never_fails_the_video(self):
+        d.EXTRACT_COMMENTS = True
+        real = d.fetch_comments
+        d.fetch_comments = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    path, count, state = d.build_comments(folder, "u", {})
+        finally:
+            d.fetch_comments = real
+        self.assertEqual((path, count, state), (None, 0, "failed"))
+
+    def test_comment_flag_defaults(self):
+        args = d.parse_args(["/tmp"])
+        self.assertFalse(args.extract_comments)
+        self.assertEqual(args.comment_limit, 100, "top 100 is the default")
+        self.assertFalse(args.comment_replies, "replies are off by default")
+        self.assertEqual(args.comment_sort, "top")
 
     # ----------------------------------------------------- transcript-only
     def _folder(self, base, name, url, status="OK", video=True, transcript=True):

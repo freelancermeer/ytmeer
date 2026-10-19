@@ -21,6 +21,10 @@ Optional flags:
     --no-subs            Do NOT build transcripts (built by default)
     --sub-lang CODE      Transcript language code (default: en)
     --transcript         Transcript only - no video is downloaded
+    --extract-comments   Also save comments_<name>.txt (top 100, replies off)
+    --comment-limit N    Top-level comments per video (default: 100; 0 = all)
+    --comment-replies    Also fetch the replies under those comments
+    --comment-sort S     top (default) or new
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
     --dry-run            Show the download plan and exit without downloading
@@ -114,6 +118,16 @@ TRANSCRIPT_ONLY = False    # True = write the transcript and never fetch the vid
 TRANSCRIPT_STATUS = "TRANSCRIPT"
 TRANSCRIPT_QUALITY = "NA (transcript only)"
 TRANSCRIPT_COUNT = [0]     # transcripts written this run, for the summary
+
+EXTRACT_COMMENTS = False   # True = also save each video's comments
+COMMENT_LIMIT   = 100      # top-level comments per video (0 = every one)
+COMMENT_REPLIES = False    # True = fetch the replies under those comments too
+COMMENT_SORT    = "top"    # "top" (YouTube's ranking) or "new"
+COMMENT_COUNT   = [0]      # comments written this run, for the summary
+# Comment extraction is paged and can be slow; measured 7.4s for 100 top-level
+# comments and 18.6s with their replies. The cap is what stops a video with tens
+# of thousands of them from holding up the batch.
+COMMENT_TIMEOUT = 600
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1222,6 +1236,222 @@ def build_extras(folder, url, info):
     return thumb, desc
 
 
+# ============================== comments ===================================
+def comment_extractor_args(client=()):
+    """The one --extractor-args pair carrying the route's client AND the comment
+    settings.
+
+    They have to travel together. yt-dlp keys extractor arguments by extractor,
+    so a second "youtube:" pair replaces the first rather than adding to it -
+    passing the player_client in one pair and max_comments in another silently
+    drops whichever came first.
+
+    max_comments is total,parents,replies,replies-per-thread. Capping the
+    parents and taking no replies is both what is wanted by default and the
+    fastest route: measured 7.4s for 100 top-level comments, against 10.8s for
+    a plain "100 comments" that came back as 28 real ones and 72 replies.
+    """
+    parents = COMMENT_LIMIT if COMMENT_LIMIT else "all"
+    replies = "all" if COMMENT_REPLIES else "0"
+    parts = []
+    for item in client:
+        if isinstance(item, str) and item.startswith("youtube:"):
+            parts.append(item.split(":", 1)[1])      # keep the route's client
+    parts.append(f"comment_sort={COMMENT_SORT}")
+    parts.append(f"max_comments=all,{parents},{replies},{replies}")
+    return ["--extractor-args", "youtube:" + ";".join(parts)]
+
+
+def find_comments_file(folder):
+    """Path to the saved comments_*.txt in the folder, or None."""
+    try:
+        for name in sorted(os.listdir(folder)):
+            if name.startswith("comments_") and name.endswith(".txt"):
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
+
+def take_comments(folder):
+    """Lift the comments out of the .info.json, then delete every one of them.
+
+    --write-comments has nowhere else to put them, and the file is large whether
+    or not the comments are: 923 KB for ten of them, because the bulk is format
+    metadata. Leaving it behind would put about a megabyte of noise in every
+    video folder, so it is removed the way take_caption removes the json3.
+    """
+    found = []
+    try:
+        found = [os.path.join(folder, n) for n in sorted(os.listdir(folder))
+                 if n.endswith(".info.json")]
+    except OSError:
+        return []
+    comments = []
+    for path in found:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                comments = (json.load(f).get("comments") or []) or comments
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+    for path in found:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return comments
+
+
+def thread_comments(comments):
+    """Group a flat comments array into [(top_level, [replies...]), ...].
+
+    The parent field is the only thing tying a reply to its comment ("root" for
+    a top-level one, else the parent's id), and yt-dlp returns them flat. A
+    reply whose parent is not in the batch - which happens when the parents are
+    capped - is promoted to top level rather than dropped, so no fetched comment
+    is silently lost.
+    """
+    tops = [c for c in comments if (c.get("parent") or "root") == "root"]
+    by_id = {c.get("id"): c for c in tops}
+    replies = {}
+    orphans = []
+    for c in comments:
+        parent = c.get("parent") or "root"
+        if parent == "root":
+            continue
+        if parent in by_id:
+            replies.setdefault(parent, []).append(c)
+        else:
+            orphans.append(c)
+    return [(c, replies.get(c.get("id"), [])) for c in tops + orphans]
+
+
+def comment_time(comment):
+    """A readable posting time for one comment, in Pakistan time.
+
+    Falls back to yt-dlp's own relative wording ("2 weeks ago") when there is no
+    integer timestamp, and to NA when there is neither.
+    """
+    stamp = (comment or {}).get("timestamp")
+    if stamp:
+        try:
+            return (datetime.datetime.fromtimestamp(int(stamp), PKT)
+                    .strftime("%d %b %Y, %I:%M %p PKT"))
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    return str((comment or {}).get("_time_text") or "NA")
+
+
+def write_comments_txt(folder, info, comments):
+    """Write comments_<folder name>.txt and return its path, or None.
+
+    Threaded rather than flat, because a reply read without its comment is
+    usually meaningless. Plain ASCII in the furniture; the comment text itself
+    is whatever the commenter wrote.
+    """
+    if not comments:
+        return None
+    name = os.path.basename(folder.rstrip("/\\"))
+    path = os.path.join(folder, f"comments_{name}.txt")
+    threads = thread_comments(comments)
+    tops = len(threads)
+    replies = len(comments) - tops
+
+    def block(comment, indent):
+        pad = " " * indent
+        who = str(comment.get("author") or "unknown")
+        marks = ""
+        if comment.get("author_is_uploader"):
+            marks += "  (uploader)"
+        if comment.get("author_is_verified"):
+            marks += "  (verified)"
+        if comment.get("is_pinned"):
+            marks += "  (pinned)"
+        likes = comment.get("like_count")
+        if isinstance(likes, int):
+            likes = f"{likes:,} like" + ("" if likes == 1 else "s")
+        else:
+            likes = "likes NA"
+        lines = [f"{pad}{who}{marks}", f"{pad}  {likes} | {comment_time(comment)}"]
+        text = one_line(str(comment.get("text") or ""))
+        lines += [f"{pad}  {text}" if text else f"{pad}  (no text)"]
+        return "\n".join(lines)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Comments for: {info.get('title') or ''}\n")
+        f.write(f"Link:         {info.get('webpage_url') or ''}\n")
+        f.write(f"Sort:         {COMMENT_SORT}\n")
+        f.write(f"Fetched:      {tops} comment(s), {replies} reply(ies)"
+                f"{'' if COMMENT_REPLIES else '  (replies off)'}\n")
+        f.write("\n" + "-" * 60 + "\n")
+        for number, (top, kids) in enumerate(threads, 1):
+            f.write(f"\n[{number}] {block(top, 0)}\n")
+            for kid in kids:
+                f.write(f"\n{block(kid, 6)}\n")
+    return path
+
+
+def fetch_comments(folder, url):
+    """Run the one yt-dlp command that leaves the comments in an .info.json.
+
+    Gets the same route escalation every lone fetch here does, because asking
+    for comments on their own meets the same bot check the video download does.
+    """
+    name = os.path.basename(folder.rstrip("/\\"))
+    routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
+    log_debug("comments_start", stage="comments", url=url, folder=rel(folder),
+              sort=COMMENT_SORT, limit=COMMENT_LIMIT, replies=COMMENT_REPLIES,
+              routes=len(routes))
+    for route_no, extra in enumerate(routes, 1):
+        cmd = base_cmd() + [
+            "--skip-download", "--no-playlist", "--ignore-no-formats-error",
+            "--write-comments", "--write-info-json", "--no-warnings",
+            "-o", output_template(folder, name),
+        ] + comment_extractor_args(extra) + ["--", url]
+        out = run_logged("comments", cmd, capture_output=True, text=True,
+                         timeout=COMMENT_TIMEOUT)
+        comments = take_comments(folder)
+        log_debug("comments_attempt", stage="comments", url=url, folder=rel(folder),
+                  route=route_no, returncode=getattr(out, "returncode", None),
+                  found=len(comments), stderr_tail=getattr(out, "stderr", ""))
+        if comments:
+            return comments
+        if not drop_rejected_cookies(getattr(out, "stderr", "") or ""):
+            continue
+    return []
+
+
+def build_comments(folder, url, info):
+    """Save a video's comments. Returns (path, count, state) and never raises.
+
+    Comments are an extra, so nothing here may fail a video: a run that lost its
+    comments to a rate limit still has the video, the transcript and the rest.
+    state is "off", "none" (the video has none, or has them disabled - a normal
+    state, not an error), "saved", or "failed".
+    """
+    if not EXTRACT_COMMENTS:
+        return None, 0, "off"
+    existing = find_comments_file(folder)
+    if existing:
+        return existing, 0, "saved"
+    try:
+        comments = fetch_comments(folder, url)
+        if not comments:
+            log_debug("comments_finish", stage="comments", url=url,
+                      folder=rel(folder), saved=False, count=0)
+            return None, 0, "none"
+        path = write_comments_txt(folder, info or {}, comments)
+        COMMENT_COUNT[0] += len(comments)
+        log_debug("comments_finish", stage="comments", url=url, folder=rel(folder),
+                  saved=bool(path), count=len(comments))
+        return path, len(comments), "saved" if path else "none"
+    except Exception as e:                      # never fail the video over this
+        note(f"      (comments unavailable: {e})")
+        log_debug("comments_finish", stage="comments", url=url, folder=rel(folder),
+                  saved=False, count=0, error=str(e))
+        return None, 0, "failed"
+
+
 # ============================ transcript helpers ===========================
 def offers_json3(entries):
     """True unless a caption track's formats are listed and json3 is not one of them.
@@ -1603,6 +1833,25 @@ def update_info_extras(folder, thumbnail, description):
         f.write("\n".join(kept) + "\n")
 
 
+def update_info_comments(folder, path, count, state):
+    """Add or refresh the single Comments: line in an existing videoinfo.txt."""
+    info_path = os.path.join(folder, "videoinfo.txt")
+    if not os.path.exists(info_path):
+        return
+    try:
+        with open(info_path, "r", encoding="utf-8") as f:
+            kept = [ln for ln in f.read().splitlines()
+                    if not ln.startswith("Comments:")]
+    except OSError:
+        return
+    kept.append(f"Comments: {comments_line(path, count, state)}")
+    try:
+        with open(info_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + "\n")
+    except OSError:
+        pass
+
+
 def download_subs(folder, url):
     """Backfill: build the transcripts for an already-downloaded video."""
     if not DOWNLOAD_SUBS:
@@ -1858,9 +2107,20 @@ def index_transcribed(base):
     return index
 
 
+def comments_line(path, count, state):
+    """The Comments: value for videoinfo.txt.
+
+    "none" when the video has no comments or has them switched off - a normal
+    state, not an error - and "failed" only when the fetch itself went wrong.
+    """
+    if path:
+        return f"{os.path.basename(path)} ({count} fetched)" if count else os.path.basename(path)
+    return "failed" if state == "failed" else "none"
+
+
 def write_info(folder, title, url, quality, status, error=None,
                transcript=None, words=None, thumbnail=None, description=None,
-               info=None):
+               info=None, comments=None, comment_count=0, comment_state="off"):
     """Write videoinfo.txt inside the video's folder."""
     lines = [
         f"Title:   {title}",
@@ -1880,6 +2140,8 @@ def write_info(folder, title, url, quality, status, error=None,
         lines.append(f"Thumbnail:  {os.path.basename(thumbnail) if thumbnail else 'none'}")
     if SAVE_DESCRIPTION:
         lines.append(f"Description: {os.path.basename(description) if description else 'none'}")
+    if EXTRACT_COMMENTS:
+        lines.append(f"Comments: {comments_line(comments, comment_count, comment_state)}")
     if error:
         lines.append(f"Error:   {error}")
     with open(os.path.join(folder, "videoinfo.txt"), "w", encoding="utf-8") as f:
@@ -1935,6 +2197,17 @@ def skip_finished(folder, url, bar=None):
         if wants_counts and info:
             update_info_counts(folder, info)
             note("      + views and subscriber count")
+
+    # Comments asked for after the video was already downloaded: fetched here,
+    # so an existing library gains them without being downloaded again.
+    if EXTRACT_COMMENTS and not find_comments_file(folder):
+        cinfo, _ = fetch_info(url)
+        cpath, ccount, cstate = build_comments(folder, url, cinfo)
+        update_info_comments(folder, cpath, ccount, cstate)
+        if cpath:
+            note(f"      + {os.path.basename(cpath)}")
+        else:
+            note("      (no comments)")
     # Recorded last: the moment this record exists it is streamed, and whoever
     # reads it may open the folder straight away - so the backfill must be done.
     log_record(url=url, status="skipped", folder=rel(folder))
@@ -2200,8 +2473,10 @@ def download_one(url, index, total):
         sub_note = (f"  Transcript: {os.path.basename(trans)} + "
                     f"{os.path.basename(words)}")
     thumb, desc = build_extras(folder, url, info)
+    cpath, ccount, cstate = build_comments(folder, url, info)
     extras_note = "".join(f"  {label}: {os.path.basename(path)}"
-                          for label, path in (("Thumbnail", thumb), ("Description", desc))
+                          for label, path in (("Thumbnail", thumb), ("Description", desc),
+                                              ("Comments", cpath))
                           if path)
     size = folder_size(folder)
     STATS["bytes"] += size
@@ -2210,12 +2485,13 @@ def download_one(url, index, total):
     note(f"    Done. Quality: {quality}  "
          f"[{human_size(size)} in {human_time(elapsed)}{rate}]{sub_note}{extras_note}")
     got = "".join(c for c, path in (("T", trans), ("W", words and "not_found" not in words),
-                                    ("j", thumb), ("d", desc)) if path)
+                                    ("j", thumb), ("d", desc), ("c", cpath)) if path)
     speed = f"{human_size(size / elapsed)}/s" if elapsed > 0 else "-"
     bar.done(f"OK  {quality:>6} {human_size(size):>9} {human_time(elapsed):>9} "
              f"{speed:>10}  [{got}]  {title}")
     write_info(folder, title, url, quality, "OK", transcript=trans, words=words,
-               thumbnail=thumb, description=desc, info=info)
+               thumbnail=thumb, description=desc, info=info,
+               comments=cpath, comment_count=ccount, comment_state=cstate)
     # Recorded after videoinfo.txt, so the folder is complete when it streams.
     log_record(url=url, title=title, status="ok", quality=quality, folder=rel(folder),
                channel=info.get("channel") or info.get("uploader"),
@@ -2227,7 +2503,8 @@ def download_one(url, index, total):
                       "transcript": os.path.basename(trans) if trans else None,
                       "words": os.path.basename(words) if words else None,
                       "thumbnail": os.path.basename(thumb) if thumb else None,
-                      "description": os.path.basename(desc) if desc else None})
+                      "description": os.path.basename(desc) if desc else None,
+                      "comments": os.path.basename(cpath) if cpath else None})
     log_debug("video_finish", stage="video", url=url, status="ok", quality=quality,
               folder=rel(folder), bytes=size, seconds=round(elapsed, 1),
               captions=True, thumbnail=bool(thumb), description=bool(desc))
@@ -2276,10 +2553,11 @@ def transcript_only(folder, url, vid, title, info, bar):
     # SAVE_THUMBNAIL is forced off in this mode, so this writes only the
     # description, out of metadata already fetched, and starts no subprocess.
     thumb, desc = build_extras(folder, url, info)
+    cpath, ccount, cstate = build_comments(folder, url, info)
     size = folder_size(folder)
     got = "".join(c for c, path in (("T", trans),
                                     ("W", words and "not_found" not in words),
-                                    ("d", desc)) if path)
+                                    ("d", desc), ("c", cpath)) if path)
     note(f"    Transcript done. {os.path.basename(trans)} "
          f"[{human_size(size)} in {human_time(elapsed)}]")
     bar.done(f"TEXT {human_size(size):>9} {human_time(elapsed):>9} "
@@ -2288,10 +2566,12 @@ def transcript_only(folder, url, vid, title, info, bar):
     if vfile:
         update_info_transcripts(folder, trans, words)
         update_info_extras(folder, thumb, desc)
+        update_info_comments(folder, cpath, ccount, cstate)
     else:
         write_info(folder, title, url, TRANSCRIPT_QUALITY, TRANSCRIPT_STATUS,
                    transcript=trans, words=words, thumbnail=thumb,
-                   description=desc, info=info)
+                   description=desc, info=info, comments=cpath,
+                   comment_count=ccount, comment_state=cstate)
     # "ok" so the API counts it as done; the mode and the absent video are
     # visible in the record itself rather than hidden behind a new status word.
     log_record(url=url, title=title, status="ok", mode="transcript",
@@ -2305,7 +2585,8 @@ def transcript_only(folder, url, vid, title, info, bar):
                       "transcript": os.path.basename(trans),
                       "words": os.path.basename(words) if words else None,
                       "thumbnail": None,
-                      "description": os.path.basename(desc) if desc else None})
+                      "description": os.path.basename(desc) if desc else None,
+                      "comments": os.path.basename(cpath) if cpath else None})
     log_debug("video_finish", stage="video", url=url, status="ok",
               mode="transcript", folder=rel(folder), bytes=size,
               seconds=round(elapsed, 1), captions=True)
@@ -2885,6 +3166,18 @@ def parse_args(argv=None):
     p.add_argument("--transcript", action="store_true",
                    help="Transcript only: write trans_/words_ .txt and never "
                         "download the video.")
+    p.add_argument("--extract-comments", action="store_true",
+                   dest="extract_comments",
+                   help="Also save each video's comments to comments_<name>.txt.")
+    p.add_argument("--comment-limit", type=int, default=100, metavar="N",
+                   dest="comment_limit",
+                   help="Top-level comments per video (default 100; 0 = every one).")
+    p.add_argument("--comment-replies", action="store_true",
+                   dest="comment_replies",
+                   help="Also fetch the replies under those comments (off by default).")
+    p.add_argument("--comment-sort", choices=("top", "new"), default="top",
+                   dest="comment_sort",
+                   help="Comment order: top (YouTube's ranking, default) or new.")
     p.add_argument("--no-thumbnail", action="store_true",
                    help="Do NOT save the thumbnail (saved by default).")
     p.add_argument("--no-description", action="store_true",
@@ -2949,6 +3242,7 @@ def main():
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY
+    global EXTRACT_COMMENTS, COMMENT_LIMIT, COMMENT_REPLIES, COMMENT_SORT
 
     use_utf8_output()
     args = parse_args()
@@ -2965,6 +3259,10 @@ def main():
     SUB_LANG      = args.sub_lang
     CHANNEL_MODE  = args.channel
     TRANSCRIPT_ONLY = args.transcript
+    EXTRACT_COMMENTS = args.extract_comments
+    COMMENT_LIMIT = max(0, args.comment_limit)
+    COMMENT_REPLIES = args.comment_replies
+    COMMENT_SORT = args.comment_sort
     # Nobody asking for a transcript wants a .jpg; the description is kept
     # because it is written from metadata already fetched and costs no request.
     SAVE_THUMBNAIL = not args.no_thumbnail and not TRANSCRIPT_ONLY
@@ -2988,6 +3286,9 @@ def main():
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
     if TRANSCRIPT_ONLY:
         print("  Output  : transcript only - no video is downloaded")
+    if EXTRACT_COMMENTS:
+        print(f"  Comments: {COMMENT_LIMIT or 'all'} top-level, sort {COMMENT_SORT}"
+              f", replies {'on' if COMMENT_REPLIES else 'off'}")
     if MIN_VIEWS or LIMIT or DAYS:
         print(f"  Channels: {f'>= {MIN_VIEWS:,} views' if MIN_VIEWS else 'every video'}"
               f"{f', newest {LIMIT} each' if LIMIT else ''}"
