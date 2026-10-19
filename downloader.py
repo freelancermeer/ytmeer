@@ -20,6 +20,7 @@ Optional flags:
     --max-height N       Quality ceiling (default: 1080)
     --no-subs            Do NOT build transcripts (built by default)
     --sub-lang CODE      Transcript language code (default: en)
+    --transcript         Transcript only - no video is downloaded
     --no-thumbnail       Do NOT save the thumbnail (saved by default)
     --no-description     Do NOT save the description (saved by default)
     --dry-run            Show the download plan and exit without downloading
@@ -105,6 +106,14 @@ LIMIT          = 0         # channel links: newest N matches each (0 = no cap)
 DAYS           = 0         # filter by last N days (0 = any time)
 SKIP_FILE      = "skip.txt"
 SKIP_IDS       = set()     # video ids listed in skip.txt - never downloaded
+TRANSCRIPT_ONLY = False    # True = write the transcript and never fetch the video
+
+# What a transcript-only folder records. The status is deliberately not "OK":
+# index_downloaded() wants "OK" plus a video file, so such a folder is never
+# mistaken for a finished download and asking for the video later still gets it.
+TRANSCRIPT_STATUS = "TRANSCRIPT"
+TRANSCRIPT_QUALITY = "NA (transcript only)"
+TRANSCRIPT_COUNT = [0]     # transcripts written this run, for the summary
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -113,7 +122,8 @@ IS_WINDOWS = platform.system() == "Windows"
 # this is the difference between a few hundred KB/s and saturating the link.
 ARIA2C = shutil.which("aria2c")
 ARIA2C_ARGS = ("-x16 -s16 -k1M -c --file-allocation=none "
-               "--console-log-level=warn --summary-interval=1")
+               "--console-log-level=warn --summary-interval=1"
+               + (" " + os.environ["ARIA2C_EXTRA"] if os.environ.get("ARIA2C_EXTRA") else ""))
 
 
 def build_format():
@@ -1772,6 +1782,35 @@ def choose_folder(parent, folder_name, vid):
 DONE_INDEX = {}
 
 
+def walk_video_folders(base):
+    """Yield every folder under base that could hold one video.
+
+    Both layouts at once: <base>/<video>/ and, beneath each of those,
+    <base>/<channel>/<video>/ - so a run resumes whichever layout produced the
+    files, including after switching --channel on or off. The order matters: a
+    flat folder is yielded before its children, and both indexes keep the FIRST
+    folder found for a video id. An unreadable base ends the walk; an unreadable
+    child level only skips that one branch.
+    """
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return
+    for name in names:
+        level1 = os.path.join(base, name)
+        if not os.path.isdir(level1):
+            continue
+        yield level1                               # flat layout
+        try:
+            subs = sorted(os.listdir(level1))
+        except OSError:
+            continue
+        for sub in subs:
+            level2 = os.path.join(level1, sub)
+            if os.path.isdir(level2):
+                yield level2                       # channel layout
+
+
 def index_downloaded(base):
     """Find every finished download under base and index it by video id.
 
@@ -1793,21 +1832,29 @@ def index_downloaded(base):
         if vid and vid not in index and find_video_file(folder):
             index[vid] = folder
 
-    try:
-        for name in sorted(os.listdir(base)):
-            level1 = os.path.join(base, name)
-            if not os.path.isdir(level1):
-                continue
-            consider(level1)                       # flat layout
-            try:
-                for sub in sorted(os.listdir(level1)):
-                    level2 = os.path.join(level1, sub)
-                    if os.path.isdir(level2):
-                        consider(level2)           # channel layout
-            except OSError:
-                pass
-    except OSError:
-        pass
+    for folder in walk_video_folders(base):
+        consider(folder)
+    return index
+
+
+def index_transcribed(base):
+    """Index every folder that already holds a transcript, by video id.
+
+    The resume index for a --transcript run. It accepts both statuses that can
+    leave a transcript behind: "TRANSCRIPT" from an earlier transcript-only run,
+    and "OK" from a full download, whose trans_ file is already written. Unlike
+    index_downloaded it does NOT want a video file - that absence is the whole
+    point of the mode, and a transcript run is finished with a video the moment
+    its trans_ file exists.
+    """
+    index = {}
+    for folder in walk_video_folders(base):
+        fields = read_info(folder)
+        if fields.get("Status") not in (TRANSCRIPT_STATUS, "OK"):
+            continue
+        vid = video_id_from_url(fields.get("Link", ""))
+        if vid and vid not in index and find_transcript_file(folder):
+            index[vid] = folder
     return index
 
 
@@ -1891,6 +1938,32 @@ def skip_finished(folder, url, bar=None):
     # Recorded last: the moment this record exists it is streamed, and whoever
     # reads it may open the folder straight away - so the backfill must be done.
     log_record(url=url, status="skipped", folder=rel(folder))
+
+
+def skip_transcribed(folder, url, bar=None):
+    """Report a video whose transcript is already on disk, and do nothing else.
+
+    Unlike skip_finished() this backfills nothing. A --transcript run was asked
+    for the transcript and the transcript is there; a thumbnail, a description
+    or fresh view counts would be network calls for files nobody asked for, and
+    on a folder left by a full download it would redo that download's work.
+    """
+    name = os.path.basename(folder.rstrip("/\\"))
+    if bar:
+        bar.done(f"SKIP  already transcribed  {name}")
+    else:
+        print(f"    Already transcribed -> {rel(folder)}/  (skipping)")
+    trans = find_transcript_file(folder)
+    log_record(url=url, status="skipped", mode="transcript", folder=rel(folder),
+               files={"transcript": os.path.basename(trans) if trans else None})
+
+
+def skip_existing(folder, url, bar=None):
+    """Report an already-done video, the way the current mode defines "done"."""
+    if TRANSCRIPT_ONLY:
+        skip_transcribed(folder, url, bar)
+    else:
+        skip_finished(folder, url, bar)
 
 
 def rel(path):
@@ -1980,7 +2053,7 @@ def download_one(url, index, total):
     #    repeated with a different tracking suffix is recognised. No network call.
     vid = video_id_from_url(url)
     if vid and vid in DONE_INDEX:
-        skip_finished(DONE_INDEX[vid], url, bar)
+        skip_existing(DONE_INDEX[vid], url, bar)
         log_debug("video_finish", stage="video", url=url, status="skipped",
                   reason="already_downloaded", folder=rel(DONE_INDEX[vid]))
         return "skip"
@@ -1997,7 +2070,7 @@ def download_one(url, index, total):
 
     # The id was unknown until now (unusual URL form) — re-check the index.
     if vid and vid in DONE_INDEX:
-        skip_finished(DONE_INDEX[vid], url, bar)
+        skip_existing(DONE_INDEX[vid], url, bar)
         log_debug("video_finish", stage="video", url=url, status="skipped",
                   reason="already_downloaded", folder=rel(DONE_INDEX[vid]))
         return "skip"
@@ -2033,6 +2106,11 @@ def download_one(url, index, total):
         log_debug("video_finish", stage="video", url=url, status=failure_status(err),
                   error=err, folder=rel(folder))
         return "gone" if is_permanent(err) else "fail"
+
+    # 2a) Transcript only: no media command runs at all, so everything below
+    #     this point - the format string, aria2c, ffprobe - is skipped.
+    if TRANSCRIPT_ONLY:
+        return transcript_only(folder, url, vid, title, info, bar)
 
     # 2) Download best 720p-1080p video+audio (merged mp4) and the thumbnail.
     #
@@ -2156,6 +2234,84 @@ def download_one(url, index, total):
     # Register it so a link repeated later in this same run is skipped too.
     if vid:
         DONE_INDEX[vid] = folder
+    return "ok"
+
+
+# ========================= transcript-only mode ===========================
+def transcript_only(folder, url, vid, title, info, bar):
+    """Write just the transcript for one video. Returns download_one's verdict.
+
+    This replaces the media download and the ffprobe quality check, so the run
+    loop, the final sweep and the counts need to know nothing about the mode.
+    Never returns "gone": a permanently dead video is already settled by the
+    shared metadata step, and a caption that fails is usually the caption
+    endpoint's own rate limit - exactly what the end-of-batch sweep is for.
+    """
+    started = time.monotonic()
+    trans, words = build_transcripts(folder, url, info)
+    elapsed = time.monotonic() - started
+
+    # A folder that already holds a video was made by a full download (one run
+    # with --no-subs, say). Its videoinfo.txt is edited line by line rather than
+    # replaced: a blanket Status: TRANSCRIPT would take a finished download out
+    # of the resume index, and Quality: NA would deny the quality it really has.
+    vfile = find_video_file(folder)
+
+    if not trans:
+        err = required_caption_error()
+        note(f"    ! {err}")
+        bar.done(f"FAIL  {err}")
+        if vfile:
+            update_info_transcripts(folder, None, None)
+        else:
+            write_info(folder, title, url, TRANSCRIPT_QUALITY, "ERROR",
+                       error=err, info=info)
+        log_record(url=url, title=title, status="failed", mode="transcript",
+                   error=err, folder=rel(folder))
+        log_debug("video_finish", stage="video", url=url, status="failed",
+                  result="fail", mode="transcript", error=err, folder=rel(folder),
+                  captions=False)
+        return "fail"
+
+    # SAVE_THUMBNAIL is forced off in this mode, so this writes only the
+    # description, out of metadata already fetched, and starts no subprocess.
+    thumb, desc = build_extras(folder, url, info)
+    size = folder_size(folder)
+    got = "".join(c for c, path in (("T", trans),
+                                    ("W", words and "not_found" not in words),
+                                    ("d", desc)) if path)
+    note(f"    Transcript done. {os.path.basename(trans)} "
+         f"[{human_size(size)} in {human_time(elapsed)}]")
+    bar.done(f"TEXT {human_size(size):>9} {human_time(elapsed):>9} "
+             f"            [{got}]  {title}")
+
+    if vfile:
+        update_info_transcripts(folder, trans, words)
+        update_info_extras(folder, thumb, desc)
+    else:
+        write_info(folder, title, url, TRANSCRIPT_QUALITY, TRANSCRIPT_STATUS,
+                   transcript=trans, words=words, thumbnail=thumb,
+                   description=desc, info=info)
+    # "ok" so the API counts it as done; the mode and the absent video are
+    # visible in the record itself rather than hidden behind a new status word.
+    log_record(url=url, title=title, status="ok", mode="transcript",
+               quality=TRANSCRIPT_QUALITY, folder=rel(folder),
+               channel=info.get("channel") or info.get("uploader"),
+               views=info.get("view_count"),
+               subscribers=info.get("channel_follower_count"),
+               uploaded=upload_time_pkt(info), category=category_or_na(info),
+               bytes=size, seconds=round(elapsed, 1),
+               files={"video": None,
+                      "transcript": os.path.basename(trans),
+                      "words": os.path.basename(words) if words else None,
+                      "thumbnail": None,
+                      "description": os.path.basename(desc) if desc else None})
+    log_debug("video_finish", stage="video", url=url, status="ok",
+              mode="transcript", folder=rel(folder), bytes=size,
+              seconds=round(elapsed, 1), captions=True)
+    TRANSCRIPT_COUNT[0] += 1
+    if vid:
+        DONE_INDEX[vid] = folder          # a repeat of this link now skips
     return "ok"
 
 
@@ -2726,6 +2882,9 @@ def parse_args(argv=None):
                    help="Do NOT build transcripts (transcripts are built by default).")
     p.add_argument("--sub-lang", default="en",
                    help="Transcript language code (default en).")
+    p.add_argument("--transcript", action="store_true",
+                   help="Transcript only: write trans_/words_ .txt and never "
+                        "download the video.")
     p.add_argument("--no-thumbnail", action="store_true",
                    help="Do NOT save the thumbnail (saved by default).")
     p.add_argument("--no-description", action="store_true",
@@ -2739,7 +2898,14 @@ def parse_args(argv=None):
     # Kept hidden for compatibility with older commands. The diagnostic trace
     # is now always written; no flag is needed.
     p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.transcript and args.no_subs:
+        # --transcript asks for a transcript and --no-subs says build none.
+        # Together the run would fetch metadata for every video and write
+        # nothing, so it is an error rather than a silent no-op.
+        p.error("--transcript and --no-subs contradict each other: "
+                "--transcript IS the transcript. Drop one.")
+    return args
 
 
 def use_utf8_output():
@@ -2782,7 +2948,7 @@ def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
-    global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS
+    global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY
 
     use_utf8_output()
     args = parse_args()
@@ -2798,7 +2964,10 @@ def main():
     DOWNLOAD_SUBS = not args.no_subs
     SUB_LANG      = args.sub_lang
     CHANNEL_MODE  = args.channel
-    SAVE_THUMBNAIL = not args.no_thumbnail
+    TRANSCRIPT_ONLY = args.transcript
+    # Nobody asking for a transcript wants a .jpg; the description is kept
+    # because it is written from metadata already fetched and costs no request.
+    SAVE_THUMBNAIL = not args.no_thumbnail and not TRANSCRIPT_ONLY
     SAVE_DESCRIPTION = not args.no_description
     VERBOSE       = args.verbose
     MIN_VIEWS     = args.views
@@ -2817,6 +2986,8 @@ def main():
     print(f"  Speed   : {'aria2c, 16 connections' if ARIA2C else 'built-in (install aria2c for a big speedup)'}")
     print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found - some videos may fail with 403'}")
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
+    if TRANSCRIPT_ONLY:
+        print("  Output  : transcript only - no video is downloaded")
     if MIN_VIEWS or LIMIT or DAYS:
         print(f"  Channels: {f'>= {MIN_VIEWS:,} views' if MIN_VIEWS else 'every video'}"
               f"{f', newest {LIMIT} each' if LIMIT else ''}"
@@ -2903,7 +3074,10 @@ def main():
 
     # Resume: one scan of what is already finished (either layout), keyed by
     # video id. Everything after this is a dictionary lookup.
-    DONE_INDEX = index_downloaded(DOWNLOAD_DIR)
+    # Each mode has its own idea of "already done": a transcript run is finished
+    # with a video once its trans_ file exists, with or without the video file.
+    DONE_INDEX = (index_transcribed(DOWNLOAD_DIR) if TRANSCRIPT_ONLY
+                  else index_downloaded(DOWNLOAD_DIR))
     if DONE_INDEX:
         print(f"  Resuming: {len(DONE_INDEX)} video(s) already downloaded here.")
 
@@ -2986,7 +3160,8 @@ def main():
 
     print("\n" + "=" * 60)
     done = counts["ok"] + counts["skip"] + len(failed) + len(gone)
-    print(f"  Summary: {counts['ok']} downloaded, {counts['skip']} skipped "
+    made = "transcribed" if TRANSCRIPT_ONLY else "downloaded"
+    print(f"  Summary: {counts['ok']} {made}, {counts['skip']} skipped "
           f"(already done), {len(failed) + len(gone)} failed  (of "
           f"{done if stopped else total} links"
           f"{f'; stopped early, {total - done} not reached' if stopped else ''}).")
@@ -3027,7 +3202,9 @@ def main():
         "planned_downloads": len(pending),
         "selected_downloads": selected_downloads,
         "already_downloaded": already_downloaded,
-        "downloaded": counts["ok"],
+        "mode": "transcript" if TRANSCRIPT_ONLY else "download",
+        "downloaded": 0 if TRANSCRIPT_ONLY else counts["ok"],
+        "transcripts": TRANSCRIPT_COUNT[0],
         "skipped": counts["skip"],
         "failed": len(failed) + len(gone)
                   + sum(1 for r in LOG_RECORDS if r.get("status") == "channel_failed"),

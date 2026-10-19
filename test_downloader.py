@@ -45,7 +45,8 @@ class PlatformCase:
         self._saved = (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
                        d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
                        d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
-                       d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE)
+                       d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE,
+                       d.TRANSCRIPT_ONLY)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -56,13 +57,90 @@ class PlatformCase:
         d.MIN_VIEWS = 0
         d.LIMIT = 0
         d.SKIP_IDS = set()
+        d.TRANSCRIPT_ONLY = False
         d.skipped_by_list[0] = 0
+        d.TRANSCRIPT_COUNT[0] = 0
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
          d.SUB_LANG, d.DOWNLOAD_SUBS, d.DOWNLOAD_DIR,
          d.SAVE_THUMBNAIL, d.SAVE_DESCRIPTION,
-         d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE) = self._saved
+         d.MIN_VIEWS, d.LIMIT, d.SKIP_IDS, d.CHANNEL_PAGE,
+         d.TRANSCRIPT_ONLY) = self._saved
+
+    # ----------------------------------------------------- transcript-only
+    def _folder(self, base, name, url, status="OK", video=True, transcript=True):
+        """A video folder on disk, as one of the resume indexes would find it."""
+        folder = os.path.join(base, name)
+        os.makedirs(folder, exist_ok=True)
+        if video:
+            with open(os.path.join(folder, f"{name}.mp4"), "w") as f:
+                f.write("x")
+        if transcript:
+            with open(os.path.join(folder, f"trans_{name}.txt"), "w") as f:
+                f.write("[00:00:00] hello\n")
+        d.write_info(folder, name, url, "1080p", status)
+        return folder
+
+    def test_walk_video_folders_covers_both_layouts(self):
+        with tempfile.TemporaryDirectory() as base:
+            flat = os.path.join(base, "Flat Video")
+            nested = os.path.join(base, "A Channel", "Nested Video")
+            os.makedirs(flat); os.makedirs(nested)
+            found = list(d.walk_video_folders(base))
+            self.assertIn(flat, found)
+            self.assertIn(nested, found)
+            self.assertIn(os.path.join(base, "A Channel"), found,
+                          "the channel folder itself is walked too")
+            self.assertLess(found.index(os.path.join(base, "A Channel")),
+                            found.index(nested),
+                            "a parent must be yielded before its children")
+
+    def test_walk_video_folders_survives_an_unreadable_base(self):
+        self.assertEqual(list(d.walk_video_folders("/nope/not/here")), [])
+
+    def test_transcript_index_takes_both_statuses(self):
+        with tempfile.TemporaryDirectory() as base:
+            # left by an earlier --transcript run: no video file at all
+            self._folder(base, "From Transcript Run",
+                         "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                         status=d.TRANSCRIPT_STATUS, video=False)
+            # left by a full download: its trans_ file is already written
+            self._folder(base, "From Full Download",
+                         "https://www.youtube.com/watch?v=bbbbbbbbbbb")
+            index = d.index_transcribed(base)
+            self.assertIn("aaaaaaaaaaa", index)
+            self.assertIn("bbbbbbbbbbb", index,
+                          "a full download already has the transcript")
+
+    def test_transcript_index_wants_the_transcript_not_the_video(self):
+        with tempfile.TemporaryDirectory() as base:
+            self._folder(base, "Video No Transcript",
+                         "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                         transcript=False)
+            self.assertEqual(d.index_transcribed(base), {},
+                             "a video without a transcript is not transcribed")
+
+    def test_transcript_folder_never_counts_as_downloaded(self):
+        # The load-bearing property: asking for the video later must still get
+        # it, so a transcript-only folder must stay out of index_downloaded.
+        with tempfile.TemporaryDirectory() as base:
+            self._folder(base, "Transcript Only",
+                         "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                         status=d.TRANSCRIPT_STATUS, video=False)
+            self.assertEqual(d.index_downloaded(base), {})
+            self.assertIn("aaaaaaaaaaa", d.index_transcribed(base))
+
+    def test_transcript_contradicts_no_subs(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                d.parse_args(["/tmp", "--transcript", "--no-subs"])
+        self.assertEqual(caught.exception.code, 2,
+                         "argparse must reject the pair, not silently do nothing")
+
+    def test_transcript_flag_defaults_off(self):
+        self.assertFalse(d.parse_args(["/tmp"]).transcript)
+        self.assertTrue(d.parse_args(["/tmp", "--transcript"]).transcript)
 
     # ---------------------------------------------------------------- naming
     def test_forbidden_characters_replaced(self):
