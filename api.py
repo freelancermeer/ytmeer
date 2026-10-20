@@ -876,6 +876,8 @@ def shutdown_jobs(timeout=15):
 # channel preview then quietly listed only that week.
 ROUTE_GLOBALS = {
     "MIN_VIEWS": 0, "LIMIT": 0, "DAYS": 0, "THIS_MONTH": False, "SKIP_IDS": set(),
+    # The counters, so one request cannot report the previous one's numbers.
+    "SEARCH_FOUND": [0], "SEARCH_COUNTS": [{}], "skipped_by_list": [0],
     "SEARCH_QUERY": None, "IN_CHANNEL": None, "SEARCH_COUNT": None,
     "SORT_BY": "relevance", "SEARCH_MATCH": "related", "RESOLVE_DATES": True,
     # 20 x ~2.1s is about 42s, which with the flat scan stays under the ~60s
@@ -1091,6 +1093,11 @@ def video_comments(url, limit=100, replies=False, sort="top"):
 
 
 def channel_info(channel, shorts=False, min_duration=180):
+    # Note: the wall is SEARCH_DEADLINE, which the downloader reads in
+    # resolve_dates and take_in_window. A listing's own requests are bounded by
+    # channel_page's 300s subprocess timeout, so the route cannot hang
+    # indefinitely, but a very large channel can still outlast ROUTE_SECONDS -
+    # see CHANNEL_VIDEO_CAP in the answer's listing_capped.
     """One channel's details: counted from its own long videos."""
     url = _lines(channel).strip().split("\n")[0].strip()
     if not url:
@@ -1111,7 +1118,7 @@ def resolve_link(url):
     link = _lines(url).strip().split("\n")[0].strip()
     if not link:
         raise ValueError("url is required")
-    with downloader_globals():
+    with downloader_globals(SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         found, err = downloader.resolve_channel(link)
     if err:
         raise LookupFailed(err)
@@ -1127,21 +1134,24 @@ def channel_video_rows(channel, limit=0, shorts=False, min_duration=180):
     if not downloader.is_channel_url(url):
         raise BadField("channel", f"not a channel link: {url}")
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
-                            MIN_DURATION=_floor_seconds(min_duration)):
+                            MIN_DURATION=_floor_seconds(min_duration),
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         answer, err = downloader.channel_videos(url, limit=max(0, int(limit or 0)))
     if err:
         raise LookupFailed(err)
     return answer
 
 
-def channel_playlist_rows(channel):
-    """A channel's playlists."""
+def channel_playlist_rows(channel, shorts=False, min_duration=180):
+    """A channel's playlists, each split into long videos and short-form."""
     url = _lines(channel).strip().split("\n")[0].strip()
     if not url:
         raise ValueError("channel is required")
     if not downloader.is_channel_url(url):
         raise BadField("channel", f"not a channel link: {url}")
-    with downloader_globals(SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
+    with downloader_globals(INCLUDE_SHORTS=bool(shorts),
+                            MIN_DURATION=_floor_seconds(min_duration),
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         answer, err = downloader.channel_playlists(url)
     if err and not answer:
         raise LookupFailed(err)
@@ -1156,8 +1166,18 @@ def similar_to(url, limit=0, shorts=False, min_duration=180, dates=True):
                             RESOLVE_DATES=bool(dates),
                             SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         answer, err = downloader.similar_videos(link, count=max(0, int(limit or 0)))
+        tally = dict(downloader.SEARCH_COUNTS[0] or {})
     if err:
         raise LookupFailed(err)
+    # The same date accounting /api/search reports: without it, "published":
+    # null on every row looked like YouTube publishing no dates rather than
+    # this route declining to pay for them.
+    answer["dates_fetched"] = tally.get("dated", 0)
+    answer["dates_missing"] = tally.get("undated", 0)
+    answer["date_capped"] = bool(tally.get("date_capped"))
+    answer["filtered_out"] = {k: v for k, v in tally.items()
+                              if k in ("short", "nolength", "views", "live",
+                                       "skipped") and v}
     return answer
 
 
@@ -1515,12 +1535,23 @@ def build_app():
             raise HTTPException(503, str(e))
 
     @app.get("/api/channel/playlists", tags=["lookups"], dependencies=keyed)
-    def get_channel_playlists(channel: str = Query(..., description="A channel link.")):
-        """A channel's playlists. One listing names them all; the video count
-        needs a request per playlist, so it is filled in for the first few and
-        is null after - capped says when."""
+    def get_channel_playlists(channel: str = Query(..., description="A channel link."),
+                              shorts: bool = Query(False, description="Count "
+                                                   "short-form as long videos."),
+                              min_duration: int = Query(180, ge=0,
+                                                        le=INT_MAX["min_duration"],
+                                                        description="Length "
+                                                        "floor, seconds.")):
+        """A channel's playlists, each split into long videos and short-form.
+
+        One listing names them all; the split needs a request per playlist, so
+        it is filled in for the first 25 - count_capped says when there were
+        more, listing_capped when the list itself was cut at 200, and
+        count_failures how many probes YouTube refused. `videos` is yt-dlp's
+        own total and counts Shorts; `long_videos` and `shorts` are counted
+        here."""
         try:
-            return channel_playlist_rows(channel)
+            return channel_playlist_rows(channel, shorts, min_duration)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
         except LookupFailed as e:

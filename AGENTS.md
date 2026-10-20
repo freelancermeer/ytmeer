@@ -26,7 +26,7 @@ Two deliberate exemptions, and only two:
 
 | Exemption | Why |
 |---|---|
-| A link to a channel's **`/shorts` tab** | Asking for that tab is asking for Shorts. A Shorts listing also reports no duration at all, so the floor would drop every entry. |
+| A link to a channel's **`/shorts` tab** | Asking for that tab is asking for Shorts. A Shorts listing also reports no duration at all, so the floor would drop every entry. This holds for the channel listings **and** for `--details` / `--channel-videos`, which report `shorts_tab: true` and `metrics_over: "every video"` when they take it. |
 | A **video link you named yourself** in `links.txt` | Naming a video is asking for that video. |
 
 To turn the floor off: `--shorts`, or `--min-duration 0`. Over the API:
@@ -100,7 +100,19 @@ Reports run **before** channel expansion, so a channel link stays a channel
 rather than becoming its 200 videos. `--details` dispatches on the link: a video
 link gets the video report, a channel link the channel report.
 
-`--limit N` applies to `--channel-videos` and `--similar`.
+**A report refuses the flags it cannot honour** rather than accepting and
+ignoring them: `--search`, `--days`, `--this-month`, `--views` and
+`--in-channel` are all errors with a report. What each one does use:
+
+| Report | Uses |
+|---|---|
+| `--details` | `--shorts` / `--min-duration` |
+| `--resolve` | nothing but the links |
+| `--channel-videos` | `--limit`, `--shorts` / `--min-duration`, `skip.txt` |
+| `--playlists` | `--shorts` / `--min-duration` |
+| `--similar` | `--limit`, `--shorts` / `--min-duration`, `skip.txt`, `--match`, `--sort`, `--search-count`, `--no-dates` |
+
+The run prints this as a `Uses :` line so there is no guessing.
 
 ### 3.2 Every flag
 
@@ -127,7 +139,7 @@ link gets the video report, a channel link the channel report.
 | `--search QUERY` | — | Search YouTube; the results become the worklist |
 | `--match related\|exact` | `related` | How wide a net — **§5.1** |
 | `--sort ORDER` | `relevance` | `relevance`, `views`/`popularity`, `least-viewed`, `date`, `oldest` |
-| `--search-count N` | *by route* | 150 normally, 40 for a date sort |
+| `--search-count N` | *by route* | 150 normally, 40 for a date sort. **Over the API this query parameter is `count`** (the job field is `search_count`) |
 | `--in-channel URL` | — | Search one channel's own search tab |
 | `--no-dates` | off | Skip publish dates — **§5.3** |
 
@@ -196,7 +208,13 @@ in-process request holds the engine; `401` bad or missing key.
 
 **One lookup, search or preview at a time.** They share the engine's module
 globals. A second gets `503` — retry, do not queue. Every request resets every
-global it can set, so nothing leaks between them. A route gives up after 120s.
+global it can set, so nothing leaks between them.
+
+Every route sets a **120s wall**, and the paid-per-video work honours it: date
+fetching and the window walk stop at it. A channel *listing* is bounded instead
+by its own 300s-per-request timeout and by `CHANNEL_VIDEO_CAP`, so a very large
+channel can outlast the wall — `listing_capped` in the answer says when only
+part of it was read.
 
 ### 4.2 Jobs — when the files are the point
 
@@ -212,8 +230,10 @@ each video appears as soon as its folder is complete. Files from
 `GET /api/jobs/{id}/files` and `/files/{path}` (Range works). Stop with
 `POST /api/jobs/{id}/stop`.
 
-Request fields mirror the flag names (§3.2) plus `links`, `skip`, `outdir`,
-`verbose`, `dates`. `links` and `search` are two different worklists — sending
+Request fields mirror the flag names (§3.2) with `_` for `-`, plus `links`,
+`skip`, `outdir`, `verbose`, `dates`. Two do not mirror: there is no job field
+for the report flags (a job downloads; use the lookup routes to report), and
+the **lookup** routes name their scan depth `count` rather than `search_count`. `links` and `search` are two different worklists — sending
 both is refused. `this_month`, `match`, `search_count` and `dates` mean nothing
 without `search` and are refused without it.
 
@@ -275,7 +295,8 @@ never as an empty result.
 | Channel details (278 videos) | ~23s |
 | Channel videos (278 listed) | ~11s |
 | Playlists (5, with counts) | ~8s |
-| Similar videos | ~24s |
+| Similar videos (no dates) | ~24s |
+| Similar videos (with dates, 20 kept) | ~65s |
 | Transcript | ~9s |
 | 100 comments | ~7s (~19s with replies) |
 | Channel listing | one request per 100 videos |
@@ -297,11 +318,21 @@ transcript: only an auto-generated track has word timings.
 
 Counted from the channel's own **long** videos, not estimated:
 
-`videos_listed`, `long_videos`, `shorts`, `metrics_over`, `listing_capped`,
-`views_listed`, `average_views`, `median_views`, `best_views`,
-`average_length`, `average_length_text`, `uploads_per_week`, `first_upload`,
-`last_upload`, `outliers` (every long video at **2x the channel average or
-better**, with its multiplier), `outlier_count`, `listing_error`.
+`videos_listed`, `long_videos`, `shorts`, `unknown_length`, `excluded`,
+`metrics_over`, `shorts_tab`, `listing_capped`, `views_listed`,
+`average_views`, `median_views`, `best_views`, `average_length`,
+`average_length_text`, `uploads_per_week`, `first_upload`, `last_upload`,
+`date_error`, `outliers` (**every** long video at 2x the channel average or
+better, with its multiplier — the printer shows ten, the data carries them
+all), `outlier_count`, `listing_error`.
+
+`shorts` is what was *measured* under the floor; `unknown_length` is what had
+no duration to measure — a livestream or a premiere, not short-form — and
+`excluded` is the two together. `median_views` is the true median (the two
+middles averaged on an even count). The first and last upload are dated from
+the **long** videos, the same population every other number uses, and
+`date_error` says when that fetch failed rather than leaving the three date
+fields silently null.
 
 Plus `id`, `name`, `handle`, `link`, `subscribers`, `verified`, `description`,
 `tags`, `availability` — and `created`, `lifetime_views`, `country`, which are
@@ -316,13 +347,24 @@ the averages then describe only that slice.
 
 `videos` (each with `rank`, `id`, `link`, `title`, `views`, `duration`,
 `duration_text`, `outlier`), `listed`, `long_videos`, `short_form_dropped`,
-`average_views`, `listing_error`. No publish dates — see §5.3.
+`excluded_by_skip_list`, `shorts_tab`, `listing_capped`, `average_views`,
+`listing_error`. No publish dates — see §5.3.
+
+`average_views` is over every long video **before** `limit`, so `outlier`
+compares a video with its channel. Past `listing_capped` it describes only the
+slice that was read, and so does every ratio built on it.
 
 ### 6.4 `GET /api/channel/playlists`
 
-`playlists` (each `id`, `title`, `link`, `videos`), `counted`, `capped`.
-One listing names them all; the video count needs a request per playlist, so it
-is filled in for the first **25** and is `null` after — `capped` says when.
+`playlists` (each `id`, `title`, `link`, `videos`, `long_videos`, `shorts`),
+`counted`, `count_capped`, `count_failures`, `listing_capped`.
+
+One listing names them all; the split needs a request per playlist, so it is
+filled in for the first **25** and is `null` after. **`videos` is yt-dlp's own
+total and counts Shorts**; `long_videos` and `shorts` are counted here, which
+is the only honest answer for a Shorts compilation. `count_capped` means there
+were more than 25, `listing_capped` that the list itself was cut at 200, and
+`count_failures` how many probes YouTube refused.
 
 ### 6.5 `GET /api/resolve`
 
@@ -330,12 +372,22 @@ is filled in for the first **25** and is `null` after — `capped` says when.
 link"` or `"video link"`). Takes a handle, any channel tab, or a video link.
 Use it to get the one channel id everything else keys off.
 
+If no channel id can be found it is a `502`, not a `200` full of nulls.
+A YouTube link that is neither a video nor a channel — its uploads playlist
+(`playlist?list=UU...`), a bare legacy vanity URL, a `/results` page — is
+**refused everywhere**, including in `links.txt`, rather than treated as a
+named video.
+
 ### 6.6 `GET /api/similar`
 
 `id`, `link`, `title`, `views`, `query`, `scanned`, `found`, `similar` (the same
-row shape as a search result). YouTube's related feed is not reachable through
-yt-dlp, so this **searches for the video's own title** and leaves the video
-itself out.
+row shape as a search result), plus `dates_fetched`, `dates_missing`,
+`date_capped` and `filtered_out` (per-reason counts).
+
+YouTube's related feed is not reachable through yt-dlp, so this **searches for
+the video's own title** and leaves the video itself out. It needs a **video**
+link — a channel or playlist link is refused rather than answered with that
+channel's own uploads. `skip.txt` still applies.
 
 ### 6.7 `GET /api/search`
 

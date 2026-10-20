@@ -227,6 +227,55 @@ not report it — some channels hide their subscriber count — so anything read
 the file finds the same shape each time. Videos downloaded before these existed
 pick the lines up on the next run.
 
+## Reports: ask, do not download
+
+Five flags answer a question and stop. **Nothing is downloaded and nothing is
+written** — not a folder, not a file.
+
+```bash
+R="/path/to/folder"          # holds links.txt
+
+python3 downloader.py "$R" --details          # a video's, or a channel's, details
+python3 downloader.py "$R" --resolve          # the channel behind any link
+python3 downloader.py "$R" --channel-videos   # a channel's long videos, each vs its average
+python3 downloader.py "$R" --playlists        # a channel's playlists, long vs short
+python3 downloader.py "$R" --similar          # long videos like this one
+```
+
+`--details` reads the link: a video link gets the video report, a channel link
+the channel report. Put many links in `links.txt` and the report runs over all
+of them — batch needs no flag, and one bad link does not stop the rest.
+
+**One report at a time**, and never with `--transcript` or `--extract-comments`
+(those exist to write files). A report also **refuses** the flags it cannot
+honour — `--search`, `--days`, `--this-month`, `--views`, `--in-channel` — so
+nothing is accepted and then quietly ignored. The run prints a `Uses :` line
+naming what it does honour.
+
+### What a channel report tells you
+
+Counted from the channel's own **long** videos, never estimated:
+
+```
+Channel:        CrownShock Chronicles    Created:      Dec 29, 2025
+Subscribers:    25,300                   First upload: 16 Jan 2026
+Country:        United Kingdom           Last upload:  20 Oct 2026
+Videos read:    278                      Uploads/week: 7.04
+Long / short:   276 long, 2 short        Average:      25,806
+Median views:   6,100                    Best video:   855,000
+Outliers:       30 video(s) at 2x the channel average or better
+```
+
+**Outlier** is just `views ÷ the channel's own average`. 2x means twice what
+that channel normally gets — nothing global. The average is taken over every
+long video before any `--limit`, so the comparison is always video-against-its-
+channel.
+
+`created`, `lifetime_views` and `country` are scraped from the About page,
+because yt-dlp exposes none of them. That is the only scraping here and it is
+strict best effort: if it fails those three come back empty and the rest of the
+report stands.
+
 ## Transcript only
 
 `--transcript` makes the transcript the product instead of a by-product: the

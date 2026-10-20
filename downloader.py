@@ -366,7 +366,13 @@ STATS = {"bytes": 0, "seconds": 0.0}
 
 
 def read_links(path: str):
-    """Return a list of non-empty, non-comment links from the links file."""
+    """The non-empty, non-comment links from the links file.
+
+    A link nothing can act on is dropped here, with a word about it, so every
+    path gets the same answer - the reports run before expand_sources and would
+    otherwise have taken a playlist URL to the metadata lookup, where it spent
+    three 120-second timeouts before giving up.
+    """
     if not os.path.exists(path):
         print(f"ERROR: links file not found: {path}")
         sys.exit(1)
@@ -376,7 +382,7 @@ def read_links(path: str):
             line = line.strip()
             if line and not line.startswith("#"):
                 links.append(line)
-    return links
+    return drop_unusable(links)
 
 
 # ============================== output =====================================
@@ -541,6 +547,42 @@ def note(text):
         print(text)
 
 
+def settings_snapshot():
+    """Every setting a flag can change, as one flat dict.
+
+    The trace's first line is this, so reading a log never requires guessing
+    how the run was invoked. Built from the globals rather than from the parsed
+    arguments, so it reports what the run is ACTUALLY using - including
+    anything main() adjusted after parsing, and anything the REST API set with
+    no command line at all.
+    """
+    return {
+        "directory": DOWNLOAD_DIR, "links_file": LINKS_FILE,
+        "skip_file": SKIP_FILE, "skip_ids": len(SKIP_IDS),
+        "cookies_present": os.path.exists(COOKIES_FILE),
+        "mode": ("report:" + REPORT if REPORT else
+                 "transcript" if TRANSCRIPT_ONLY else "download"),
+        "channel_layout": CHANNEL_MODE,
+        "min_height": MIN_HEIGHT, "max_height": MAX_HEIGHT,
+        "transcripts": DOWNLOAD_SUBS, "sub_lang": SUB_LANG,
+        "thumbnail": SAVE_THUMBNAIL, "description": SAVE_DESCRIPTION,
+        "extract_comments": EXTRACT_COMMENTS, "comment_limit": COMMENT_LIMIT,
+        "comment_replies": COMMENT_REPLIES, "comment_sort": COMMENT_SORT,
+        "min_views": MIN_VIEWS, "limit": LIMIT, "days": DAYS,
+        "this_month": THIS_MONTH,
+        "min_duration": MIN_DURATION, "include_shorts": INCLUDE_SHORTS,
+        "duration_floor": duration_floor(),
+        "search": redact_text(SEARCH_QUERY) if SEARCH_QUERY else None,
+        "in_channel": redact_url(IN_CHANNEL) if IN_CHANNEL else None,
+        "search_match": SEARCH_MATCH, "search_count": SEARCH_COUNT,
+        "search_depth": search_depth(needs_dated_route()) if SEARCH_QUERY else None,
+        "sort_by": SORT_BY, "dated_route": needs_dated_route(),
+        "resolve_dates": RESOLVE_DATES, "date_resolve_max": DATE_RESOLVE_MAX,
+        "channel_video_cap": CHANNEL_VIDEO_CAP,
+        "verbose": VERBOSE, "search_deadline": SEARCH_DEADLINE is not None,
+    }
+
+
 def log_record(**fields):
     """Keep one structured record for the JSON log, and stream it as a line.
 
@@ -603,6 +645,28 @@ def write_empty_summary(stopped=False, excluded=0):
         "failed": failed_before_download(),
         **mode_fields(),
         "stopped_early": stopped, "bytes": 0, "size": human_size(0),
+        "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
+        "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
+    })
+
+
+def write_report_summary(report, links, reported):
+    """The JSON log for a report run.
+
+    write_empty_summary() describes a DOWNLOAD that found nothing to do, which
+    is a different thing: it reported "downloaded: 0, failed: 0" for a report
+    where every link had failed, and nothing in it said a report had run at all.
+    """
+    write_json_log({
+        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "run_type": "report",
+        "report": report,
+        "links": links,
+        "reported": reported,
+        "failed": links - reported,
+        "downloaded": 0, "skipped": 0,
+        **mode_fields(),
+        "bytes": 0, "size": human_size(0),
         "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
         "debug_log": os.path.basename(LOG_DEBUG[0]) if LOG_DEBUG[0] else None,
     })
@@ -3636,9 +3700,13 @@ def details_of(info):
         "comment_count": info.get("comment_count"),
         "duration": seconds,
         "duration_text": human_time(seconds) if isinstance(seconds, (int, float)) else None,
-        "uploaded": upload_time_pkt(info),
+        # null, never "NA": this is data, and the manual promises a caller can
+        # tell "not published" from a value. The "NA" spellings belong to
+        # videoinfo.txt, which is a text file for a person to read.
+        "uploaded": upload_time_pkt(info) if info.get("timestamp")
+                    or info.get("upload_date") else None,
         "upload_epoch": info.get("timestamp"),
-        "category": category_or_na(info),
+        "category": (category_or_na(info) if info.get("categories") else None),
         "categories": list(info.get("categories") or []),
         "tags": list(info.get("tags") or []),
         "thumbnail": info.get("thumbnail"),
@@ -3745,13 +3813,18 @@ def channel_video_list(url, cap=None):
     cap = CHANNEL_VIDEO_CAP if cap is None else cap
     tab = channel_videos_url(url)
     entries, start = [], 1
-    while len(entries) < cap:
+    # One past the cap, so "capped" can mean "there were more" rather than
+    # "we happened to stop on the round number".
+    while len(entries) <= cap:
         data, err = channel_page(tab, start, start + CHANNEL_PAGE - 1)
         if err:
             return entries, err
-        page = [e for e in (data.get("entries") or []) if e and e.get("id")]
-        entries.extend(page)
-        if len(page) < CHANNEL_PAGE:
+        returned = data.get("entries") or []
+        entries.extend(e for e in returned if e and e.get("id"))
+        # The RAW count decides whether there is another page. Judging it by
+        # the filtered count stopped the whole channel at one page as soon as
+        # a single entry came back without an id.
+        if len(returned) < CHANNEL_PAGE:
             break
         start += CHANNEL_PAGE
     return entries[:cap], None
@@ -3781,7 +3854,13 @@ def channel_details(url):
     # both formats has two completely different view distributions, and an
     # average blended across them describes neither - so the Shorts are
     # counted and set aside rather than mixed in.
-    long_videos, shorts_dropped = long_only(entries)
+    why = {}
+    # A link to the /shorts tab is a request FOR Shorts - the same exemption
+    # the channel listings make. Without it, asking about that tab filtered
+    # every video out and reported an empty channel.
+    asked_for_shorts = is_shorts_tab(tab)
+    long_videos, shorts_dropped = long_only(entries, counts=why,
+                                            allow_short=asked_for_shorts)
     views = [e.get("view_count") for e in long_videos
              if isinstance(e.get("view_count"), (int, float))]
     lengths = [as_seconds(e.get("duration")) for e in long_videos]
@@ -3798,11 +3877,22 @@ def channel_details(url):
          and e["view_count"] >= average * 2),
         key=lambda v: -v["outlier"])
 
-    newest, oldest = entries[0] if entries else {}, entries[-1] if entries else {}
+    # The SAME population as every other number here. Taken from the raw
+    # listing, a channel whose newest and oldest uploads were Shorts reported a
+    # Shorts-to-Shorts span and then divided the long-video count by it - 0.03
+    # uploads a week where the real answer was 0.75.
+    newest, oldest = ((long_videos[0], long_videos[-1]) if long_videos
+                      else ({}, {}))
     edges = [{"id": newest.get("id"), "url": watch_url(newest.get("id")), "epoch": None},
              {"id": oldest.get("id"), "url": watch_url(oldest.get("id")), "epoch": None}]
-    if entries:
-        resolve_dates(edges)
+    date_error = None
+    if long_videos:
+        # One video is both edges; asking twice would pay for the same date
+        # twice and tell us nothing more.
+        wanted = edges[:1] if len(long_videos) == 1 else edges
+        _dated, date_error = resolve_dates(wanted, deadline=SEARCH_DEADLINE)
+        if len(long_videos) == 1:
+            edges[1]["epoch"] = edges[0]["epoch"]
     last_epoch, first_epoch = edges[0]["epoch"], edges[1]["epoch"]
     span_days = ((last_epoch - first_epoch) / 86400.0
                  if last_epoch and first_epoch and last_epoch > first_epoch else None)
@@ -3825,20 +3915,31 @@ def channel_details(url):
         "videos_listed": len(entries),
         "listing_capped": len(entries) >= CHANNEL_VIDEO_CAP,
         "long_videos": len(long_videos),
-        "shorts": shorts_dropped,
-        "metrics_over": "long videos only" if duration_floor() else "every video",
+        "shorts": why.get("short", 0),
+        # Kept apart from the Shorts: a livestream or a premiere whose length
+        # the listing did not give is not short-form, it is unmeasured.
+        "unknown_length": why.get("nolength", 0),
+        "excluded": shorts_dropped,
+        "metrics_over": ("every video" if asked_for_shorts or not duration_floor()
+                         else "long videos only"),
+        "shorts_tab": asked_for_shorts,
         "views_listed": sum(views) if views else None,
         "average_views": int(average) if average else None,
-        "median_views": int(sorted(views)[len(views) // 2]) if views else None,
+        "median_views": int(median_of(views)) if views else None,
         "best_views": max(views) if views else None,
         "average_length": int(sum(lengths) / len(lengths)) if lengths else None,
         "average_length_text": (human_time(sum(lengths) / len(lengths))
                                 if lengths else None),
         "first_upload": upload_time_pkt({"timestamp": first_epoch}) if first_epoch else None,
         "last_upload": upload_time_pkt({"timestamp": last_epoch}) if last_epoch else None,
+        # Why those three are null, when they are: a fetch that FAILED is a
+        # different fact from a channel whose dates YouTube will not give.
+        "date_error": date_error,
         "uploads_per_week": (round(len(long_videos) / (span_days / 7), 2)
                              if span_days and span_days >= 7 else None),
-        "outliers": outliers[:10],
+        # Every one of them, not a top ten: this is data, and the printer is
+        # where a screenful is decided.
+        "outliers": outliers,
         "outlier_count": len(outliers),
         "listing_error": list_err,
     }
@@ -3849,20 +3950,51 @@ def channel_details(url):
     return details, None
 
 
-def long_only(entries):
+def median_of(numbers):
+    """The middle value, averaging the two middles on an even count.
+
+    sorted(x)[len//2] is the upper middle, which on two videos returns the
+    better one - so "median" could come back equal to "best".
+    """
+    ordered = sorted(numbers)
+    middle = len(ordered) // 2
+    if not ordered:
+        return 0
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def long_only(entries, counts=None, allow_short=False):
     """The entries that clear the length floor, and how many were dropped.
 
     This tool is for long-form video. Everything that counts, ranks or reports
     a channel's videos goes through here first, so a Shorts-heavy channel's
-    numbers are never a blend of two different formats - and the count of what
-    went is kept, so the report can say so.
+    numbers are never a blend of two formats.
+
+    Pass a dict as `counts` to learn WHY each one went: "short" was measured
+    under the floor, "nolength" had no duration to measure. The two are not the
+    same fact, and calling a three-hour livestream of unknown length "a Short"
+    is how a report ends up lying about its own filtering.
     """
-    floor = duration_floor()
+    floor = 0 if allow_short else duration_floor()
     if not floor:
         return list(entries), 0
-    kept = [e for e in entries
-            if (as_seconds(e.get("duration")) or 0) >= floor]
-    return kept, len(entries) - len(kept)
+    kept, dropped = [], 0
+    for entry in entries:
+        seconds = as_seconds(entry.get("duration"))
+        if seconds is None:
+            dropped += 1
+            if counts is not None:
+                counts["nolength"] = counts.get("nolength", 0) + 1
+            continue
+        if seconds < floor:
+            dropped += 1
+            if counts is not None:
+                counts["short"] = counts.get("short", 0) + 1
+            continue
+        kept.append(entry)
+    return kept, dropped
 
 
 def resolve_channel(url):
@@ -3894,7 +4026,12 @@ def resolve_channel(url):
                  "link": info.get("channel_url") or info.get("uploader_url"),
                  "subscribers": info.get("channel_follower_count"),
                  "from": "video link"}
-    found["videos_tab"] = (f"{found['link']}/videos" if found["link"] else None)
+    if not found["id"]:
+        # Nulls all the way down are not an answer; they used to arrive as a
+        # 200 that looked like one.
+        return None, (f"could not find a channel behind {url} - the listing "
+                      f"carried no channel id")
+    found["videos_tab"] = channel_videos_url(found["link"]) if found["link"] else None
     log_debug("resolve", stage="channel", url=url, channel_id=found["id"],
               source=found["from"])
     return found, None
@@ -3913,7 +4050,13 @@ def channel_videos(url, limit=0):
     entries, err = channel_video_list(url)
     if not entries and err:
         return None, err
-    kept, dropped = long_only(entries)
+    asked_for_shorts = is_shorts_tab(channel_videos_url(url))
+    kept, dropped = long_only(entries, allow_short=asked_for_shorts)
+    excluded = 0
+    if SKIP_IDS:
+        before = len(kept)
+        kept = [e for e in kept if e.get("id") not in SKIP_IDS]
+        excluded = before - len(kept)
     # The average is taken over EVERY long video, before any --limit. The
     # "vs average" column exists to compare a video with its channel; computed
     # after the cut it would compare the shown videos with each other, which
@@ -3937,11 +4080,18 @@ def channel_videos(url, limit=0):
             "outlier": (round(count / average, 2)
                         if average and isinstance(count, (int, float)) else None),
         })
+    capped = len(entries) >= CHANNEL_VIDEO_CAP
     log_debug("channel_videos", stage="channel", url=url, shown=len(rows),
               long_videos=long_count, short_form_dropped=dropped,
+              listing_capped=capped,
               average_views=int(average) if average else None, listing_error=err)
     return {"videos": rows, "listed": len(entries), "long_videos": long_count,
             "short_form_dropped": dropped,
+            "excluded_by_skip_list": excluded,
+            "shorts_tab": asked_for_shorts,
+            # Past the cap the average - and so every ratio built on it -
+            # describes only the slice that was read.
+            "listing_capped": capped,
             "average_views": int(average) if average else None,
             "listing_error": err}, None
 
@@ -3962,31 +4112,58 @@ def channel_playlists(url, counts_for=None):
     data, err = channel_page(tab, 1, PLAYLIST_LIST_CAP)
     if not data:
         return None, err or "could not read that channel's playlists"
+    returned = data.get("entries") or []
     rows = []
-    for entry in (data.get("entries") or []):
+    for entry in returned:
         if not entry or not entry.get("id"):
             continue
         rows.append({"id": entry["id"], "title": entry.get("title"),
                      "link": f"https://www.youtube.com/playlist?list={entry['id']}",
-                     "videos": None})
+                     "videos": None, "long_videos": None, "shorts": None})
+    counted, failures = 0, 0
     for row in rows[:counts_for]:
-        page, _err = channel_page(row["link"], 1, 1)
-        if page:
-            row["videos"] = page.get("playlist_count")
+        # The playlist's own flat listing, which carries each entry's duration -
+        # so the long/short split is counted here rather than taking yt-dlp's
+        # playlist_count, which counts Shorts and says nothing about them. A
+        # Shorts compilation used to report "437 videos" with no mark at all.
+        page, page_err = channel_page(row["link"], 1, PLAYLIST_VIDEO_CAP)
+        if not page or page_err:
+            failures += 1
+            continue
+        items = [e for e in (page.get("entries") or []) if e and e.get("id")]
+        long_items, shorts = long_only(items)
+        row["videos"] = page.get("playlist_count") or len(items) or None
+        row["long_videos"] = len(long_items)
+        row["shorts"] = shorts
+        counted += 1
     log_debug("channel_playlists", stage="channel", url=tab, playlists=len(rows),
-              counted=min(len(rows), counts_for))
-    return {"playlists": rows, "counted": min(len(rows), counts_for),
-            "capped": len(rows) > counts_for, "error": err}, None
+              counted=counted, count_failures=failures,
+              listing_capped=len(returned) >= PLAYLIST_LIST_CAP)
+    return {"playlists": rows, "counted": counted,
+            # Two different caps, named apart: how many were COUNTED, and
+            # whether the LIST itself was cut short.
+            "count_capped": len(rows) > counts_for,
+            "count_failures": failures,
+            "listing_capped": len(returned) >= PLAYLIST_LIST_CAP,
+            "error": err}, None
 
 
 def similar_videos(url, count=0):
-    """(similar, error): long videos like this one.
+    """(similar, error): long videos like this one, for ONE video link.
 
     YouTube's own related feed is not reachable through yt-dlp, so this asks
     the same question the research does: it searches YouTube for this video's
     title and returns what comes back, which is exactly the near-match set
     --match related exists for. The video itself is left out.
     """
+    if is_channel_url(url):
+        # Searching for a channel's NAME is a different question, and used to
+        # come back as that channel's own uploads labelled "similar videos".
+        return None, ("similar needs a video link, not a channel: "
+                      f"{url} - try --channel-videos for a channel")
+    problem = unusable_youtube_link(url)
+    if problem:
+        return None, f"similar needs a video link: {url} is {problem}"
     info, err = fetch_info(url)
     if not info:
         return None, err or "could not read that video"
@@ -3994,11 +4171,14 @@ def similar_videos(url, count=0):
     if not title:
         return None, "that video has no title to search for"
     vid = info.get("id")
+    was_skipping = set(SKIP_IDS)
     saved = (SEARCH_QUERY, IN_CHANNEL, SKIP_IDS, LIMIT)
     try:
         globals()["SEARCH_QUERY"] = title
         globals()["IN_CHANNEL"] = None
-        globals()["SKIP_IDS"] = {vid} if vid else set()
+        # Added to, not replaced: skip.txt is announced in the banner, so
+        # dropping it here made the run say it was applied when it was not.
+        globals()["SKIP_IDS"] = was_skipping | ({vid} if vid else set())
         globals()["LIMIT"] = int(count or 0)
         items, search_err = search_items(title)
     finally:
@@ -4046,9 +4226,12 @@ def print_channel_videos(url):
               f"  (over all {answer['long_videos']} long videos)")
     print(f"\n  {'#':>4}  {'VIEWS':>11}  {'LENGTH':>9}  {'VS AVG':>7}  TITLE")
     for row in rows:
+        # Computed first: a ratio that rounds to 0.0 is still a measurement,
+        # and the old truthiness test printed it as "NA".
+        ratio = "NA" if row["outlier"] is None else f"{row['outlier']}x"
         print(f"  {row['rank']:>4}  {count_or_na(row['views']):>11}"
               f"  {(row['duration_text'] or 'NA'):>9}"
-              f"  {(str(row['outlier']) + 'x' if row['outlier'] else 'NA'):>7}"
+              f"  {ratio:>7}"
               f"  {(row['title'] or '')[:46]}")
         print(f"        {row['link']}")
     if answer["listing_error"]:
@@ -4346,6 +4529,10 @@ CHANNEL_VIDEO_CAP = 2000
 # needs a request of its own, so only the first few are counted.
 PLAYLIST_LIST_CAP = 200
 PLAYLIST_COUNT_CAP = 25
+# Entries read from one playlist when splitting its long videos from its
+# Shorts. A flat page is cheap; this stops a 5,000-video playlist from costing
+# fifty requests on its own.
+PLAYLIST_VIDEO_CAP = 200
 
 # How many videos skip.txt kept out of the channel listings this run. Counted
 # here because a listing applies skip.txt itself, before --limit, so those
@@ -4381,24 +4568,73 @@ def scan_done():
     scan_width[0] = 0
 
 
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "music.youtube.com")
+
+
+def youtube_host(url):
+    """This link's host if it is one of YouTube's, else "".
+
+    Checked on the parsed host rather than by searching the text: the channel
+    pattern used to match "youtube.com/@x" anywhere in a string, so
+    "https://evil.example/?next=youtube.com/@x" read as a channel link and got
+    fetched.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    try:
+        host = urlsplit(text if "//" in text else "//" + text).hostname or ""
+    except ValueError:
+        return ""
+    host = host.lower()
+    for prefix in ("www.", "m."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    return host if host in YOUTUBE_HOSTS else ""
+
+
 def is_channel_url(url):
     """True for a link that names a channel rather than one video.
 
     The video check comes second and wins: a channel link can carry a video in
     its path (/@handle/live/<id>), and that is a video, not a channel.
     """
+    if not youtube_host(url):
+        return False
     return bool(CHANNEL_URL_RE.search(url or "")) and not video_id_from_url(url)
 
 
+def unusable_youtube_link(url):
+    """Why this YouTube link cannot be used, or "" if it can.
+
+    A link that is neither a video nor a channel - YouTube's own uploads
+    playlist (playlist?list=UU...), a bare legacy vanity URL, a /results page -
+    used to be handed to the download loop as though the user had named a
+    single video. That is the one case the length floor exempts, so a whole
+    channel arrived with no floor, no --limit and no --views applied.
+    """
+    if not youtube_host(url):
+        return ""                      # not ours to judge
+    if video_id_from_url(url) or is_channel_url(url):
+        return ""
+    return ("not a video or channel link. Use a video (watch?v=... or "
+            "youtu.be/...) or a channel (@handle, /channel/UC..., /c/..., "
+            "/user/...). A playlist or a bare vanity URL is neither")
+
+
 def channel_videos_url(url):
-    """The channel tab to list: the one asked for, else long-form /videos."""
+    """The channel tab to list: the one asked for, else long-form /videos.
+
+    Any other tab is swapped for /videos through channel_root, which knows all
+    of them - including /search, which used to fall through and produce
+    ".../search/videos". That is not a page, so a channel reached by its search
+    tab reported itself as having no videos at all.
+    """
     base = (url or "").split("?")[0].split("#")[0].rstrip("/")
     tail = base.rsplit("/", 1)[-1].lower()
     if tail in VIDEO_TABS:
         return base                      # an explicit tab is taken as given
-    if tail in OTHER_TABS:
-        base = base.rsplit("/", 1)[0]    # a non-video tab is swapped for /videos
-    return base + "/videos"
+    return channel_root(base) + "/videos"
 
 
 def channel_page(url, start, end):
@@ -4747,6 +4983,30 @@ def list_channel_videos(url, deadline=None):
         print(f"      NOTE: {counts['unknown']} video(s) had no view count and "
               f"were left out (could not be shown to clear --views).")
     return links, name, None
+
+
+def drop_unusable(links):
+    """The links worth acting on, with a word about each one that is not.
+
+    A YouTube link that names neither a video nor a channel - its uploads
+    playlist, a bare vanity URL, a /results page - used to be treated as though
+    the user had named one video. For a download that meant a whole channel
+    arriving with no length floor and no --limit; for a report it meant handing
+    a playlist URL to the metadata lookup, which spent three 120-second
+    timeouts on it before giving up.
+
+    Called from read_links, so every path gets it: the reports run before
+    expand_sources and would otherwise have missed it entirely.
+    """
+    kept = []
+    for link in links:
+        problem = unusable_youtube_link(link)
+        if problem:
+            print(f"\n  Ignoring {link}\n    {problem}.")
+            log_debug("link_refused", stage="sources", url=link, reason=problem)
+            continue
+        kept.append(link)
+    return kept
 
 
 def expand_sources(links):
@@ -5190,6 +5450,23 @@ def parse_args(argv=None):
         p.error(f"--{asked[0]} only reports; it cannot be combined with "
                 f"--transcript or --extract-comments.")
     args.report = asked[0] if asked else None
+    if args.report:
+        # A report reads; it does not build a worklist and it writes nothing.
+        # These used to be accepted, printed in the banner as if in force, and
+        # then ignored - or, for --search, quietly change what was reported on
+        # AND write two files the banner said would not be written.
+        unusable = [name for name, on in (("--search", args.search),
+                                          ("--days", args.days),
+                                          ("--this-month", args.this_month),
+                                          ("--views", args.views),
+                                          ("--in-channel", args.in_channel)) if on]
+        if unusable:
+            p.error(f"--{args.report} is a report: it cannot use "
+                    f"{', '.join(unusable)}."
+                    + ("  (--similar takes --match, --sort, --search-count and"
+                       " --no-dates; every report takes --limit, --shorts and"
+                       " --min-duration)" if args.report == "similar" else
+                       "  (a report takes --limit, --shorts and --min-duration)"))
     if args.transcript and args.no_subs:
         # --transcript asks for a transcript and --no-subs says build none.
         # Together the run would fetch metadata for every video and write
@@ -5300,6 +5577,13 @@ def main():
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
     if REPORT:
         print(f"  Output  : {REPORT} report only - nothing is downloaded or written")
+        uses = {"details": "--shorts/--min-duration",
+                "resolve": "nothing but the links",
+                "channel-videos": "--limit, --shorts/--min-duration, skip.txt",
+                "playlists": "--shorts/--min-duration",
+                "similar": ("--limit, --shorts/--min-duration, skip.txt, "
+                            "--match, --sort, --search-count, --no-dates")}
+        print(f"  Uses    : {uses.get(REPORT, '--limit')}")
     if TRANSCRIPT_ONLY:
         print("  Output  : transcript only - no video is downloaded")
     if EXTRACT_COMMENTS:
@@ -5362,13 +5646,12 @@ def main():
         print(f"NOTE: could not open the diagnostic log ({e}); continuing without it.")
         LOG_DEBUG[0] = None
 
-    log_debug("run_start", directory=DOWNLOAD_DIR, links_file=LINKS_FILE,
-              cookies_present=os.path.exists(COOKIES_FILE), channel=CHANNEL_MODE,
-              min_height=MIN_HEIGHT, max_height=MAX_HEIGHT,
-              transcripts=DOWNLOAD_SUBS, sub_lang=SUB_LANG,
-              thumbnail=SAVE_THUMBNAIL, description=SAVE_DESCRIPTION,
+    log_debug("run_start",
               yt_dlp=shutil.which("yt-dlp"), ffmpeg=shutil.which("ffmpeg"),
-              aria2c=ARIA2C, bgutil_script=bool(BGUTIL_SCRIPT))
+              aria2c=ARIA2C, bgutil_script=bool(BGUTIL_SCRIPT),
+              node=shutil.which("node"), deno=shutil.which("deno"),
+              platform=platform.platform(), python=sys.version.split()[0],
+              **settings_snapshot())
 
     missing = [tool for tool in ("yt-dlp", "ffmpeg") if not shutil.which(tool)]
     if missing:
@@ -5412,7 +5695,7 @@ def main():
         print(f"  {REPORT}: reported {ok} of {len(links)} link(s)."
               f" Nothing was downloaded.")
         print("=" * 60)
-        write_empty_summary()
+        write_report_summary(REPORT, len(links), ok)
         return
 
     # A channel link stands for many videos, so it is expanded before anything

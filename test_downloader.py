@@ -1994,6 +1994,9 @@ class PlatformCase:
             asked.append((start, end))
             i = (start - 1) // d.CHANNEL_PAGE
             return ({"channel": "Test Channel",
+                     "channel_id": "UC" + "t" * 22,
+                     "channel_url": "https://www.youtube.com/channel/UC" + "t" * 22,
+                     "uploader_id": "@test",
                      "entries": list(pages[i]) if i < len(pages) else []}, None)
 
         original = d.channel_page
@@ -3911,7 +3914,11 @@ class PlatformCase:
             if "/playlists" in url:
                 return ({"entries": [{"id": "PL1", "title": "One"},
                                      {"id": "PL2", "title": "Two"}]}, None)
-            return ({"playlist_count": 7}, None)      # a playlist's own listing
+            # A playlist's own flat listing: durations, so the long/short
+            # split can be counted rather than taking playlist_count.
+            return ({"playlist_count": 7,
+                     "entries": [{"id": "a" * 11, "duration": 900},
+                                 {"id": "b" * 11, "duration": 30}]}, None)
 
         saved = d.channel_page
         d.channel_page = page
@@ -3924,6 +3931,7 @@ class PlatformCase:
         self.assertEqual(answer["playlists"][0]["link"],
                          "https://www.youtube.com/playlist?list=PL1")
         self.assertEqual(answer["playlists"][0]["videos"], 7)
+        self.assertEqual(answer["count_failures"], 0)
 
     def test_playlist_counts_stop_at_the_cap(self):
         saved = d.channel_page
@@ -3934,7 +3942,8 @@ class PlatformCase:
                 return ({"entries": [{"id": f"PL{n}", "title": str(n)}
                                       for n in range(5)]}, None)
             asked.append(url)
-            return ({"playlist_count": 1}, None)
+            return ({"playlist_count": 1,
+                     "entries": [{"id": "v" * 11, "duration": 900}]}, None)
 
         d.channel_page = page
         try:
@@ -3943,7 +3952,8 @@ class PlatformCase:
         finally:
             d.channel_page = saved
         self.assertEqual(len(asked), 2, "only the first two are counted")
-        self.assertTrue(answer["capped"])
+        self.assertTrue(answer["count_capped"])
+        self.assertEqual(answer["counted"], 2)
         self.assertIsNone(answer["playlists"][4]["videos"])
 
     def test_similar_searches_for_the_title_and_drops_the_video(self):
@@ -4021,6 +4031,344 @@ class PlatformCase:
 
     def test_every_report_has_a_printer(self):
         self.assertEqual(sorted(d.REPORT_PRINTERS), sorted(d.REPORTS))
+
+    # ------------------------------- regressions: the long-form rule, round 2
+    def test_the_date_edges_come_from_the_long_videos(self):
+        # Taken from the raw listing, a channel whose newest and oldest were
+        # Shorts reported a Shorts-to-Shorts span and divided the long-video
+        # count by it: 0.03 uploads a week where the answer was 0.75.
+        d.MIN_DURATION = 180
+        now = int(time.time())
+        ages = {}
+        entries = []
+        for n, (length, days) in enumerate([(30, 0), (900, 2), (900, 15),
+                                            (900, 30), (45, 730)]):
+            vid = f"{n:011d}"
+            entries.append({"id": vid, "view_count": 100, "duration": length})
+            ages[vid] = now - days * 86400
+        asked = []
+
+        def fake(items, deadline=None):
+            asked.extend(i["id"] for i in items)
+            for item in items:
+                item["epoch"] = ages[item["id"]]
+            return len(items), None
+
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = fake
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing(entries)
+        try:
+            details, err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertIsNone(err)
+        # The Shorts at both ends must not be the edges.
+        self.assertEqual(sorted(asked), [f"{1:011d}", f"{3:011d}"])
+        self.assertEqual(details["long_videos"], 3)
+        self.assertEqual(details["shorts"], 2)
+        # 3 long videos over the 28 days between them = 0.75 a week.
+        self.assertEqual(details["uploads_per_week"], 0.75)
+
+    def test_a_one_video_channel_is_not_dated_twice(self):
+        d.MIN_DURATION = 180
+        calls = []
+
+        def fake(items, deadline=None):
+            calls.append(len(items))
+            for item in items:
+                item["epoch"] = 1700000000
+            return len(items), None
+
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = fake
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": "a" * 11, "view_count": 10, "duration": 900}])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertEqual(calls, [1], "one video is one date, not two")
+        self.assertEqual(details["first_upload"], details["last_upload"])
+
+    def test_a_failed_date_fetch_is_named_in_the_channel_report(self):
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = lambda items, deadline=None: (0, "Sign in to confirm")
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": "a" * 11, "view_count": 10, "duration": 900}])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertIsNone(details["first_upload"])
+        self.assertIn("Sign in", details["date_error"])
+
+    def test_paging_does_not_stop_on_a_filtered_page(self):
+        # One entry without an id made the filtered page short, and the whole
+        # channel stopped at page one.
+        pages = [[{"id": f"{n:011d}", "view_count": 1, "duration": 900}
+                  for n in range(d.CHANNEL_PAGE)],
+                 [{"id": "z" * 11, "view_count": 1, "duration": 900}]]
+        pages[0][5] = {"title": "no id here"}        # survives, has no id
+        asked = []
+
+        def page(url, start, end):
+            asked.append(start)
+            index = (start - 1) // d.CHANNEL_PAGE
+            return ({"channel": "Ch", "channel_id": "UC" + "t" * 22,
+                     "entries": list(pages[index]) if index < len(pages) else []},
+                    None)
+
+        saved = d.channel_page
+        d.channel_page = page
+        try:
+            entries, err = d.channel_video_list("https://www.youtube.com/@ch")
+        finally:
+            d.channel_page = saved
+        self.assertIsNone(err)
+        self.assertEqual(len(asked), 2, "it must ask for the second page")
+        self.assertEqual(len(entries), d.CHANNEL_PAGE)   # 99 + 1
+
+    def test_long_only_separates_short_from_unmeasured(self):
+        # Calling a three-hour livestream of unknown length "a Short" is how a
+        # report ends up lying about its own filtering.
+        d.MIN_DURATION = 180
+        why = {}
+        kept, dropped = d.long_only(
+            [{"duration": 30}, {"duration": None}, {"duration": "NA"},
+             {"duration": 900}], counts=why)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 3)
+        self.assertEqual(why, {"short": 1, "nolength": 2})
+
+    def test_the_median_is_the_middle_not_the_upper_middle(self):
+        self.assertEqual(d.median_of([1, 2, 3]), 2)
+        self.assertEqual(d.median_of([10, 20]), 15)
+        self.assertEqual(d.median_of([]), 0)
+        self.assertEqual(d.median_of([5]), 5)
+
+    def test_a_two_video_channel_median_is_not_its_best(self):
+        d.MIN_DURATION = 180
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = lambda items, deadline=None: (0, None)
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": "a" * 11, "view_count": 100, "duration": 900},
+                      {"id": "b" * 11, "view_count": 300, "duration": 900}])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertEqual(details["best_views"], 300)
+        self.assertEqual(details["median_views"], 200)
+
+    # ------------------------------- regressions: links that are neither
+    def test_a_link_that_is_neither_a_video_nor_a_channel_is_refused(self):
+        # YouTube's own uploads playlist used to pass through as "a video you
+        # named yourself", which is the one case the length floor exempts - so
+        # a whole channel arrived with no floor and no --limit.
+        for url in ("https://www.youtube.com/playlist?list=UU" + "x" * 22,
+                    "https://www.youtube.com/ForbesBreakingNews",
+                    "https://www.youtube.com/results?search_query=x"):
+            self.assertTrue(d.unusable_youtube_link(url), url)
+        for url in ("https://www.youtube.com/watch?v=" + "a" * 11,
+                    "https://youtu.be/" + "a" * 11,
+                    "https://www.youtube.com/@handle",
+                    "https://www.youtube.com/channel/UC" + "x" * 22,
+                    "https://vimeo.com/123"):
+            self.assertEqual(d.unusable_youtube_link(url), "", url)
+
+    def test_the_channel_pattern_is_anchored_to_youtubes_host(self):
+        # It used to search the whole string, so any host could carry a
+        # "youtube.com/@x" in a query parameter and be fetched as a channel.
+        self.assertTrue(d.is_channel_url("https://www.youtube.com/@x"))
+        self.assertFalse(d.is_channel_url("https://evil.example/?u=youtube.com/@x"))
+        self.assertFalse(d.is_channel_url("https://notyoutube.com/@x"))
+        self.assertEqual(d.youtube_host("https://m.youtube.com/@x"), "youtube.com")
+        self.assertEqual(d.youtube_host("https://youtu.be/x"), "youtu.be")
+        self.assertEqual(d.youtube_host("nonsense"), "")
+
+    def test_a_search_tab_link_still_lists_the_channel(self):
+        # It became ".../search/videos", which is not a page, so the channel
+        # reported itself as having no videos.
+        self.assertEqual(
+            d.channel_videos_url("https://www.youtube.com/@h/search?query=x"),
+            "https://www.youtube.com/@h/videos")
+        for tail in ("", "/about", "/playlists", "/community"):
+            self.assertEqual(d.channel_videos_url("https://www.youtube.com/@h" + tail),
+                             "https://www.youtube.com/@h/videos", repr(tail))
+        self.assertEqual(d.channel_videos_url("https://www.youtube.com/@h/shorts"),
+                         "https://www.youtube.com/@h/shorts")
+
+    # ------------------------------- regressions: the reports themselves
+    def test_similar_refuses_anything_but_a_video(self):
+        for url in ("https://www.youtube.com/@handle",
+                    "https://www.youtube.com/playlist?list=UU" + "x" * 22):
+            answer, err = d.similar_videos(url)
+            self.assertIsNone(answer, url)
+            self.assertIn("video link", err)
+
+    def test_similar_keeps_the_skip_list(self):
+        d.SKIP_IDS = {"z" * 11}
+        seen = {}
+        saved = (d.fetch_info, d.search_items)
+        d.fetch_info = lambda url, *a, **k: ({"id": "a" * 11, "title": "T"}, None)
+        d.search_items = lambda q: (seen.update(skip=set(d.SKIP_IDS)) or ([], None))
+        try:
+            d.similar_videos("https://youtu.be/" + "a" * 11)
+        finally:
+            d.fetch_info, d.search_items = saved
+        self.assertEqual(seen["skip"], {"z" * 11, "a" * 11},
+                         "skip.txt is announced, so it must be applied")
+        self.assertEqual(d.SKIP_IDS, {"z" * 11})
+
+    def test_channel_videos_applies_the_skip_list(self):
+        d.MIN_DURATION = 180
+        d.SKIP_IDS = {"b" * 11}
+        self.listing([{"id": "a" * 11, "view_count": 10, "duration": 900},
+                      {"id": "b" * 11, "view_count": 10, "duration": 900}])
+        answer, _err = d.channel_videos("https://www.youtube.com/@ch")
+        self.assertEqual([v["id"] for v in answer["videos"]], ["a" * 11])
+        self.assertEqual(answer["excluded_by_skip_list"], 1)
+
+    def test_a_report_refuses_the_flags_it_cannot_honour(self):
+        for flag, value in (("--search", "x"), ("--days", "7"), ("--views", "10")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit, msg=f"--details {flag}"):
+                    d.parse_args(["/tmp", "--details", flag, value])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--details", "--this-month"])
+        # The ones a report does honour stay accepted.
+        args = d.parse_args(["/tmp", "--channel-videos", "--limit", "5",
+                             "--min-duration", "600"])
+        self.assertEqual((args.report, args.limit, args.min_duration),
+                         ("channel-videos", 5, 600))
+
+    def test_resolve_will_not_answer_with_an_empty_channel(self):
+        saved = d.channel_page
+        d.channel_page = lambda url, s, e: ({"entries": []}, None)
+        try:
+            found, err = d.resolve_channel("https://www.youtube.com/@ch")
+        finally:
+            d.channel_page = saved
+        self.assertIsNone(found, "nulls all the way down are not an answer")
+        self.assertIn("no channel id", err)
+
+    def test_the_outlier_list_is_not_truncated_in_the_data(self):
+        d.MIN_DURATION = 0
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = lambda items, deadline=None: (0, None)
+        d.about_page_extras = lambda url: (None, None, None)
+        # 88 at 100 views and 12 at 10,000. The average lands at 1,288, so the
+        # twelve clear 2x - enough of them to show the list is not cut at ten.
+        self.listing([{"id": f"{n:011d}", "view_count": 100 if n < 88 else 10000,
+                       "duration": 900} for n in range(100)])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertEqual(details["average_views"], 1288)
+        self.assertEqual(details["outlier_count"], 12)
+        self.assertEqual(len(details["outliers"]), 12,
+                         "the data carries them all; the printer shows ten")
+
+    def test_details_of_uses_null_not_the_string_na(self):
+        got = d.details_of({"id": "a" * 11})
+        self.assertIsNone(got["category"])
+        self.assertIsNone(got["uploaded"])
+        dated = d.details_of({"id": "a" * 11, "timestamp": 1700000000,
+                              "categories": ["News"]})
+        self.assertEqual(dated["category"], "News")
+        self.assertTrue(dated["uploaded"])
+
+    def test_settings_snapshot_covers_every_flag(self):
+        # AGENTS.md promises this is run_start's payload.
+        snapshot = d.settings_snapshot()
+        for key in ("mode", "duration_floor", "include_shorts", "min_duration",
+                    "search", "search_match", "sort_by", "resolve_dates",
+                    "date_resolve_max", "extract_comments", "comment_limit",
+                    "min_views", "limit", "days", "this_month", "skip_ids",
+                    "channel_video_cap"):
+            self.assertIn(key, snapshot, key)
+        d.REPORT = "playlists"
+        self.assertEqual(d.settings_snapshot()["mode"], "report:playlists")
+
+    def test_a_shorts_tab_report_gets_its_shorts(self):
+        # The exemption the channel listings make, in the reports too: asking
+        # about /shorts used to filter every video out and report an empty
+        # channel.
+        d.MIN_DURATION = 180
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = lambda items, deadline=None: (0, None)
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": f"{n:011d}", "view_count": 10, "duration": 30}
+                      for n in range(4)])
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                details, _err = d.channel_details(
+                    "https://www.youtube.com/@ch/shorts")
+                videos, _e = d.channel_videos("https://www.youtube.com/@ch/shorts")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertEqual(details["long_videos"], 4, "a /shorts tab keeps them")
+        self.assertTrue(details["shorts_tab"])
+        self.assertEqual(details["metrics_over"], "every video")
+        self.assertEqual(len(videos["videos"]), 4)
+        self.assertTrue(videos["shorts_tab"])
+
+    def test_a_videos_tab_report_still_filters(self):
+        d.MIN_DURATION = 180
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = lambda items, deadline=None: (0, None)
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": f"{n:011d}", "view_count": 10, "duration": 30}
+                      for n in range(4)])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertEqual(details["long_videos"], 0)
+        self.assertEqual(details["shorts"], 4)
+        self.assertFalse(details["shorts_tab"])
+        self.assertEqual(details["metrics_over"], "long videos only")
+
+    def test_the_report_summary_says_a_report_ran(self):
+        # write_empty_summary describes a download that found nothing to do,
+        # which reported "failed: 0" for a report where every link failed.
+        summary = self._summary(lambda: d.write_report_summary("playlists", 5, 2))
+        self.assertEqual(summary["run_type"], "report")
+        self.assertEqual(summary["report"], "playlists")
+        self.assertEqual((summary["links"], summary["reported"],
+                          summary["failed"]), (5, 2, 3))
+        self.assertEqual(summary["downloaded"], 0)
+
+    def test_read_links_drops_what_nothing_can_act_on(self):
+        # The reports run before expand_sources, so a refusal that lived there
+        # missed them - and a playlist URL reaching the metadata lookup cost
+        # three 120-second timeouts before giving up.
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "links.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# a comment\n"
+                        "https://www.youtube.com/playlist?list=UU" + "x" * 22 + "\n"
+                        "https://www.youtube.com/watch?v=" + "a" * 11 + "\n"
+                        "\n"
+                        "https://www.youtube.com/@handle\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                links = d.read_links(path)
+        self.assertEqual(links, ["https://www.youtube.com/watch?v=" + "a" * 11,
+                                 "https://www.youtube.com/@handle"])
+        self.assertIn("Ignoring", buf.getvalue())
+        self.assertIn("not a video or channel link", buf.getvalue())
+
+    def test_read_links_leaves_a_non_youtube_link_alone(self):
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "links.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("https://vimeo.com/123\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(d.read_links(path), ["https://vimeo.com/123"])
 
     def test_no_dates_flag_parses(self):
         self.assertFalse(d.parse_args(["/tmp"]).no_dates)
