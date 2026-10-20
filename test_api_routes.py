@@ -729,6 +729,90 @@ class TestRoutes(unittest.TestCase):
                   ["paths"]["/api/search"]["get"]["parameters"])}
         self.assertEqual(params["match"]["schema"]["enum"], list(api.MATCH_MODES))
 
+    # ------------------------------------------------ dates over the API
+    def test_the_search_answer_reports_the_route_it_really_took(self):
+        # It reported the dated route's depth 40 for a windowed search that
+        # scans 150 - the same defect the CLI banner had.
+        d = api.downloader
+        self._stub(search_items=lambda q: ([], None))
+        r = self.c.get("/api/search?query=x&sort=views&this_month=true",
+                       headers=self.h).json()
+        self.assertEqual(r["depth"], d.SEARCH_DEPTH_FLAT,
+                         "a window is applied locally, so the scan is the deep one")
+        r = self.c.get("/api/search?query=x&sort=date", headers=self.h).json()
+        self.assertEqual(r["depth"], d.SEARCH_DEPTH_DATED,
+                         "a date sort still asks YouTube, which scans less deep")
+
+    def test_the_search_answer_accounts_for_the_dates(self):
+        d = api.downloader
+
+        def items(query):
+            d.SEARCH_COUNTS[0] = {"scanned": 30, "dated": 20, "undated": 3,
+                                  "date_capped": True}
+            d.SEARCH_FOUND[0] = 30
+            return [], None
+
+        self._stub(search_items=items)
+        r = self.c.get("/api/search?query=x&sort=views&this_month=true",
+                       headers=self.h).json()
+        self.assertEqual(r["dates_fetched"], 20)
+        self.assertEqual(r["dates_missing"], 3)
+        self.assertTrue(r["date_capped"],
+                        "found=0 with the cap hit is not 'nothing was published'")
+
+    def test_a_failed_date_fetch_is_not_a_clean_empty_answer(self):
+        # A yt-dlp failure used to arrive as 200, found=0, error=null.
+        self._stub(search_items=lambda q: ([], "Could not apply the date window: "
+                                               "Sign in to confirm you are not a bot"))
+        r = self.c.get("/api/search?query=x&sort=views&this_month=true",
+                       headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["found"], 0)
+        self.assertIsNotNone(body["error"])
+        self.assertIn("bot", body["error"])
+
+    def test_a_request_gets_a_smaller_date_cap_than_the_terminal(self):
+        d = api.downloader
+        seen = {}
+
+        def items(query):
+            seen["cap"] = d.DATE_RESOLVE_MAX
+            seen["deadline"] = d.SEARCH_DEADLINE
+            return [], None
+
+        self._stub(search_items=items)
+        self.assertEqual(self.c.get("/api/search?query=x", headers=self.h).status_code, 200)
+        self.assertEqual(seen["cap"], 20, "20 x 2.1s fits the ~60s a request gets")
+        self.assertIsNotNone(seen["deadline"], "the whole pass needs a wall")
+
+    def test_the_terminal_date_cap_does_not_leak_into_a_request(self):
+        d = api.downloader
+        saved = d.DATE_RESOLVE_MAX
+        d.DATE_RESOLVE_MAX = 100          # as the module ships for the CLI
+        seen = {}
+        try:
+            self._stub(search_items=lambda q: (seen.update(cap=d.DATE_RESOLVE_MAX)
+                                               or ([], None)))
+            self.c.get("/api/search?query=x", headers=self.h)
+        finally:
+            d.DATE_RESOLVE_MAX = saved
+        self.assertEqual(seen["cap"], 20)
+
+    def test_dates_is_refused_on_a_job_that_cannot_use_it(self):
+        for field, value in (("dates", False), ("dates", True)):
+            r = self.c.post("/api/jobs",
+                            json={"links": "https://youtu.be/" + "a" * 11,
+                                  field: value}, headers=self.h)
+            self.assertEqual(r.status_code, 422, f"{field}={value} without search")
+            self.assertIn("search", r.json()["detail"][0]["msg"])
+
+    def test_no_dates_reaches_the_command_line(self):
+        opts = api.normalize_request({"search": "cats", "dates": False})
+        self.assertIn("--no-dates", api.build_argv("/out", opts))
+        opts = api.normalize_request({"search": "cats"})
+        self.assertNotIn("--no-dates", api.build_argv("/out", opts))
+
     def test_a_blocked_run_says_so(self):
         os.environ["FAKE_MODE"] = "blocked"
         job = self.wait(self.start())

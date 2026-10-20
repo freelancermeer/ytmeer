@@ -3068,53 +3068,139 @@ class PlatformCase:
         self.assertEqual(d.as_seconds("900.0"), 900)
 
     # ------------------------------------------- publish dates for a search
-    def _resolve(self, stdout, returncode=0, raises=None):
-        """Drive resolve_dates against a scripted yt-dlp; returns (items, urls)."""
-        urls = {}
+    def _resolve(self, stdout, returncode=0, raises=None, stderr=""):
+        """Drive resolve_dates against a scripted yt-dlp.
+
+        Returns (items, dated, error, commands). One route only, so a single
+        scripted answer is the whole story unless the test says otherwise.
+        """
+        cmds = []
 
         def run(cmd, **kw):
+            cmds.append(cmd)
             if raises:
                 raise raises
-            urls["cmd"] = cmd
-            return subprocess.CompletedProcess(cmd, returncode, stdout, "")
+            return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
-        saved = d.subprocess.run
+        saved = (d.subprocess.run, d.po_token_first[0])
         d.subprocess.run = run
+        d.po_token_first[0] = True            # one route, for a clear test
         items = [{"id": "a" * 11, "url": d.watch_url("a" * 11), "epoch": None},
                  {"id": "b" * 11, "url": d.watch_url("b" * 11), "epoch": None}]
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                dated = d.resolve_dates(items)
+                dated, error = d.resolve_dates(items)
         finally:
-            d.subprocess.run = saved
-        return items, dated, urls.get("cmd", [])
+            d.subprocess.run, d.po_token_first[0] = saved
+        return items, dated, error, cmds
 
     def test_dates_are_fetched_for_the_results_that_survived(self):
-        items, dated, cmd = self._resolve(
+        items, dated, error, cmds = self._resolve(
             f"{'a' * 11}\t1700000000\n{'b' * 11}\t1700000001\n")
-        self.assertEqual(dated, 2)
+        self.assertEqual((dated, error), (2, None))
         self.assertEqual([i["epoch"] for i in items], [1700000000, 1700000001])
-        self.assertIn(d.watch_url("a" * 11), cmd)
-        self.assertIn(d.watch_url("b" * 11), cmd)
+        self.assertIn(d.watch_url("a" * 11), cmds[0])
+        self.assertIn(d.watch_url("b" * 11), cmds[0])
 
     def test_a_video_that_cannot_be_dated_keeps_no_date(self):
         # A removed or private video simply has none; inventing one would be
         # worse than reporting the gap.
-        items, dated, _cmd = self._resolve(f"{'a' * 11}\t1700000000\n")
-        self.assertEqual(dated, 1)
+        items, dated, error, _cmds = self._resolve(f"{'a' * 11}\t1700000000\n")
+        self.assertEqual((dated, error), (1, None))
         self.assertEqual(items[0]["epoch"], 1700000000)
         self.assertIsNone(items[1]["epoch"])
 
     def test_an_na_timestamp_is_not_read_as_a_date(self):
-        items, dated, _cmd = self._resolve(f"{'a' * 11}\tNA\n{'b' * 11}\t\n")
+        items, dated, error, _cmds = self._resolve(
+            f"{'a' * 11}\tNA\n{'b' * 11}\t\n")
         self.assertEqual(dated, 0)
+        self.assertIsNone(error, "yt-dlp exited cleanly: these videos have no date")
         self.assertEqual([i["epoch"] for i in items], [None, None])
 
-    def test_dating_survives_a_timeout(self):
-        items, dated, _cmd = self._resolve(
+    def test_a_failed_date_fetch_is_not_an_empty_one(self):
+        # The difference is the whole point of the error channel: a window
+        # applied over dates that never arrived would call every video
+        # out-of-window.
+        _items, dated, error, _cmds = self._resolve(
+            "", returncode=1,
+            stderr="ERROR: [youtube] Sign in to confirm you're not a bot")
+        self.assertEqual(dated, 0)
+        self.assertIsNotNone(error)
+        self.assertIn("bot", error)
+
+    def test_a_timeout_keeps_the_dates_that_already_arrived(self):
+        # yt-dlp flushes a line per video, so what reached us is paid for.
+        timeout = subprocess.TimeoutExpired("yt-dlp", 1)
+        timeout.stdout = f"{'a' * 11}\t1700000000\n".encode()
+        items, dated, error, _cmds = self._resolve("", raises=timeout)
+        self.assertEqual((dated, error), (1, None))
+        self.assertEqual(items[0]["epoch"], 1700000000)
+        self.assertIsNone(items[1]["epoch"])
+
+    def test_a_timeout_with_nothing_printed_is_an_error(self):
+        items, dated, error, _cmds = self._resolve(
             "", raises=subprocess.TimeoutExpired("yt-dlp", 1))
         self.assertEqual(dated, 0)
+        self.assertIn("Timed out", error)
         self.assertEqual([i["epoch"] for i in items], [None, None])
+
+    def test_a_half_written_line_is_not_read_as_a_date(self):
+        # The last line can be cut mid-number, and "17000" would read as 1970.
+        timeout = subprocess.TimeoutExpired("yt-dlp", 1)
+        timeout.stdout = f"{'a' * 11}\t1700000000\n{'b' * 11}\t17000".encode()
+        items, dated, _error, _cmds = self._resolve("", raises=timeout)
+        self.assertEqual(dated, 1)
+        self.assertEqual(items[0]["epoch"], 1700000000)
+        self.assertIsNone(items[1]["epoch"], "a cut line must not become a date")
+
+    def test_a_rejected_cookie_file_is_retried_for_dates_too(self):
+        # Every other lone fetch here drops the jar and asks again; this one
+        # did not, so a stale cookies.txt cost the whole run its dates.
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "ERROR: the page needs to be reloaded")
+            return subprocess.CompletedProcess(
+                cmd, 0, f"{'a' * 11}\t1700000000\n", "")
+
+        saved = (d.subprocess.run, d.drop_rejected_cookies, d.po_token_first[0])
+        d.subprocess.run = run
+        d.drop_rejected_cookies = lambda text: "reloaded" in (text or "")
+        d.po_token_first[0] = True
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                dated, error = d.resolve_dates(
+                    [{"id": "a" * 11, "url": d.watch_url("a" * 11), "epoch": None}])
+        finally:
+            d.subprocess.run, d.drop_rejected_cookies, d.po_token_first[0] = saved
+        self.assertEqual((dated, error), (1, None))
+        self.assertEqual(len(calls), 2, "the same route must be tried again")
+
+    def test_dates_escalate_to_the_po_token_client(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(cmd, 1, "", "ERROR: blocked")
+            return subprocess.CompletedProcess(
+                cmd, 0, f"{'a' * 11}\t1700000000\n", "")
+
+        saved = (d.subprocess.run, d.po_token_first[0], d.drop_rejected_cookies)
+        d.subprocess.run = run
+        d.po_token_first[0] = False           # plain first, then PO token
+        d.drop_rejected_cookies = lambda text: False
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                dated, error = d.resolve_dates(
+                    [{"id": "a" * 11, "url": d.watch_url("a" * 11), "epoch": None}])
+        finally:
+            d.subprocess.run, d.po_token_first[0], d.drop_rejected_cookies = saved
+        self.assertEqual((dated, error), (1, None))
+        self.assertEqual(len(calls), 2, "it must try the PO-token route")
 
     def test_nothing_is_asked_for_when_every_date_is_known(self):
         saved = d.subprocess.run
@@ -3122,7 +3208,7 @@ class PlatformCase:
         d.subprocess.run = lambda cmd, **kw: calls.append(cmd)
         try:
             self.assertEqual(d.resolve_dates(
-                [{"id": "a" * 11, "url": "u", "epoch": 1700000000}]), 0)
+                [{"id": "a" * 11, "url": "u", "epoch": 1700000000}]), (0, None))
         finally:
             d.subprocess.run = saved
         self.assertEqual(calls, [], "the dated route already has them")
@@ -3132,11 +3218,11 @@ class PlatformCase:
         saved = d.resolve_dates
         seen = {}
 
-        def fake(items):
+        def fake(items, deadline=None):
             seen["n"] = len(items)
             for number, item in enumerate(items):
                 item["epoch"] = 1700000000 + number
-            return len(items)
+            return len(items), None
 
         d.resolve_dates = fake
         try:
@@ -3208,11 +3294,11 @@ class PlatformCase:
         d.search_flat = lambda q, c: (list(pool), None)
         d.search_dated = lambda *a, **k: self.fail("a window must not take the dated route")
 
-        def fake_resolve(items):
+        def fake_resolve(items, deadline=None):
             asked.extend(i["id"] for i in items)
             for item in items:
                 item["epoch"] = ages[item["id"]]
-            return len(items)
+            return len(items), None
 
         d.resolve_dates = fake_resolve
         try:
@@ -3239,11 +3325,11 @@ class PlatformCase:
         asked, saved = [], (d.search_flat, d.resolve_dates)
         d.search_flat = lambda q, cnt: (list(pool), None)
 
-        def fake_resolve(items):
+        def fake_resolve(items, deadline=None):
             asked.extend(i["id"] for i in items)
             for item in items:
                 item["epoch"] = now - 3600
-            return len(items)
+            return len(items), None
 
         d.resolve_dates = fake_resolve
         try:
@@ -3263,23 +3349,24 @@ class PlatformCase:
                  for c in "abcdefghij"]
         asked, saved = [], d.resolve_dates
 
-        def fake_resolve(chunk):
+        def fake_resolve(chunk, deadline=None):
             asked.extend(i["id"] for i in chunk)
             for item in chunk:
                 item["epoch"] = now - 90 * 86400      # all outside the window
-            return len(chunk)
+            return len(chunk), None
 
         d.resolve_dates = fake_resolve
         try:
-            kept, dated, exhausted = d.take_in_window(
-                items, now - 30 * 86400, limit=5)
+            walk = d.take_in_window(items, now - 30 * 86400, limit=5)
         finally:
             d.resolve_dates = saved
             d.DATE_RESOLVE_MAX = 40
-        self.assertEqual(kept, [])
-        self.assertEqual(dated, 4, "it must stop at the cap")
+        self.assertEqual(walk["kept"], [])
+        self.assertEqual(walk["asked"], 4, "it must stop at the cap")
+        self.assertEqual(walk["dated"], 4)
         self.assertEqual(len(asked), 4)
-        self.assertFalse(exhausted, "the list was not exhausted, the cap was hit")
+        self.assertFalse(walk["exhausted"], "the cap was hit, not the end")
+        self.assertTrue(walk["capped"])
 
     def test_the_window_walk_reports_an_exhausted_list(self):
         now = int(time.time())
@@ -3287,19 +3374,92 @@ class PlatformCase:
                  for c in "ab"]
         saved = d.resolve_dates
 
-        def fake_resolve(chunk):
+        def fake_resolve(chunk, deadline=None):
             for item in chunk:
                 item["epoch"] = now - 3600
-            return len(chunk)
+            return len(chunk), None
 
         d.resolve_dates = fake_resolve
         try:
-            kept, dated, exhausted = d.take_in_window(items, now - 30 * 86400, limit=5)
+            walk = d.take_in_window(items, now - 30 * 86400, limit=5)
         finally:
             d.resolve_dates = saved
-        self.assertEqual(len(kept), 2)
-        self.assertEqual(dated, 2)
-        self.assertTrue(exhausted)
+        self.assertEqual(len(walk["kept"]), 2)
+        self.assertEqual(walk["dated"], 2)
+        self.assertTrue(walk["exhausted"])
+        self.assertFalse(walk["capped"])
+
+    def test_the_walk_counts_dates_that_came_back_not_videos_walked(self):
+        # It printed "dated 30, kept 0" when zero had been dated.
+        now = int(time.time())
+        items = [{"id": c * 11, "url": d.watch_url(c * 11), "epoch": None}
+                 for c in "abcd"]
+        saved = d.resolve_dates
+        d.resolve_dates = lambda chunk, deadline=None: (0, None)
+        try:
+            walk = d.take_in_window(items, now - 30 * 86400, limit=0)
+        finally:
+            d.resolve_dates = saved
+        self.assertEqual(walk["dated"], 0)
+        self.assertEqual(walk["asked"], 4)
+        self.assertEqual(walk["undated"], 4)
+        self.assertEqual(walk["kept"], [])
+
+    def test_the_walk_stops_when_the_fetch_itself_fails(self):
+        # Walking on repeats the same failure for every block - minutes of it.
+        now = int(time.time())
+        items = [{"id": c * 11, "url": d.watch_url(c * 11), "epoch": None}
+                 for c in "abcdefghij"]
+        calls, saved = [], d.resolve_dates
+
+        def failing(chunk, deadline=None):
+            calls.append(len(chunk))
+            return 0, "Sign in to confirm you are not a bot"
+
+        d.resolve_dates = failing
+        try:
+            walk = d.take_in_window(items, now - 30 * 86400, limit=2)
+        finally:
+            d.resolve_dates = saved
+        self.assertEqual(len(calls), 1, "one failure is enough")
+        self.assertIn("bot", walk["error"])
+        self.assertFalse(walk["exhausted"], "it did not reach the end")
+        self.assertFalse(walk["capped"], "the cap is not why it stopped")
+
+    def test_an_epoch_of_zero_is_not_treated_as_missing(self):
+        # Truthiness would drop 1 Jan 1970; parse_dates already refuses 0 as a
+        # date, so this guards the walk's own test rather than the parser's.
+        items = [{"id": "a" * 11, "url": "u", "epoch": None}]
+        saved = d.resolve_dates
+
+        def fake(chunk, deadline=None):
+            chunk[0]["epoch"] = 0
+            return 1, None
+
+        d.resolve_dates = fake
+        try:
+            walk = d.take_in_window(items, -1, limit=0)
+        finally:
+            d.resolve_dates = saved
+        self.assertEqual(len(walk["kept"]), 1)
+
+    def test_the_block_is_no_bigger_than_the_limit_needs(self):
+        # A --limit 2 paid for ten dates when the block had a floor of ten.
+        items = [{"id": c * 11, "url": "u", "epoch": None} for c in "abcdefghij"]
+        sizes, saved = [], d.resolve_dates
+
+        def fake(chunk, deadline=None):
+            sizes.append(len(chunk))
+            for item in chunk:
+                item["epoch"] = 1
+            return len(chunk), None
+
+        d.resolve_dates = fake
+        try:
+            d.take_in_window(items, 2, limit=2)      # nothing is in window
+        finally:
+            d.resolve_dates = saved
+        self.assertTrue(all(n <= 2 for n in sizes), f"blocks were {sizes}")
 
     def test_no_dates_sends_a_window_back_to_youtube(self):
         # Without local dates there is nothing to filter on here, so the window
@@ -3338,6 +3498,52 @@ class PlatformCase:
         self.assertFalse(d.needs_dated_route())
         d.RESOLVE_DATES = False
         self.assertFalse(d.needs_dated_route(), "no window, so nothing to filter")
+
+    def test_the_filtered_out_tally_adds_up(self):
+        # "3 of 146 scanned" with only two reasons listed left a silent
+        # remainder of 47 videos the walk never looked at.
+        d.MIN_DURATION = 180
+        d.SEARCH_FOUND[0] = 10
+        d.SEARCH_COUNTS[0] = {"scanned": 10, "short": 2, "nolength": 0,
+                              "views": 0, "live": 0, "skipped": 0,
+                              "outside": 3, "undated": 1, "unreached": 3}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.print_search_results([{"id": "a" * 11, "url": "u", "title": "T",
+                                     "views": 5, "duration": 900}], "")
+        shown = buf.getvalue()
+        for text in ("2 under", "3 outside the window", "1 with no publish date",
+                     "3 not reached"):
+            self.assertIn(text, shown)
+        # 1 kept + 2 + 3 + 1 + 3 == 10 scanned
+        self.assertIn("1 video(s) of 10 scanned", shown)
+
+    def test_the_walk_counts_what_it_never_reached(self):
+        d.RESOLVE_DATES = True
+        d.DAYS = 30
+        d.SORT_BY = "views"
+        d.LIMIT = 1
+        now = int(time.time())
+        pool = [{"id": c * 11, "url": d.watch_url(c * 11), "title": c,
+                 "view_count": 9000 - n, "duration": 900}
+                for n, c in enumerate("abcdefghij")]
+        saved = (d.search_flat, d.resolve_dates)
+        d.search_flat = lambda q, cnt: (list(pool), None)
+
+        def fake(items, deadline=None):
+            for item in items:
+                item["epoch"] = now - 3600
+            return len(items), None
+
+        d.resolve_dates = fake
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                kept, _err = d.search_items("cats")
+        finally:
+            d.search_flat, d.resolve_dates = saved
+        counts = d.SEARCH_COUNTS[0]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(counts["unreached"], 9, "one was dated, nine untouched")
 
     def test_no_dates_flag_parses(self):
         self.assertFalse(d.parse_args(["/tmp"]).no_dates)

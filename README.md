@@ -400,8 +400,20 @@ satisfied. On one long title, `--sort views --this-month --limit 20`:
 
 A **date sort** (`--sort date`/`oldest`) still takes the dated route, because
 ordering by date needs every date before anything can be ordered. At most
-`DATE_RESOLVE_MAX` videos are dated in one run — 100 on the command line, 40
-through the REST API, which cannot hold its lock for three minutes.
+`DATE_RESOLVE_MAX` videos are dated in one run — **100** on the command line,
+**20** through the REST API, which is cut at about 60s per request.
+
+When that cap stops the walk early the run says so, and `GET /api/search`
+returns `date_capped: true` alongside `dates_fetched` and `dates_missing` — so
+`found: 0` with `date_capped: true` means "this did not look far enough", not
+"nothing was published". A date fetch that *fails* (a bot check, a rejected
+`cookies.txt`) is reported as an error rather than as an empty result, because
+a window applied over dates that never arrived would call every video
+out-of-window.
+
+`--no-dates` does two things, and the second is easy to miss: it skips the date
+fetch, **and** with `--days`/`--this-month` it hands the window back to YouTube,
+which answers it from a much narrower search — faster, but far fewer results.
 
 **Sorting** stays local on purpose, not for want of `sp=`. YouTube's own
 sort-by-views collapses onto the exact phrase and discards the near-matches,

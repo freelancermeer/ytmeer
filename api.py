@@ -336,6 +336,8 @@ def normalize_request(payload):
     if "search_count" in payload and not opts["search"]:
         raise ValueError("search_count is the search's scan depth; it needs "
                          "search too")
+    if "dates" in payload and not opts["search"]:
+        raise ValueError("dates is about search results; it needs search too")
     if opts["transcript"] and not opts["subs"]:
         raise ValueError("transcript IS the transcript, so it cannot be combined "
                          "with subs=false")
@@ -876,9 +878,12 @@ ROUTE_GLOBALS = {
     "MIN_VIEWS": 0, "LIMIT": 0, "DAYS": 0, "THIS_MONTH": False, "SKIP_IDS": set(),
     "SEARCH_QUERY": None, "IN_CHANNEL": None, "SEARCH_COUNT": None,
     "SORT_BY": "relevance", "SEARCH_MATCH": "related", "RESOLVE_DATES": True,
-    # 40 x ~2.1s fits inside ROUTE_SECONDS; the CLI's own default is higher
-    # because a person at a terminal can wait and a held lock cannot.
-    "DATE_RESOLVE_MAX": 40,
+    # 20 x ~2.1s is about 42s, which with the flat scan stays under the ~60s
+    # a gradio.live request is cut at. 40 measured 71-85s and would miss it;
+    # the CLI's own default is 100, because a person at a terminal can wait
+    # and a held lock cannot. SEARCH_DEADLINE is the wall for the whole pass.
+    "DATE_RESOLVE_MAX": 20,
+    "SEARCH_DEADLINE": None,
     "INCLUDE_SHORTS": False, "MIN_DURATION": 180,
     "SUB_LANG": "en", "DOWNLOAD_SUBS": True, "TRANSCRIPT_ONLY": False,
     "EXTRACT_COMMENTS": False, "COMMENT_LIMIT": 100, "COMMENT_REPLIES": False,
@@ -1009,14 +1014,18 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
             MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
             SKIP_IDS=_skip_ids(skip), SEARCH_TIMEOUT=ROUTE_SECONDS,
             SEARCH_MATCH=match, INCLUDE_SHORTS=bool(shorts),
-            MIN_DURATION=min_duration, RESOLVE_DATES=bool(dates)):
+            MIN_DURATION=min_duration, RESOLVE_DATES=bool(dates),
+            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         items, err = d.search_items(query)
         _since, window = d.search_window()
         rows = [d.search_row(item, number) for number, item in enumerate(items, 1)]
         sort_used, channel_used, scanned = d.SORT_BY, d.IN_CHANNEL, d.SEARCH_FOUND[0]
         floor_used = d.duration_floor()
-        depth_used = d.search_depth(_since is not None
-                                    or d.SORT_BY in ("date", "oldest"))
+        # The same function the run asked, not a second copy of the rule: the
+        # CLI banner had its own copy and reported depth 40 for a search that
+        # scanned 150.
+        depth_used = d.search_depth(d.needs_dated_route())
+        tally = dict(d.SEARCH_COUNTS[0] or {})
     return {"query": query, "in_channel": channel_used,
             # in_channel searches the channel's own tab, which neither value of
             # match applies to - echoing the request there would claim a net
@@ -1024,7 +1033,14 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
             "match": None if channel_used else match,
             "sort": sort_used, "window": window or None,
             "min_duration": floor_used or None, "depth": depth_used,
-            "scanned": scanned, "found": len(rows), "results": rows, "error": err}
+            "scanned": scanned,
+            # So a caller can tell a complete answer from one the date cap cut
+            # short: found=0 with date_capped true is not "nothing was
+            # published", it is "this did not look far enough".
+            "dates_fetched": tally.get("dated", 0),
+            "dates_missing": tally.get("undated", 0),
+            "date_capped": bool(tally.get("date_capped")),
+            "found": len(rows), "results": rows, "error": err}
 
 
 # --------------------------------------------------- answers, not jobs
@@ -1245,9 +1261,9 @@ def build_app():
                count: int = Query(0, ge=0, le=INT_MAX["search_count"],
                                   description="Results to scan before filtering. "
                                   "0 (the default) follows the route: 150 "
-                                  "normally, 40 with a date window, because a "
-                                  "dated scan costs about thirty times more per "
-                                  "result."),
+                                  "normally, 40 when sort is date or oldest, "
+                                  "because that scan costs about thirty times "
+                                  "more per result."),
                match: Literal[MATCH_MODES] = Query(
                    "related", description="How wide a net: related (YouTube's "
                    "own results page, so near-matches come too) or exact (the "
@@ -1285,9 +1301,15 @@ def build_app():
         another language - and those are usually the point; sort then orders what
         came back. Shorts are left out unless you ask for them.
 
-        A date window or a date sort costs about 2 s per result scanned; without
-        one the search is about 0.15 s per result. One search, preview or lookup
-        runs at a time; another gets 503."""
+        A date window is applied here, not by YouTube, over publish dates
+        fetched for the results that survive - so it keeps the relevance breadth
+        that YouTube's own date search throws away. Those dates cost about 2 s
+        each, so at most 20 are fetched per request and date_capped says when
+        that stopped it short; raise limit or narrow the query rather than
+        reading found=0 as "nothing was published". sort=date/oldest needs every
+        date up front and still asks YouTube, which scans less deep.
+
+        One search, preview or lookup runs at a time; another gets 503."""
         try:
             return search_youtube(query, in_channel, count, sort, days,
                                   this_month, views, limit, skip,

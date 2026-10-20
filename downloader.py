@@ -30,7 +30,8 @@ Optional flags:
     --match MODE         related (default: YouTube's own results page, so
                          near-matches come too) | exact (narrower ytsearch)
     --search-count N     Results to scan before filtering (default: 150,
-                         or 40 when a date window forces the dated route)
+                         or 40 when --sort date/oldest needs every date)
+    --no-dates           Do not fetch publish dates for search results
     --sort ORDER         relevance (default) | views/popularity |
                          least-viewed (reverse) | date | oldest
     --this-month         Search window: since the 1st of this month
@@ -170,6 +171,14 @@ SEARCH_DEPTH_DATED = 40
 # The cap is what stops an unlimited search from quietly spending those five
 # minutes: past it the dates are left out and the run says so, naming --limit.
 RESOLVE_DATES    = True    # --no-dates turns it off
+# One date batch's own wall. A block of 20 at about 2.1s each is 42s, so this
+# is generous; it is here so a hung yt-dlp cannot hold a run (or the REST
+# API's lock) for the 15 minutes SEARCH_TIMEOUT allows a whole search.
+DATE_TIMEOUT     = 300
+# A whole search's wall, as a time.monotonic() value, or None for no wall. The
+# REST API sets it: dating is paid per video, so without it one request could
+# hold the downloader's globals far longer than the route's own budget.
+SEARCH_DEADLINE  = None
 # At about 2.1s each this is the longest a run will spend on dates: a shade
 # over three minutes. The REST API lowers it for itself, because a request
 # cannot hold the downloader's globals for that long (see ROUTE_GLOBALS).
@@ -561,6 +570,9 @@ def mode_fields():
         "search_match": SEARCH_MATCH if (SEARCH_QUERY and not IN_CHANNEL) else None,
         "min_duration": duration_floor() or None,
         "shorts": INCLUDE_SHORTS,
+        "dates": RESOLVE_DATES if SEARCH_QUERY else None,
+        "dates_fetched": (SEARCH_COUNTS[0] or {}).get("dated") or None,
+        "date_capped": bool((SEARCH_COUNTS[0] or {}).get("date_capped")) or None,
     }
 
 
@@ -3018,42 +3030,116 @@ def search_dated(query, count, since=None):
     return items, None
 
 
-def resolve_dates(items):
-    """Fill in the upload date of each item, in one yt-dlp pass.
+def flushed_lines(stream):
+    """The complete lines of a stream that was cut off mid-flight.
 
-    Returns how many were dated. Items left undated keep epoch None, which the
-    row then reports as a missing date rather than a wrong one.
+    Only the newline-terminated part. yt-dlp flushes one whole line per video
+    as it extracts it, so what arrived is already paid for - but the last line
+    can be cut mid-number, and "17000" would read as a 1970 date. A wrong date
+    is worse than a missing one. TimeoutExpired carries bytes even under
+    text=True, so this decodes when it has to.
+    """
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        stream = stream.decode("utf-8", "replace")
+    cut = stream.rfind("\n")
+    return stream[:cut + 1] if cut >= 0 else ""
+
+
+def parse_dates(printed):
+    """The id -> epoch pairs in a --print "%(id)s\t%(timestamp)s" stream."""
+    dates = {}
+    for line in (printed or "").splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2 or not BARE_ID_RE.match(parts[0]):
+            continue
+        stamp = as_seconds(parts[1])
+        # A date, not a duration: 0 and negatives are not real upload times
+        # and would sort as the oldest videos on YouTube.
+        if stamp is not None and stamp > 0:
+            dates[parts[0]] = int(stamp)
+    return dates
+
+
+def resolve_dates(items, deadline=None):
+    """Fill in the upload date of each item. Returns (dated, error).
+
+    An error means the FETCH failed - a bot check, a rejected cookies.txt, a
+    timeout - which is a different fact from "these videos have no date", and
+    the caller has to tell them apart: a window applied over dates that never
+    arrived would report every video in it as out of it. Its two siblings in
+    this search do the same (channel_page, search_dated).
+
+    Gets the route escalation and cookie-rejection retry every other lone fetch
+    here does, because asking for one field of many videos meets the same bot
+    check the rest of them do.
     """
     urls = [i["url"] for i in items if i.get("epoch") is None and i.get("id")]
     if not urls:
-        return 0
-    cmd = base_cmd() + [
-        "--no-warnings", "--ignore-errors", "--skip-download",
-        "--print", "%(id)s\t%(timestamp)s", "--",
-    ] + urls
-    try:
-        out = run_logged("search_dates", cmd, capture_output=True, text=True,
-                         timeout=SEARCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        note("      (ran out of time fetching publish dates)")
-        return 0
-    except OSError as e:
-        note(f"      (could not fetch publish dates: {e})")
-        return 0
-    dates = {}
-    for line in (out.stdout or "").splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            dates[parts[0]] = int(parts[1])
-    for item in items:
-        if item.get("epoch") is None:
-            item["epoch"] = dates.get(item.get("id"))
-    return len(dates)
+        return 0, None
+    budget = DATE_TIMEOUT
+    if deadline is not None:
+        budget = min(budget, max(1, int(deadline - time.monotonic())))
+    routes = [PO_TOKEN_FLAGS] if po_token_first[0] else [[], PO_TOKEN_FLAGS]
+    problem = None
+
+    def store(dates):
+        for item in items:
+            if item.get("epoch") is None:
+                item["epoch"] = dates.get(item.get("id"))
+        return len(dates)
+
+    for route_no, extra in enumerate(routes, 1):
+        for attempt in (1, 2):
+            cmd = base_cmd() + list(extra) + [
+                "--no-warnings", "--ignore-errors", "--skip-download",
+                "--print", "%(id)s\t%(timestamp)s", "--",
+            ] + urls
+            try:
+                out = run_logged("search_dates", cmd, capture_output=True,
+                                 text=True, timeout=budget)
+                printed, stderr, code = out.stdout or "", out.stderr or "", out.returncode
+            except subprocess.TimeoutExpired as e:
+                # Keep what yt-dlp printed before the wall rather than paying
+                # for it twice; a slow last video must not cost the batch.
+                dates = parse_dates(flushed_lines(e.stdout))
+                log_debug("search_dates", stage="search", timed_out=True,
+                          asked=len(urls), got=len(dates), route=route_no)
+                if dates:
+                    return store(dates), None
+                return 0, "Timed out while fetching publish dates"
+            except OSError as e:
+                return 0, f"Could not fetch publish dates: {e}"
+            dates = parse_dates(printed)
+            log_debug("search_dates", stage="search", route=route_no,
+                      attempt=attempt, returncode=code, asked=len(urls),
+                      got=len(dates), stderr_tail=stderr)
+            if dates:
+                return store(dates), None
+            # Nothing parsed. A rejected cookies.txt earns the same route one
+            # more try without the jar, exactly as fetch_comments does.
+            if attempt == 1 and drop_rejected_cookies(stderr):
+                continue
+            if code:
+                last = stderr.strip().splitlines()
+                problem = last[-1] if last else "Could not fetch publish dates"
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+    # yt-dlp exiting cleanly with nothing to print means these videos really
+    # have no date. A non-zero exit means the fetch failed. Only the second is
+    # an error, and the difference is the whole point of this return value.
+    return 0, problem
 
 
-def take_in_window(items, since, limit, cap=None):
+def take_in_window(items, since, limit, cap=None, deadline=None):
     """Walk an already-sorted list, dating as it goes, keeping what is in the
-    window. Returns (kept, how many were dated, whether the list ran out).
+    window. Returns a dict: kept, dated, undated, asked, exhausted, capped, error.
+
+    "dated" is how many dates actually came back and "undated" how many did
+    not - two different facts, and reporting the videos walked as though they
+    had all been dated would claim work that never happened.
 
     The window cannot be applied before the dates are known, and the dates are
     the expensive part, so they are fetched a block at a time DOWN A LIST THAT
@@ -3064,22 +3150,43 @@ def take_in_window(items, since, limit, cap=None):
     search returned 3 videos where the unfiltered relevance list returned 148.
     """
     cap = DATE_RESOLVE_MAX if cap is None else cap
-    block = max(10, limit or 20)
-    kept, dated, index = [], 0, 0
-    while index < len(items) and dated < cap:
-        chunk = items[index:index + min(block, cap - dated)]
+    # No bigger than the caller actually needs: a --limit 2 used to pay for ten
+    # dates because the block had a floor of ten.
+    block = max(1, limit or 20)
+    kept, asked, dated, index, error = [], 0, 0, 0, None
+    while index < len(items) and asked < cap:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        chunk = items[index:index + min(block, cap - asked)]
         if not chunk:
             break
         index += len(chunk)
-        dated += len(chunk)
-        resolve_dates(chunk)
+        asked += len(chunk)
+        got, error = resolve_dates(chunk, deadline=deadline)
+        dated += got
+        if error:
+            # The fetch failed rather than finding nothing. Walking on would
+            # repeat the same failure for every remaining block - minutes of
+            # it, and on the REST API's lock.
+            break
         for item in chunk:
             epoch = item.get("epoch")
-            if epoch and epoch >= since:
+            # "is not None", not truthiness: an epoch of 0 is 1 Jan 1970, and
+            # parse_dates has already refused 0 and negatives as not-a-date.
+            if epoch is not None and epoch >= since:
                 kept.append(item)
                 if limit and len(kept) >= limit:
-                    return kept, dated, index >= len(items)
-    return kept, dated, index >= len(items)
+                    break
+        if limit and len(kept) >= limit:
+            break
+    return {"kept": kept, "dated": dated, "undated": asked - dated,
+            "asked": asked,
+            # Not exhausted if a failure or a deadline stopped it early: the
+            # caller says "there may be more further down" on the strength of
+            # this, and that must not be printed as though the list ran out.
+            "exhausted": error is None and index >= len(items),
+            "capped": error is None and asked >= cap and index < len(items),
+            "error": error}
 
 
 def sort_items(items):
@@ -3206,13 +3313,33 @@ def search_items(query):
     if window_here:
         # Dates fetched down the sorted list, keeping what is in the window and
         # stopping as soon as --limit is satisfied.
-        print(f"  Dates   : fetching publish dates down the list to find"
-              f"{f' {LIMIT}' if LIMIT else ''} video(s) {label}"
-              f" (about 2.1s each)...")
-        items, dated, exhausted = take_in_window(items, since, LIMIT)
-        counts["dated"] = dated
-        print(f"            dated {dated}, kept {len(items)}")
-        if not exhausted and (not LIMIT or len(items) < LIMIT):
+        wanted_text = f"{LIMIT} video(s)" if LIMIT else "every video"
+        print(f"  Dates   : walking the list for {wanted_text} {label},"
+              f" at about 2.1s per date, up to {DATE_RESOLVE_MAX}...")
+        candidates = len(items)
+        walk = take_in_window(items, since, LIMIT, deadline=SEARCH_DEADLINE)
+        items = walk["kept"]
+        # The walk stops as soon as --limit is filled, so the rest of the list
+        # was never looked at. Saying so is what makes the tally add up against
+        # "of N scanned" instead of leaving a silent remainder.
+        counts["unreached"] = max(0, candidates - walk["asked"])
+        counts["dated"] = walk["dated"]
+        counts["undated"] = walk["undated"]
+        # Among the ones that WERE dated, the rest fell outside the window -
+        # which is the biggest filter on this path and belongs in the tally.
+        counts["outside"] = max(0, walk["dated"] - len(items))
+        counts["date_capped"] = walk["capped"]
+        if walk["error"]:
+            # The fetch failed, so the window could not be applied. Reporting
+            # "nothing was published" would be a different claim entirely.
+            print(f"            could not fetch publish dates: {walk['error']}")
+            return [], f"Could not apply the date window: {walk['error']}"
+        print(f"            asked {walk['asked']}, dated {walk['dated']},"
+              f" kept {len(items)}")
+        if walk["undated"]:
+            print(f"            {walk['undated']} had no publish date and were"
+                  f" left out of the window")
+        if walk["capped"]:
             print(f"            stopped at the {DATE_RESOLVE_MAX}-video date cap;"
                   f" there may be more further down the list")
     else:
@@ -3224,11 +3351,17 @@ def search_items(query):
             if len(items) <= DATE_RESOLVE_MAX:
                 print(f"  Dates   : fetching {len(items)} publish date(s)"
                       f" (about {round(len(items) * 2.1)}s)...")
-                dated = resolve_dates(items)
+                dated, err = resolve_dates(items, deadline=SEARCH_DEADLINE)
                 counts["dated"] = dated
-                if dated < len(items):
+                counts["undated"] = len(items) - dated
+                if err:
+                    # Not fatal here: the dates are an extra on this path, and
+                    # the results themselves are sound without them.
+                    print(f"            could not fetch publish dates: {err}")
+                elif dated < len(items):
                     print(f"            {len(items) - dated} could not be dated")
             else:
+                counts["date_capped"] = True
                 print(f"  Dates   : {len(items)} results is past the"
                       f" {DATE_RESOLVE_MAX} this will date in one run; publish"
                       f" dates left out.  (--limit {DATE_RESOLVE_MAX} to get them)")
@@ -3279,6 +3412,11 @@ def write_search_results(path, query, items, label):
         "window": label or None,
         "min_duration": duration_floor() or None,
         "scanned": SEARCH_FOUND[0],
+        # What was actually done about publish dates, so a reader can tell a
+        # complete answer from one the date cap cut short.
+        "dates_fetched": (SEARCH_COUNTS[0] or {}).get("dated", 0),
+        "dates_missing": (SEARCH_COUNTS[0] or {}).get("undated", 0),
+        "date_capped": bool((SEARCH_COUNTS[0] or {}).get("date_capped")),
         "found": len(rows),
         "results": rows,
     }
@@ -3345,6 +3483,12 @@ def print_search_results(items, label):
         f"{counts.get('views')} under {MIN_VIEWS:,} views" if counts.get("views") else "",
         f"{counts.get('live')} live or upcoming" if counts.get("live") else "",
         f"{counts.get('skipped')} in skip.txt" if counts.get("skipped") else "",
+        # The window and the undateable are filters too, and on a windowed
+        # search the window is the biggest one - leaving it out made the line
+        # fail to add up against "of N scanned".
+        f"{counts.get('outside')} outside the window" if counts.get("outside") else "",
+        f"{counts.get('undated')} with no publish date" if counts.get("undated") else "",
+        f"{counts.get('unreached')} not reached" if counts.get("unreached") else "",
     ) if p)
     if dropped:
         print(f"  Filtered out: {dropped}")
@@ -3714,6 +3858,8 @@ def explain_empty_listing(counts):
         return
     floor = duration_floor()
     reasons = [
+        (counts.get("outside"), f"{counts.get('outside')} outside the date window"),
+        (counts.get("undated"), f"{counts.get('undated')} with no publish date"),
         (counts.get("short"), f"{counts.get('short')} shorter than {human_time(floor)}"),
         (counts.get("nolength"), f"{counts.get('nolength')} of unknown length"),
         (counts.get("views"), f"{counts.get('views')} under {MIN_VIEWS:,} views"),
@@ -3724,6 +3870,11 @@ def explain_empty_listing(counts):
     said = ", ".join(text for number, text in reasons if number)
     print(f"      none of {counts['scanned']} video(s) matched"
           f"{': ' + said if said else ''}")
+    if counts.get("outside") or counts.get("date_capped"):
+        print("      (a wider --days, or --this-month dropped, widens the window)")
+    if counts.get("date_capped"):
+        print(f"      (it stopped at the {DATE_RESOLVE_MAX}-video date cap, so"
+              f" there may be more further down the list)")
     if counts.get("short") or counts.get("nolength"):
         print("      (--shorts, or --min-duration 0, includes short-form videos)")
 
@@ -4298,8 +4449,9 @@ def parse_args(argv=None):
                    help=f"Results to scan before filtering. Default follows the "
                         f"route, because their costs differ about thirtyfold: "
                         f"{SEARCH_DEPTH_FLAT} normally (about 0.07s each), "
-                        f"{SEARCH_DEPTH_DATED} with a date window or a date sort "
-                        f"(about 2s each). Give a number to override either.")
+                        f"{SEARCH_DEPTH_DATED} when --sort date/oldest needs "
+                        f"every date up front (about 2s each). Give a number "
+                        f"to override either.")
     p.add_argument("--sort", "--sort-by", dest="sort", default="relevance",
                    choices=("relevance", "views", "popularity", "least-viewed",
                             "date", "oldest"),
@@ -4319,7 +4471,10 @@ def parse_args(argv=None):
                    help=f"Do not fetch publish dates for search results. They "
                         f"cost about 2.1s per video and are fetched only for "
                         f"the results that survive the filters, up to "
-                        f"{DATE_RESOLVE_MAX} of them.")
+                        f"{DATE_RESOLVE_MAX} of them. NOTE: with --days or "
+                        f"--this-month this also hands the window back to "
+                        f"YouTube, which answers it from a much narrower "
+                        f"search - faster, but fewer results.")
     p.add_argument("--shorts", action="store_true",
                    help="Include short-form videos (Shorts). Left out by default.")
     p.add_argument("--min-duration", type=count, default=SHORTS_SECONDS, metavar="SECONDS",
