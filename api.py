@@ -1090,6 +1090,77 @@ def video_comments(url, limit=100, replies=False, sort="top"):
     return comments
 
 
+def channel_info(channel, shorts=False, min_duration=180):
+    """One channel's details: counted from its own long videos."""
+    url = _lines(channel).strip().split("\n")[0].strip()
+    if not url:
+        raise ValueError("channel is required")
+    if not downloader.is_channel_url(url):
+        raise BadField("channel", f"not a channel link: {url}")
+    with downloader_globals(INCLUDE_SHORTS=bool(shorts),
+                            MIN_DURATION=_floor_seconds(min_duration),
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
+        details, err = downloader.channel_details(url)
+    if err:
+        raise LookupFailed(err)
+    return details
+
+
+def resolve_link(url):
+    """The canonical channel behind any link - a handle, a tab, or a video."""
+    link = _lines(url).strip().split("\n")[0].strip()
+    if not link:
+        raise ValueError("url is required")
+    with downloader_globals():
+        found, err = downloader.resolve_channel(link)
+    if err:
+        raise LookupFailed(err)
+    return found
+
+
+def channel_video_rows(channel, limit=0, shorts=False, min_duration=180):
+    """A channel's long videos, newest first, with each one's ratio to the
+    channel's own average."""
+    url = _lines(channel).strip().split("\n")[0].strip()
+    if not url:
+        raise ValueError("channel is required")
+    if not downloader.is_channel_url(url):
+        raise BadField("channel", f"not a channel link: {url}")
+    with downloader_globals(INCLUDE_SHORTS=bool(shorts),
+                            MIN_DURATION=_floor_seconds(min_duration)):
+        answer, err = downloader.channel_videos(url, limit=max(0, int(limit or 0)))
+    if err:
+        raise LookupFailed(err)
+    return answer
+
+
+def channel_playlist_rows(channel):
+    """A channel's playlists."""
+    url = _lines(channel).strip().split("\n")[0].strip()
+    if not url:
+        raise ValueError("channel is required")
+    if not downloader.is_channel_url(url):
+        raise BadField("channel", f"not a channel link: {url}")
+    with downloader_globals(SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
+        answer, err = downloader.channel_playlists(url)
+    if err and not answer:
+        raise LookupFailed(err)
+    return answer
+
+
+def similar_to(url, limit=0, shorts=False, min_duration=180, dates=True):
+    """Long videos like this one, found by searching for its title."""
+    link = one_url(url, "url")
+    with downloader_globals(INCLUDE_SHORTS=bool(shorts),
+                            MIN_DURATION=_floor_seconds(min_duration),
+                            RESOLVE_DATES=bool(dates),
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
+        answer, err = downloader.similar_videos(link, count=max(0, int(limit or 0)))
+    if err:
+        raise LookupFailed(err)
+    return answer
+
+
 def tools_present():
     return {t: downloader.shutil.which(t) is not None
             for t in ("yt-dlp", "ffmpeg", "ffprobe", "aria2c", "node", "deno")}
@@ -1372,6 +1443,109 @@ def build_app():
             return video_comments(url, limit, replies, sort)
         except ValueError as e:
             raise unprocessable(str(e), "query", "url")
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/resolve", tags=["lookups"], dependencies=keyed)
+    def get_resolve(url: str = Query(..., description="A handle, any channel "
+                                     "tab, or a video link.")):
+        """The canonical channel behind any link: its id, handle, name and
+        videos tab. Everything else keys off that channel id."""
+        try:
+            return resolve_link(url)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", getattr(e, "field", "url"))
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/channel", tags=["lookups"], dependencies=keyed)
+    def get_channel(channel: str = Query(..., description="A channel link."),
+                    shorts: bool = Query(False, description="Include short-form "
+                                         "videos in the metrics."),
+                    min_duration: int = Query(180, ge=0,
+                                              le=INT_MAX["min_duration"],
+                                              description="Length floor, seconds.")):
+        """One channel's details, counted from its own videos rather than
+        estimated: total and average and median views, the best video, average
+        length, uploads per week, first and last upload, and every video at 2x
+        the channel average or better.
+
+        The metrics are over the LONG videos only - a channel posting both
+        formats has two different view distributions and an average blended
+        across them describes neither. The Shorts are counted separately.
+        created, lifetime_views and country are scraped best-effort and may be
+        null."""
+        try:
+            return channel_info(channel, shorts, min_duration)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/channel/videos", tags=["lookups"], dependencies=keyed)
+    def get_channel_videos(channel: str = Query(..., description="A channel link."),
+                           limit: int = Query(0, ge=0, le=INT_MAX["limit"],
+                                              description="Newest N. 0 = all."),
+                           shorts: bool = Query(False, description="Include "
+                                                "short-form videos."),
+                           min_duration: int = Query(180, ge=0,
+                                                     le=INT_MAX["min_duration"],
+                                                     description="Length floor, "
+                                                     "seconds.")):
+        """A channel's long videos, newest first, each with its views, length
+        and ratio to the channel's own average.
+
+        That ratio is taken over EVERY long video before limit is applied, so
+        it compares a video with its channel rather than with the others on
+        this page. No publish dates: a flat listing has none and dating every
+        video costs about 2.1s each."""
+        try:
+            return channel_video_rows(channel, limit, shorts, min_duration)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/channel/playlists", tags=["lookups"], dependencies=keyed)
+    def get_channel_playlists(channel: str = Query(..., description="A channel link.")):
+        """A channel's playlists. One listing names them all; the video count
+        needs a request per playlist, so it is filled in for the first few and
+        is null after - capped says when."""
+        try:
+            return channel_playlist_rows(channel)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
+        except LookupFailed as e:
+            raise HTTPException(502, str(e))
+        except PreviewBusy as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/similar", tags=["lookups"], dependencies=keyed)
+    def get_similar(url: str = Query(..., description="A video link or id."),
+                    limit: int = Query(0, ge=0, le=INT_MAX["limit"],
+                                       description="Keep only the first N."),
+                    shorts: bool = Query(False, description="Include short-form."),
+                    min_duration: int = Query(180, ge=0,
+                                              le=INT_MAX["min_duration"],
+                                              description="Length floor, seconds."),
+                    dates: bool = Query(True, description="Fetch publish dates "
+                                        "(about 2.1s per video).")):
+        """Long videos like this one. YouTube's related feed is not reachable
+        through yt-dlp, so this searches YouTube for the video's own title -
+        the same near-match set match=related exists for - and leaves the video
+        itself out."""
+        try:
+            return similar_to(url, limit, shorts, min_duration, dates)
+        except ValueError as e:
+            raise unprocessable(str(e), "query", getattr(e, "field", "url"))
         except LookupFailed as e:
             raise HTTPException(502, str(e))
         except PreviewBusy as e:

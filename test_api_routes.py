@@ -153,7 +153,9 @@ class TestRoutes(unittest.TestCase):
         paths = self.c.get("/api/openapi.json").json()["paths"]
         self.assertEqual(sorted(paths), sorted([
             "/api/ping", "/api/health", "/api/preview", "/api/search",
-            "/api/video", "/api/transcript", "/api/comments", "/api/jobs",
+            "/api/video", "/api/transcript", "/api/comments",
+            "/api/resolve", "/api/channel", "/api/channel/videos",
+            "/api/channel/playlists", "/api/similar", "/api/jobs",
             "/api/jobs/{job_id}", "/api/jobs/{job_id}/videos",
             "/api/jobs/{job_id}/stop", "/api/jobs/{job_id}/files",
             "/api/jobs/{job_id}/files/{path}"]))
@@ -812,6 +814,85 @@ class TestRoutes(unittest.TestCase):
         self.assertIn("--no-dates", api.build_argv("/out", opts))
         opts = api.normalize_request({"search": "cats"})
         self.assertNotIn("--no-dates", api.build_argv("/out", opts))
+
+    # ------------------------------------- the four lookups over the API
+    def test_resolve_returns_the_channel(self):
+        self._stub(resolve_channel=lambda url: (
+            {"id": "UC" + "x" * 22, "name": "Ch", "handle": "@ch",
+             "link": "l", "videos_tab": "l/videos", "subscribers": 9,
+             "from": "video link"}, None))
+        r = self.c.get("/api/resolve?url=" + "a" * 11, headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["id"], "UC" + "x" * 22)
+
+    def test_channel_details_come_back_long_only(self):
+        d = api.downloader
+        seen = {}
+        self._stub(is_channel_url=lambda url: True,
+                   channel_details=lambda url: (
+                       seen.update(floor=d.duration_floor()) or ({"name": "Ch"}, None)))
+        r = self.c.get("/api/channel?channel=https://www.youtube.com/@X",
+                       headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen["floor"], 180, "long videos only, by default")
+        self.c.get("/api/channel?channel=https://www.youtube.com/@X&shorts=true",
+                   headers=self.h)
+        self.assertEqual(seen["floor"], 0)
+
+    def test_channel_videos_pass_the_limit_and_the_floor(self):
+        d = api.downloader
+        seen = {}
+
+        def videos(url, limit=0):
+            seen.update(limit=limit, floor=d.duration_floor())
+            return {"videos": [], "long_videos": 0}, None
+
+        self._stub(is_channel_url=lambda url: True, channel_videos=videos)
+        r = self.c.get("/api/channel/videos?channel=https://www.youtube.com/@X"
+                       "&limit=7", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen, {"limit": 7, "floor": 180})
+
+    def test_playlists_come_back(self):
+        self._stub(is_channel_url=lambda url: True,
+                   channel_playlists=lambda url: (
+                       {"playlists": [{"id": "PL1", "title": "One",
+                                       "link": "l", "videos": 3}],
+                        "counted": 1, "capped": False, "error": None}, None))
+        r = self.c.get("/api/channel/playlists?channel=https://www.youtube.com/@X",
+                       headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["playlists"][0]["videos"], 3)
+
+    def test_similar_comes_back(self):
+        self._stub(similar_videos=lambda url, count=0: (
+            {"id": "a" * 11, "query": "T", "scanned": 100, "found": 1,
+             "similar": [{"rank": 1, "id": "b" * 11}]}, None))
+        r = self.c.get("/api/similar?url=" + "a" * 11 + "&limit=5", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["found"], 1)
+
+    def test_the_channel_routes_refuse_a_video_link(self):
+        for path, field in (("/api/channel", "channel"),
+                            ("/api/channel/videos", "channel"),
+                            ("/api/channel/playlists", "channel")):
+            r = self.c.get(f"{path}?{field}=https://youtu.be/" + "a" * 11,
+                           headers=self.h)
+            self.assertEqual(r.status_code, 422, path)
+            self.assertEqual(r.json()["detail"][0]["loc"][-1], field)
+
+    def test_the_new_lookups_need_the_key(self):
+        for path, params in (("/api/resolve", "url=" + "a" * 11),
+                             ("/api/channel", "channel=https://youtube.com/@X"),
+                             ("/api/channel/videos", "channel=https://youtube.com/@X"),
+                             ("/api/channel/playlists", "channel=https://youtube.com/@X"),
+                             ("/api/similar", "url=" + "a" * 11)):
+            self.assertEqual(self.c.get(f"{path}?{params}").status_code, 401, path)
+
+    def test_a_lookup_that_youtube_will_not_answer_is_a_502(self):
+        self._stub(resolve_channel=lambda url: (None, "Video unavailable"))
+        r = self.c.get("/api/resolve?url=" + "a" * 11, headers=self.h)
+        self.assertEqual(r.status_code, 502)
 
     def test_a_blocked_run_says_so(self):
         os.environ["FAKE_MODE"] = "blocked"
