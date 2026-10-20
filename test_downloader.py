@@ -34,6 +34,17 @@ def glob_words(folder):
             if n.startswith("words_") and not n.startswith("words_not_found_")]
 
 
+# The module's own values for the tuning constants, captured before any test
+# has mutated one. setUp restores from here rather than from whatever the
+# previous test left behind: a tearDown that puts back what setUp SAW will
+# propagate a leak down the whole file, which is how DATE_RESOLVE_MAX came to
+# be stuck at a value it had not had since it was raised to 100.
+PRISTINE = {name: getattr(d, name) for name in (
+    "DATE_RESOLVE_MAX", "CHANNEL_VIDEO_CAP", "PLAYLIST_COUNT_CAP",
+    "PLAYLIST_LIST_CAP", "SHORTS_SECONDS", "SEARCH_DEPTH_FLAT",
+    "SEARCH_DEPTH_DATED", "DATE_TIMEOUT", "CHANNEL_PAGE")}
+
+
 class PlatformCase:
     """Mixin holding the tests; the two subclasses below run them per platform.
 
@@ -52,7 +63,7 @@ class PlatformCase:
                        d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
                        d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
                        d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION,
-                       d.RESOLVE_DATES, d.DETAILS_ONLY)
+                       d.RESOLVE_DATES, d.DETAILS_ONLY, d.REPORT)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -75,6 +86,8 @@ class PlatformCase:
         d.THIS_MONTH = False
         d.IN_CHANNEL = None
         d.DAYS = 0
+        for name, value in PRISTINE.items():
+            setattr(d, name, value)
         d.SEARCH_MATCH = "related"
         # Fetching publish dates is a network call per video. The tests that
         # care about it stub the subprocess and switch it on themselves.
@@ -102,7 +115,7 @@ class PlatformCase:
          d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
          d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
          d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION,
-         d.RESOLVE_DATES, d.DETAILS_ONLY) = self._saved
+         d.RESOLVE_DATES, d.DETAILS_ONLY, d.REPORT) = self._saved
         d.LOG_RECORDS[:] = self._records
 
     # ------------------------------------------------------------------ search
@@ -3253,8 +3266,7 @@ class PlatformCase:
                 kept, _err = d.search_items("cats")
         finally:
             d.resolve_dates = saved
-            d.search_flat = saved_flat
-            d.DATE_RESOLVE_MAX = 40
+            d.search_flat = saved_flat   # tearDown puts the cap back
         self.assertEqual(len(kept), 3)
         self.assertIn("publish dates left out", buf.getvalue())
         self.assertIn("--limit", buf.getvalue())
@@ -3361,8 +3373,7 @@ class PlatformCase:
         try:
             walk = d.take_in_window(items, now - 30 * 86400, limit=5)
         finally:
-            d.resolve_dates = saved
-            d.DATE_RESOLVE_MAX = 40
+            d.resolve_dates = saved      # tearDown puts the cap back
         self.assertEqual(walk["kept"], [])
         self.assertEqual(walk["asked"], 4, "it must stop at the cap")
         self.assertEqual(walk["dated"], 4)
@@ -3741,42 +3752,86 @@ class PlatformCase:
             d.channel_details, d.video_details = saved
         self.assertEqual(calls, ["channel", "video"])
 
+    def _manual(self):
+        """AGENTS.md's text, or skip. It is a deliverable, so it is tested."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "AGENTS.md")
+        if not os.path.exists(path):
+            self.skipTest("AGENTS.md is not in this checkout")
+        return open(path, encoding="utf-8").read(), here
+
+    @staticmethod
+    def _section(text, heading):
+        """One section of the manual, found by its heading text.
+
+        By text, not by its number: renumbering the sections must not quietly
+        make these checks read the wrong part of the file and pass.
+        """
+        at = text.find(heading)
+        if at < 0:
+            return ""
+        rest = text[at + len(heading):]
+        end = rest.find("\n## ")
+        return rest[:end] if end >= 0 else rest
+
     def test_the_agent_manual_names_real_trace_events(self):
         # AGENTS.md tells an agent to grep the trace for these. A renamed event
         # would send it looking for something that no longer exists.
-        here = os.path.dirname(os.path.abspath(__file__))
-        manual = os.path.join(here, "AGENTS.md")
-        if not os.path.exists(manual):
-            self.skipTest("AGENTS.md is not in this checkout")
+        text, here = self._manual()
         source = open(os.path.join(here, "downloader.py"), encoding="utf-8").read()
         emitted = set(re.findall(r'log_debug\("([a-z_]+)"', source))
-        text = open(manual, encoding="utf-8").read()
-        # Only the backticked names inside the logging section, so prose is
-        # not mistaken for an event name.
-        section = text.split("## 6.", 1)[-1].split("## 7.", 1)[0]
-        named = set(re.findall(r"`([a-z_]+(?:_start|_finish|_block|_timeout|_dates))`",
-                               section))
+        section = self._section(text, "Reading the logs")
+        self.assertTrue(section, "the manual should still have a logging section")
+        named = set(re.findall(r"`([a-z][a-z_]*[a-z])`", section))
+        named = {n for n in named if "_" in n and not n.endswith("_")}
         self.assertTrue(named, "the logging section should name some events")
-        missing = sorted(n for n in named if n not in emitted)
-        self.assertEqual(missing, [], f"AGENTS.md names events the code never emits: {missing}")
+        # Only names that look like events, not field names it also mentions.
+        looks_like_event = {n for n in named
+                            if n.split("_")[-1] in ("start", "finish", "block",
+                                                    "timeout", "dates", "page",
+                                                    "videos", "playlists")
+                            or n == "resolve"}
+        missing = sorted(n for n in looks_like_event if n not in emitted)
+        self.assertEqual(missing, [],
+                         f"AGENTS.md names events the code never emits: {missing}")
 
-    def test_the_agent_manual_matches_the_real_defaults(self):
-        here = os.path.dirname(os.path.abspath(__file__))
-        manual = os.path.join(here, "AGENTS.md")
-        if not os.path.exists(manual):
-            self.skipTest("AGENTS.md is not in this checkout")
-        text = open(manual, encoding="utf-8").read()
-        args = d.parse_args(["/tmp"])
-        # Each claim the manual makes in numbers, checked against the code.
-        for claim, value in (("floor is **180s**", d.SHORTS_SECONDS),
-                             ("150 normally, 40 for a date sort", d.SEARCH_DEPTH_FLAT),
-                             ("(2000) videos", d.CHANNEL_VIDEO_CAP)):
-            self.assertIn(str(value), claim,
-                          f"the manual's wording no longer matches {value}")
-            self.assertIn(claim, text, f"AGENTS.md should still say: {claim}")
-        self.assertEqual(args.min_duration, d.SHORTS_SECONDS)
-        self.assertEqual(args.match, "related")
-        self.assertIsNone(args.search_count)
+    def test_the_agent_manual_quotes_the_real_numbers(self):
+        # Checked per keyword rather than by exact sentence, so rewording the
+        # manual is free but changing a number without updating it is not.
+        text, _here = self._manual()
+        lines = text.splitlines()
+        for keyword, value in (("min-duration", d.SHORTS_SECONDS),
+                               ("read per channel", d.CHANNEL_VIDEO_CAP),
+                               ("playlists get counts", d.PLAYLIST_COUNT_CAP),
+                               ("dated per CLI run", d.DATE_RESOLVE_MAX)):
+            hits = [ln for ln in lines if keyword in ln]
+            self.assertTrue(hits, f"AGENTS.md no longer mentions {keyword!r}")
+            self.assertTrue(any(str(value) in ln for ln in hits),
+                            f"AGENTS.md's {keyword!r} line does not say {value}")
+
+    def test_the_agent_manual_documents_every_flag(self):
+        # An agent reading it must not find a flag missing, nor one that no
+        # longer exists.
+        text, _here = self._manual()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                d.parse_args(["--help"])
+            except SystemExit:
+                pass
+        real = set(re.findall(r"(--[a-z][a-z-]+)", buf.getvalue()))
+        real -= {"--help"}
+        documented = set(re.findall(r"(--[a-z][a-z-]+)", text))
+        missing = sorted(real - documented)
+        self.assertEqual(missing, [], f"AGENTS.md documents no: {missing}")
+        # The manual also shows api.py's own flags and a curl invocation, so
+        # those are not downloader flags it invented.
+        elsewhere = {"--new-key", "--share", "--port", "--outdir",
+                     "--data-urlencode"}
+        invented = sorted(documented - real - elsewhere)
+        self.assertEqual(invented, [],
+                         f"AGENTS.md documents flags the downloader does not have:"
+                         f" {invented}")
 
     # ------------------------------------------- the four remaining lookups
     def test_long_only_keeps_what_clears_the_floor(self):
