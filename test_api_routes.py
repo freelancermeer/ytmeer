@@ -645,6 +645,90 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual([r["url"] for r in api.video_records(records)],
                          ["https://youtu.be/aaaaaaaaaaa"])
 
+    def test_the_request_model_and_the_defaults_agree(self):
+        # create_job dumps the body with exclude_unset so it can tell what the
+        # caller actually sent, and DEFAULTS then fills the rest. That is only
+        # safe while the two sets of defaults are identical - if they drift, a
+        # field the caller left out silently changes value.
+        props = (self.c.get("/api/openapi.json").json()
+                 ["components"]["schemas"]["JobRequest"]["properties"])
+        for name, spec in props.items():
+            if name == "links":
+                continue
+            self.assertIn(name, api.DEFAULTS, f"{name} is not in DEFAULTS")
+            self.assertEqual(spec.get("default"), api.DEFAULTS[name],
+                             f"{name}: schema default differs from DEFAULTS")
+
+    def test_a_flag_that_needs_a_search_is_refused_only_when_sent(self):
+        # A defaulted match must not trip the guard, or every ordinary job 422s.
+        self.assertEqual(self.c.post("/api/jobs", json={"links": "https://youtu.be/" + "a" * 11},
+                                     headers=self.h).status_code, 202)
+        for field, value in (("match", "exact"), ("this_month", True),
+                             ("search_count", 60)):
+            r = self.c.post("/api/jobs", json={"links": "https://youtu.be/" + "a" * 11,
+                                               field: value}, headers=self.h)
+            self.assertEqual(r.status_code, 422, f"{field} without search should be refused")
+            self.assertIn("search", r.json()["detail"][0]["msg"])
+
+    def test_the_preview_applies_the_same_length_floor_as_a_job(self):
+        d = api.downloader
+        seen = {}
+        self._stub(is_channel_url=lambda url: True,
+                   channel_videos_url=lambda url: url,
+                   list_channel_videos=lambda url, deadline=None: (
+                       seen.update(floor=d.duration_floor()) or ([], "Ch", None)))
+        r = self.c.get("/api/preview?channel=https://www.youtube.com/@X", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen["floor"], 180, "a preview must filter as the job will")
+        self.assertEqual(r.json()["min_duration"], 180, "and must say which floor it used")
+
+    def test_the_preview_can_be_told_to_include_shorts(self):
+        d = api.downloader
+        seen = {}
+        self._stub(is_channel_url=lambda url: True,
+                   channel_videos_url=lambda url: url,
+                   list_channel_videos=lambda url, deadline=None: (
+                       seen.update(floor=d.duration_floor()) or ([], "Ch", None)))
+        r = self.c.get("/api/preview?channel=https://www.youtube.com/@X&shorts=true",
+                       headers=self.h)
+        self.assertEqual(seen["floor"], 0)
+        self.assertIsNone(r.json()["min_duration"])
+        r = self.c.get("/api/preview?channel=https://www.youtube.com/@X&min_duration=600",
+                       headers=self.h)
+        self.assertEqual(seen["floor"], 600)
+        self.assertEqual(r.json()["min_duration"], 600)
+
+    def test_a_422_names_the_parameter_that_was_wrong(self):
+        # Reporting every bad value against the first parameter sends the caller
+        # looking in the wrong place.
+        for path, params, field in (
+                ("/api/search", "query=x&match=sideways", "match"),
+                ("/api/search", "query=x&sort=sideways", "sort"),
+                ("/api/search", "query=x&in_channel=nonsense", "in_channel"),
+                ("/api/search", "query=x&days=7&this_month=true", "this_month"),
+                ("/api/preview", "channel=notachannel", "channel"),
+        ):
+            r = self.c.get(f"{path}?{params}", headers=self.h)
+            self.assertEqual(r.status_code, 422, f"{path}?{params}")
+            self.assertEqual(r.json()["detail"][0]["loc"][-1], field,
+                             f"{path}?{params} should blame {field}")
+
+    def test_in_channel_makes_match_inert_and_says_so(self):
+        self._stub(search_items=lambda q: ([], None),
+                   is_channel_url=lambda url: True)
+        r = self.c.get("/api/search?query=x&in_channel=https://www.youtube.com/@H"
+                       "&match=exact", headers=self.h)
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()["match"],
+                          "in_channel searches the channel's own tab; match never applied")
+        r = self.c.get("/api/search?query=x&match=exact", headers=self.h)
+        self.assertEqual(r.json()["match"], "exact")
+
+    def test_the_search_schema_constrains_match(self):
+        params = {p["name"]: p for p in (self.c.get("/api/openapi.json").json()
+                  ["paths"]["/api/search"]["get"]["parameters"])}
+        self.assertEqual(params["match"]["schema"]["enum"], list(api.MATCH_MODES))
+
     def test_a_blocked_run_says_so(self):
         os.environ["FAKE_MODE"] = "blocked"
         job = self.wait(self.start())

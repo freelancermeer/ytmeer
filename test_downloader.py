@@ -50,7 +50,7 @@ class PlatformCase:
                        d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
                        d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
                        d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
-                       d.DAYS)
+                       d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -72,6 +72,12 @@ class PlatformCase:
         d.THIS_MONTH = False
         d.IN_CHANNEL = None
         d.DAYS = 0
+        d.SEARCH_MATCH = "related"
+        d.INCLUDE_SHORTS = False
+        # The length floor is a concern of its own, with its own tests below.
+        # Left off here so a fixture written to test a view floor or the
+        # live/upcoming rule does not also have to carry a duration.
+        d.MIN_DURATION = 0
         # Module state like any other: without this a summary written by one
         # test counts the channel failures logged by another.
         self._records = list(d.LOG_RECORDS)
@@ -89,15 +95,28 @@ class PlatformCase:
          d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
          d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
          d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
-         d.DAYS) = self._saved
+         d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION) = self._saved
         d.LOG_RECORDS[:] = self._records
 
     # ------------------------------------------------------------------ search
-    def test_search_target_is_youtube_wide_by_default(self):
+    def test_the_default_net_is_youtubes_own_results_page(self):
+        # ytsearch: answers a far narrower question: measured on one long title
+        # it returned 2 videos where the results page returned 150.
+        self.assertEqual(d.search_target("cats", 25),
+                         "https://www.youtube.com/results?search_query=cats")
+
+    def test_match_exact_uses_the_narrow_ytsearch_route(self):
+        d.SEARCH_MATCH = "exact"
         self.assertEqual(d.search_target("cats", 25), "ytsearch25:cats")
+
+    def test_a_query_is_url_encoded_for_the_results_page(self):
+        self.assertEqual(d.search_target("two words & more", 5),
+                         "https://www.youtube.com/results?"
+                         "search_query=two%20words%20%26%20more")
 
     def test_a_query_may_contain_a_colon(self):
         # Only the first colon separates the prefix from the query.
+        d.SEARCH_MATCH = "exact"
         self.assertEqual(d.search_target("kash patel: the hearing", 5),
                          "ytsearch5:kash patel: the hearing")
 
@@ -210,9 +229,103 @@ class PlatformCase:
         args = d.parse_args(["/tmp"])
         self.assertIsNone(args.search)
         self.assertIsNone(args.in_channel)
-        self.assertEqual(args.search_count, 50)
+        self.assertIsNone(args.search_count)       # None = pick by route
         self.assertEqual(args.sort, "relevance")
         self.assertFalse(args.this_month)
+        self.assertEqual(args.match, "related")    # near-matches come too
+        self.assertFalse(args.shorts)              # long videos only
+        self.assertEqual(args.min_duration, d.SHORTS_SECONDS)
+
+    def test_the_search_depth_follows_the_route(self):
+        # Scanning costs about 0.07s per result flat and about 2s dated, so one
+        # default cannot serve both: 150 dated would take five minutes.
+        d.SEARCH_COUNT = None
+        self.assertEqual(d.search_depth(False), d.SEARCH_DEPTH_FLAT)
+        self.assertEqual(d.search_depth(True), d.SEARCH_DEPTH_DATED)
+        self.assertGreater(d.SEARCH_DEPTH_FLAT, d.SEARCH_DEPTH_DATED)
+
+    def test_an_explicit_search_count_wins_on_either_route(self):
+        d.SEARCH_COUNT = 7
+        self.assertEqual(d.search_depth(False), 7)
+        self.assertEqual(d.search_depth(True), 7)
+
+    def test_a_date_window_shortens_the_default_scan(self):
+        d.SEARCH_COUNT = None
+        d.DAYS = 30
+        since, _label = d.search_window()
+        self.assertEqual(d.search_depth(since is not None), d.SEARCH_DEPTH_DATED)
+        d.DAYS = 0
+        d.SORT_BY = "date"            # a date sort needs the dated route too
+        since, _label = d.search_window()
+        self.assertEqual(d.search_depth(since is not None or d.SORT_BY in ("date", "oldest")),
+                         d.SEARCH_DEPTH_DATED)
+
+    def test_a_duration_is_read_not_merely_type_checked(self):
+        # A route handing over "900" describes a 15-minute video; treating that
+        # as "length unknown" would drop it, which is the one thing the floor
+        # must never do by accident.
+        for value, want in ((900, 900.0), ("900", 900.0), (" 900 ", 900.0),
+                            ("900.0", 900.0), (900.5, 900.5)):
+            self.assertEqual(d.as_seconds(value), want, repr(value))
+        for value in ("NA", None, "", "abc", True, False, [], {}):
+            self.assertIsNone(d.as_seconds(value), repr(value))
+
+    def test_both_routes_read_a_duration_the_same_way(self):
+        d.MIN_DURATION = 180
+        line = "aaaaaaaaaaa\t1700000000\t500\tnot_live\t900.0\tChan\tA Title"
+        items, _err, _cmd = self._dated(line + "\n")
+        self.assertEqual(items[0]["duration"], 900.0,
+                         "a fractional duration must not read as unknown")
+
+    def test_a_channel_filtered_to_nothing_says_why(self):
+        # The tally goes to the log through note(), which is --verbose only, so
+        # without this a channel of Shorts looks like a channel with no videos.
+        d.MIN_DURATION = 180
+        self.listing([
+            {"id": "a" * 11, "title": "S1", "view_count": 100, "duration": 30},
+            {"id": "b" * 11, "title": "S2", "view_count": 200, "duration": None},
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            links, _name, err = d.list_channel_videos("https://www.youtube.com/@X")
+        shown = buf.getvalue()
+        self.assertEqual(links, [])
+        self.assertIsNone(err)
+        self.assertIn("none of 2 video(s) matched", shown)
+        self.assertIn("1 shorter than", shown)
+        self.assertIn("1 of unknown length", shown)
+        self.assertIn("--shorts", shown, "it must name the way to undo it")
+
+    def test_a_channel_that_kept_something_explains_nothing(self):
+        d.MIN_DURATION = 180
+        self.listing([
+            {"id": "a" * 11, "title": "Long", "view_count": 100, "duration": 900},
+            {"id": "b" * 11, "title": "S", "view_count": 200, "duration": 30},
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(len(links), 1)
+        self.assertNotIn("none of", buf.getvalue())
+
+    def test_an_empty_channel_is_not_explained_as_filtered(self):
+        self.listing([])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            links, _name, _err = d.list_channel_videos("https://www.youtube.com/@X")
+        self.assertEqual(links, [])
+        self.assertNotIn("none of", buf.getvalue(),
+                         "nothing was scanned, so there is no reason to give")
+
+    def test_match_and_shorts_flags_parse(self):
+        self.assertEqual(d.parse_args(["/tmp", "--match", "exact"]).match, "exact")
+        self.assertTrue(d.parse_args(["/tmp", "--shorts"]).shorts)
+        self.assertEqual(d.parse_args(["/tmp", "--min-duration", "600"]).min_duration, 600)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--match", "sideways"])
+            with self.assertRaises(SystemExit):
+                d.parse_args(["/tmp", "--min-duration", "-1"])
 
     def test_least_viewed_is_a_sort_choice(self):
         self.assertEqual(d.parse_args(["/tmp", "--sort", "least-viewed"]).sort,
@@ -2451,18 +2564,18 @@ class PlatformCase:
     def test_the_dated_route_reads_live_status(self):
         # The live/upcoming rule read a key this route never produced, so every
         # premiere and in-progress stream sailed through it.
-        line = "aaaaaaaaaaa\t1700000000\t500\tis_live\tChan\tA Title"
+        line = "aaaaaaaaaaa\t1700000000\t500\tis_live\t900\tChan\tA Title"
         items, err, _cmd = self._dated(line + "\n")
         self.assertIsNone(err)
         self.assertEqual(items[0]["live_status"], "is_live")
 
     def test_the_dated_route_reads_na_live_status_as_unknown(self):
-        line = "aaaaaaaaaaa\t1700000000\t500\tNA\tChan\tA Title"
+        line = "aaaaaaaaaaa\t1700000000\t500\tNA\t900\tChan\tA Title"
         items, _err, _cmd = self._dated(line + "\n")
         self.assertIsNone(items[0]["live_status"])
 
     def test_a_tab_inside_a_title_does_not_truncate_it(self):
-        line = "aaaaaaaaaaa\t1700000000\t500\tnot_live\tChan\tPart A\tPart B"
+        line = "aaaaaaaaaaa\t1700000000\t500\tnot_live\t900\tChan\tPart A\tPart B"
         items, _err, _cmd = self._dated(line + "\n")
         self.assertEqual(items[0]["title"], "Part A\tPart B")
 
@@ -2641,6 +2754,113 @@ class PlatformCase:
                 self.assertIn(key, summary, f"{writer} should write {key}")
             self.assertEqual(summary["mode"], "transcript")
             self.assertEqual(summary["search_sort"], "views")
+
+    # ----------------------------------------- long videos only, no Shorts
+    def test_the_length_floor_is_on_by_default(self):
+        # Asserted on what a real run gets, not on the module global: setUp
+        # turns the floor off so the other tests need no durations.
+        self.assertEqual(d.SHORTS_SECONDS, 180, "a Short is at most 3 minutes")
+        args = d.parse_args(["/tmp"])
+        self.assertEqual(args.min_duration, 180)
+        self.assertFalse(args.shorts)
+
+    def test_the_floor_drops_a_short_and_keeps_a_long_video(self):
+        d.MIN_DURATION = 180
+        self.assertEqual(d.wanted_entry({"duration": 45})[1], "short")
+        self.assertEqual(d.wanted_entry({"duration": 179})[1], "short")
+        self.assertTrue(d.wanted_entry({"duration": 180})[0])
+        self.assertTrue(d.wanted_entry({"duration": 1277})[0])
+
+    def test_an_unknown_length_cannot_be_shown_to_be_a_long_video(self):
+        # A Shorts listing reports no duration at all, so "no length" is the
+        # one signal that a Shorts tab gives - and it is kept apart from
+        # "short", which was actually measured.
+        d.MIN_DURATION = 180
+        self.assertEqual(d.wanted_entry({"duration": None})[1], "nolength")
+        self.assertEqual(d.wanted_entry({})[1], "nolength")
+        self.assertEqual(d.wanted_entry({"duration": "NA"})[1], "nolength")
+
+    def test_asking_for_shorts_turns_the_floor_off(self):
+        d.MIN_DURATION = 180
+        d.INCLUDE_SHORTS = True
+        self.assertEqual(d.duration_floor(), 0)
+        for entry in ({"duration": 5}, {"duration": None}, {}):
+            self.assertTrue(d.wanted_entry(entry)[0], entry)
+
+    def test_a_zero_min_duration_also_turns_it_off(self):
+        d.MIN_DURATION = 0
+        self.assertEqual(d.duration_floor(), 0)
+        self.assertTrue(d.wanted_entry({"duration": 5})[0])
+
+    def test_a_shorts_tab_link_is_a_request_for_shorts(self):
+        # Applying the floor there would drop every video on the tab, since a
+        # Shorts listing reports no duration.
+        for url in ("https://www.youtube.com/@H/shorts",
+                    "https://www.youtube.com/@H/shorts/",
+                    "https://www.youtube.com/@H/shorts?x=1"):
+            self.assertTrue(d.is_shorts_tab(url), url)
+        for url in ("https://www.youtube.com/@H/videos",
+                    "https://www.youtube.com/@H",
+                    "https://www.youtube.com/watch?v=aaaaaaaaaaa"):
+            self.assertFalse(d.is_shorts_tab(url), url)
+        d.MIN_DURATION = 180
+        self.assertTrue(d.wanted_entry({"duration": None}, allow_short=True)[0])
+        self.assertTrue(d.wanted_entry({"duration": 20}, allow_short=True)[0])
+
+    def test_the_floor_does_not_override_the_live_rule(self):
+        d.MIN_DURATION = 180
+        self.assertEqual(d.wanted_entry({"duration": 9999,
+                                         "live_status": "is_live"})[1], "live")
+
+    def test_the_view_floor_still_applies_above_the_length_floor(self):
+        d.MIN_DURATION = 180
+        d.MIN_VIEWS = 1000
+        self.assertEqual(d.wanted_entry({"duration": 900, "view_count": 10})[1], "views")
+        self.assertTrue(d.wanted_entry({"duration": 900, "view_count": 5000})[0])
+
+    def test_a_search_drops_shorts_on_the_flat_route(self):
+        d.MIN_DURATION = 180
+        kept, _err, found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "Long",
+             "views": 500, "duration": 1200},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "Short",
+             "views": 900000, "duration": 30},
+            {"id": "c" * 11, "url": d.watch_url("c" * 11), "title": "No length",
+             "views": 700, "duration": None},
+        ], dated=False)
+        # The Short had by far the most views and still must not win.
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+        self.assertEqual(found, 3)
+
+    def test_a_search_drops_shorts_on_the_dated_route_too(self):
+        d.MIN_DURATION = 180
+        d.DAYS = 7
+        now = int(time.time() - 3600)
+        kept, _err, _found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "Long",
+             "views": 5, "epoch": now, "duration": 1200},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "Short",
+             "views": 5, "epoch": now, "duration": 30},
+        ])
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+
+    def test_the_dated_route_reads_duration(self):
+        line = "aaaaaaaaaaa\t1700000000\t500\tnot_live\t1277\tChan\tA Title"
+        items, err, _cmd = self._dated(line + "\n")
+        self.assertIsNone(err)
+        self.assertEqual(items[0]["duration"], 1277)
+        line = "aaaaaaaaaaa\t1700000000\t500\tnot_live\tNA\tChan\tA Title"
+        items, _err, _cmd = self._dated(line + "\n")
+        self.assertIsNone(items[0]["duration"])
+
+    def test_a_search_row_reports_the_length(self):
+        row = d.search_row({"id": "a" * 11, "url": "u", "title": "T",
+                            "views": 5, "duration": 1277}, 1)
+        self.assertEqual(row["duration"], 1277)
+        self.assertEqual(row["duration_text"], d.human_time(1277))
+        row = d.search_row({"id": "a" * 11, "url": "u", "title": "T"}, 1)
+        self.assertIsNone(row["duration"])
+        self.assertIsNone(row["duration_text"])
 
 
 class TestMacOS(PlatformCase, unittest.TestCase):

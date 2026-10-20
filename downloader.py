@@ -145,11 +145,35 @@ COMMENT_COUNT   = [0]      # comments written this run, for the summary
 COMMENT_TIMEOUT = 600
 
 SEARCH_QUERY   = None      # --search QUERY: run a YouTube search first
-SEARCH_COUNT   = 50        # results to ask YouTube for before filtering
+
+# How many results to scan, when --search-count was not given. One number
+# cannot serve both routes: scanning costs about 0.07s per result on the cheap
+# flat listing and about 2s on the dated one, which needs a full extraction per
+# video to learn its upload date. 150 is the depth the research wants and takes
+# about 10s flat; the same 150 dated would take five minutes, longer than the
+# REST API will hold its lock for. So the depth follows the route, and the run
+# prints which one it used.
+SEARCH_DEPTH_FLAT  = 150
+SEARCH_DEPTH_DATED = 40
+SEARCH_COUNT   = None      # --search-count N; None = pick by route
 SORT_BY        = "relevance"   # relevance | views | date | oldest
 THIS_MONTH     = False     # --this-month: since the 1st of the current month
 IN_CHANNEL     = None      # --in-channel URL: search inside that channel only
 SEARCH_FOUND   = [0]       # results the last search returned, before filtering
+
+# How wide a net the search casts. These are two different questions asked of
+# YouTube, not two orderings of one answer - see web_search_url().
+#   related - YouTube's own results page: the near-matches come too
+#   exact   - yt-dlp's ytsearch: pseudo-URL, which answers far more narrowly
+SEARCH_MATCH   = "related"
+MATCH_MODES    = ("related", "exact")
+
+# A Short is at most 3 minutes, so this floor excludes them without needing a
+# field YouTube does not publish. It is a floor on length, not a Shorts flag:
+# that is the only signal a search listing actually carries.
+SHORTS_SECONDS = 180
+MIN_DURATION   = SHORTS_SECONDS   # --min-duration N: shortest video to keep
+INCLUDE_SHORTS = False            # --shorts: let short-form videos through
 SEARCH_TIMEOUT = 900       # a dated search extracts every result it scans
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -2836,16 +2860,34 @@ def channel_search_url(channel, query):
     return f"{base}/search?query={quote(query)}"
 
 
+def web_search_url(query):
+    """YouTube's own results page for a query - what a person sees in a browser.
+
+    This is the relevance-ordered list, and relevance is the point: it also
+    carries the near-matches, which for research are the useful part - the same
+    story told by another channel, the opposite angle on it, the same formula in
+    another language. Asking YouTube to sort by views instead collapses onto the
+    exact phrase and loses all of that.
+
+    yt-dlp's ytsearch: pseudo-URL answers a much narrower question. Measured on
+    one long title: ytsearch100: returned 2 videos where this returned 150.
+    """
+    return f"https://www.youtube.com/results?search_query={quote(query)}"
+
+
 def search_target(query, count):
     """What to hand yt-dlp for this search.
 
-    With --in-channel that is the channel's search tab; otherwise yt-dlp's own
-    ytsearchN: pseudo-URL, where only the first colon separates the prefix from
-    the query, so the query may contain colons of its own.
+    With --in-channel that is the channel's own search tab. Otherwise it is
+    whichever net SEARCH_MATCH asks for: the results page, or ytsearchN: - where
+    only the first colon separates the prefix from the query, so the query may
+    contain colons of its own.
     """
     if IN_CHANNEL:
         return channel_search_url(IN_CHANNEL, query)
-    return f"ytsearch{max(1, count)}:{query}"
+    if SEARCH_MATCH == "exact":
+        return f"ytsearch{max(1, count)}:{query}"
+    return web_search_url(query)
 
 
 def search_flat(query, count):
@@ -2880,7 +2922,7 @@ def search_dated(query, count, since=None):
         # one field that can itself contain a tab, and the parse below gives the
         # last field whatever remains of the line.
         "--print", "%(id)s\t%(timestamp)s\t%(view_count)s\t%(live_status)s"
-                   "\t%(channel)s\t%(title)s",
+                   "\t%(duration)s\t%(channel)s\t%(title)s",
     ]
     if since is not None:
         days = max(1, int((time.time() - since) / 86400) + 1)
@@ -2895,10 +2937,10 @@ def search_dated(query, count, since=None):
         return [], f"Could not run yt-dlp: {e}"
     items = []
     for line in (out.stdout or "").splitlines():
-        parts = line.split("\t", 5)
-        if len(parts) < 6 or len(parts[0]) != 11:
+        parts = line.split("\t", 6)
+        if len(parts) < 7 or len(parts[0]) != 11:
             continue
-        vid, stamp, views, live, channel, title = parts
+        vid, stamp, views, live, length, channel, title = parts
         items.append({
             "id": vid,
             "url": watch_url(vid),
@@ -2910,6 +2952,9 @@ def search_dated(query, count, since=None):
             # too; without it a premiere or an in-progress stream would pass
             # the filter that exists to keep them out.
             "live_status": None if live == "NA" else live,
+            # Same reason, for the Shorts floor. as_seconds, so there is one
+            # rule for reading a duration wherever it comes from.
+            "duration": as_seconds(length),
         })
     if not items and out.returncode != 0:
         msg = (out.stderr or "").strip().splitlines()
@@ -2936,19 +2981,32 @@ def sort_items(items):
     return items
 
 
+def search_depth(needs_dates):
+    """How many results this search will scan.
+
+    An explicit --search-count is used as given, however slow that makes it.
+    Without one the depth follows the route (see SEARCH_DEPTH_FLAT).
+    """
+    if SEARCH_COUNT:
+        return max(1, SEARCH_COUNT)
+    return SEARCH_DEPTH_DATED if needs_dates else SEARCH_DEPTH_FLAT
+
+
 def search_items(query):
     """Run the search and return (items, error), filtered, sorted and capped."""
     since, label = search_window()
     # A date sort needs upload dates, which only this route returns; a window
     # needs them too. Either reason is enough to take it.
     needs_dates = since is not None or SORT_BY in ("date", "oldest")
+    depth = search_depth(needs_dates)
     log_debug("search_start", stage="search", query=redact_text(query),
-              count=SEARCH_COUNT, sort=SORT_BY, days=DAYS, this_month=THIS_MONTH,
+              count=depth, asked=SEARCH_COUNT, sort=SORT_BY, days=DAYS,
+              this_month=THIS_MONTH,
               in_channel=redact_url(IN_CHANNEL) if IN_CHANNEL else None,
               views=MIN_VIEWS, limit=LIMIT, dated_route=needs_dates)
 
     if needs_dates:
-        items, err = search_dated(query, SEARCH_COUNT, since)
+        items, err = search_dated(query, depth, since)
         if since is not None:
             # --dateafter is accurate to the day, so the window is tightened
             # here to the exact second. An item whose timestamp YouTube declined
@@ -2956,7 +3014,7 @@ def search_items(query):
             # real result over a missing field would shrink every dated search.
             items = [i for i in items if i.get("epoch") is None or i["epoch"] >= since]
     else:
-        entries, err = search_flat(query, SEARCH_COUNT)
+        entries, err = search_flat(query, depth)
         items = []
         for entry in entries:
             vid = entry.get("id") or ""
@@ -2970,6 +3028,7 @@ def search_items(query):
                 "views": entry.get("view_count"),
                 "epoch": None,
                 "live_status": entry.get("live_status"),
+                "duration": entry.get("duration"),
             })
     if err:
         return [], err
@@ -2977,8 +3036,10 @@ def search_items(query):
     found = len(items)
     # wanted_entry() already decides the view floor and the live/upcoming rule
     # for channel listings; a search result is judged by the same rules.
-    items = [i for i in items if wanted_entry({"view_count": i.get("views"),
-                                               "live_status": i.get("live_status")})[0]]
+    items = [i for i in items
+             if wanted_entry({"view_count": i.get("views"),
+                              "live_status": i.get("live_status"),
+                              "duration": i.get("duration")})[0]]
     seen, unique, excluded = set(), [], 0
     for item in items:
         if item["id"] in seen:
@@ -3011,6 +3072,9 @@ def search_row(item, rank):
         "title": item.get("title"),
         "channel": item.get("channel") or None,
         "views": item.get("views"),
+        "duration": item.get("duration"),
+        "duration_text": (human_time(item["duration"])
+                          if isinstance(item.get("duration"), (int, float)) else None),
         "published": upload_time_pkt({"timestamp": epoch}) if epoch else None,
         "published_epoch": epoch,
     }
@@ -3410,16 +3474,93 @@ def channel_page(url, start, end):
     return (data, None) if isinstance(data, dict) else ({}, "Channel not found")
 
 
-def wanted_entry(entry):
+def as_seconds(value):
+    """A duration as a number, or None when there is not one.
+
+    Read rather than type-checked: a route that hands over "900" instead of 900
+    describes a 15-minute video, and treating that as "length unknown" would
+    drop it - which is the one outcome the length floor must never cause by
+    accident. "NA" is yt-dlp's way of saying it does not know, and stays None.
+    """
+    if isinstance(value, bool):          # True is not a duration
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def explain_empty_listing(counts):
+    """Say on screen why a channel listing kept nothing.
+
+    The per-reason tally goes to the log through note(), which only reaches the
+    screen with --verbose - so without this a channel whose every video was
+    filtered out looks exactly like a channel with no videos at all. The length
+    floor is on by default, which makes that the likely case rather than a rare
+    one, so the reason is printed and the way to undo it is named.
+    """
+    if not counts.get("scanned"):
+        return
+    floor = duration_floor()
+    reasons = [
+        (counts.get("short"), f"{counts.get('short')} shorter than {human_time(floor)}"),
+        (counts.get("nolength"), f"{counts.get('nolength')} of unknown length"),
+        (counts.get("views"), f"{counts.get('views')} under {MIN_VIEWS:,} views"),
+        (counts.get("unknown"), f"{counts.get('unknown')} with no view count"),
+        (counts.get("live"), f"{counts.get('live')} live or upcoming"),
+        (counts.get("skipped"), f"{counts.get('skipped')} in skip.txt"),
+    ]
+    said = ", ".join(text for number, text in reasons if number)
+    print(f"      none of {counts['scanned']} video(s) matched"
+          f"{': ' + said if said else ''}")
+    if counts.get("short") or counts.get("nolength"):
+        print("      (--shorts, or --min-duration 0, includes short-form videos)")
+
+
+def duration_floor():
+    """The shortest video to keep, in seconds. 0 means keep any length.
+
+    --shorts is the switch and --min-duration is the dial; asking for shorts
+    turns the floor off rather than arguing with a number that was set to keep
+    them out.
+    """
+    return 0 if INCLUDE_SHORTS else max(0, MIN_DURATION)
+
+
+def is_shorts_tab(url):
+    """Whether this link points at a channel's Shorts tab.
+
+    A link there is a request FOR short-form videos, so the length floor is not
+    applied to it - and it would drop every one of them, since a Shorts listing
+    reports no duration at all.
+    """
+    return (url or "").split("?")[0].rstrip("/").lower().endswith("/shorts")
+
+
+def wanted_entry(entry, allow_short=False):
     """Whether a listed video should be downloaded: (yes, reason-if-not).
 
     "unknown" is kept apart from "too few views": a video YouTube listed without
     a view count cannot be shown to clear the floor, so it is left out - but
     quietly dropping it would look the same as a video that genuinely fell short.
+    The same distinction is made for length: "short" is measured, "nolength" is
+    a listing that did not say - which a Shorts tab never does.
     """
     entry = entry or {}
     if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
         return False, "live"          # nothing finished to download yet
+    floor = 0 if allow_short else duration_floor()
+    if floor:
+        seconds = as_seconds(entry.get("duration"))
+        if seconds is None:
+            # Length unknown, so it cannot be shown to be a long video. Kept
+            # apart from "short" in the count, because the two are not the same
+            # fact and a run that drops many of these should say so.
+            return False, "nolength"
+        if seconds < floor:
+            return False, "short"
     if not MIN_VIEWS:
         return True, ""
     views = entry.get("view_count")
@@ -3437,11 +3578,13 @@ def list_channel_recent(url, deadline=None):
     the whole channel.
     """
     tab = channel_videos_url(url)
+    shorts_tab = is_shorts_tab(tab)
     links, seen, name = [], set(), ""
-    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0}
+    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0,
+              "short": 0, "nolength": 0}
 
     cmd = base_cmd() + [
-        "--print", "%(id)s|%(view_count)s|%(channel)s|%(live_status)s",
+        "--print", "%(id)s|%(view_count)s|%(channel)s|%(live_status)s|%(duration)s",
         "--dateafter", f"today-{DAYS}days",
         "--break-on-reject",
         "--no-warnings",
@@ -3473,6 +3616,7 @@ def list_channel_recent(url, deadline=None):
             continue
         vid, views, ch_name = parts[0], parts[1], parts[2]
         live_status = parts[3] if len(parts) >= 4 else ""
+        length = parts[4] if len(parts) >= 5 else ""
 
         counts["scanned"] += 1
         name = name or ch_name
@@ -3483,6 +3627,16 @@ def list_channel_recent(url, deadline=None):
         if live_status in ("is_upcoming", "is_live", "post_live"):
             counts["live"] += 1
             continue
+
+        floor = 0 if shorts_tab else duration_floor()
+        if floor:
+            seconds = as_seconds(length)
+            if seconds is None:
+                counts["nolength"] += 1
+                continue
+            if seconds < floor:
+                counts["short"] += 1
+                continue
 
         if views in ("NA", "None"):
             if MIN_VIEWS:
@@ -3513,7 +3667,11 @@ def list_channel_recent(url, deadline=None):
     note(f"      listed {counts['scanned']} video(s) from last {DAYS} days: kept {len(links)}"
          + (f", {counts['views']} under {MIN_VIEWS} views" if counts["views"] else "")
          + (f", {counts['skipped']} in skip.txt" if counts["skipped"] else "")
-         + (f", {counts['live']} live/upcoming" if counts["live"] else ""))
+         + (f", {counts['live']} live/upcoming" if counts["live"] else "")
+         + (f", {counts['short']} short-form" if counts["short"] else "")
+         + (f", {counts['nolength']} of unknown length" if counts["nolength"] else ""))
+    if not links:
+        explain_empty_listing(counts)
     skipped_by_list[0] += counts["skipped"]
     if counts["unknown"]:
         print(f"      NOTE: {counts['unknown']} video(s) had no view count and "
@@ -3534,10 +3692,12 @@ def list_channel_videos(url, deadline=None):
     """
     if DAYS > 0:
         return list_channel_recent(url, deadline)
-        
+
     tab = channel_videos_url(url)
+    shorts_tab = is_shorts_tab(tab)
     links, seen, name = [], set(), ""
-    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0}
+    counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0,
+              "short": 0, "nolength": 0}
     start = 1
     while True:
         if deadline is not None and start > 1 and time.monotonic() >= deadline:
@@ -3555,7 +3715,7 @@ def list_channel_videos(url, deadline=None):
             vid = (entry or {}).get("id")
             if not vid or vid in seen:
                 continue
-            keep, reason = wanted_entry(entry)
+            keep, reason = wanted_entry(entry, allow_short=shorts_tab)
             if not keep:
                 counts[reason] += 1
                 continue
@@ -3578,7 +3738,11 @@ def list_channel_videos(url, deadline=None):
     note(f"      listed {counts['scanned']} video(s): kept {len(links)}"
          + (f", {counts['views']} under {MIN_VIEWS} views" if counts["views"] else "")
          + (f", {counts['skipped']} in skip.txt" if counts["skipped"] else "")
-         + (f", {counts['live']} live/upcoming" if counts["live"] else ""))
+         + (f", {counts['live']} live/upcoming" if counts["live"] else "")
+         + (f", {counts['short']} short-form" if counts["short"] else "")
+         + (f", {counts['nolength']} of unknown length" if counts["nolength"] else ""))
+    if not links:
+        explain_empty_listing(counts)
     skipped_by_list[0] += counts["skipped"]
     if counts["unknown"]:
         print(f"      NOTE: {counts['unknown']} video(s) had no view count and "
@@ -3891,17 +4055,35 @@ def parse_args(argv=None):
     p.add_argument("--in-channel", metavar="URL", default=None, dest="in_channel",
                    help="With --search: search inside this channel only, using "
                         "the channel's own search tab.")
-    p.add_argument("--search-count", type=count, default=50, metavar="N",
+    p.add_argument("--search-count", type=count, default=None, metavar="N",
                    dest="search_count",
-                   help="Results to ask YouTube for before filtering (default 50).")
+                   help=f"Results to scan before filtering. Default follows the "
+                        f"route, because their costs differ about thirtyfold: "
+                        f"{SEARCH_DEPTH_FLAT} normally (about 0.07s each), "
+                        f"{SEARCH_DEPTH_DATED} with a date window or a date sort "
+                        f"(about 2s each). Give a number to override either.")
     p.add_argument("--sort", "--sort-by", dest="sort", default="relevance",
                    choices=("relevance", "views", "popularity", "least-viewed",
                             "date", "oldest"),
                    help="Order the search results: relevance (default), views "
                         "(popularity), least-viewed (reverse popularity), "
                         "date (newest first) or oldest.")
+    p.add_argument("--match", dest="match", default="related",
+                   choices=("related", "exact"),
+                   help="How wide a net the search casts: related (default) uses "
+                        "YouTube's own results page, so near-matches come too - "
+                        "the same story from another channel, the opposite angle, "
+                        "another language; exact uses yt-dlp's narrower "
+                        "ytsearch and returns far fewer.")
     p.add_argument("--this-month", action="store_true", dest="this_month",
                    help="Search window: since the 1st of the current month.")
+    p.add_argument("--shorts", action="store_true",
+                   help="Include short-form videos (Shorts). Left out by default.")
+    p.add_argument("--min-duration", type=count, default=SHORTS_SECONDS, metavar="SECONDS",
+                   dest="min_duration",
+                   help=f"Shortest video to keep, in seconds (default "
+                        f"{SHORTS_SECONDS} - a Short is at most 3 minutes). "
+                        f"0 = any length, same as --shorts.")
     p.add_argument("--cookies", metavar="FILE",
                    help="Use this cookies.txt instead of <directory>/cookies.txt.")
     p.add_argument("--links", metavar="FILE",
@@ -4007,6 +4189,7 @@ def main():
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY
     global EXTRACT_COMMENTS, COMMENT_LIMIT, COMMENT_REPLIES, COMMENT_SORT
     global SEARCH_QUERY, SEARCH_COUNT, SORT_BY, THIS_MONTH, IN_CHANNEL
+    global SEARCH_MATCH, INCLUDE_SHORTS, MIN_DURATION
 
     use_utf8_output()
     args = parse_args()
@@ -4028,11 +4211,15 @@ def main():
     COMMENT_REPLIES = args.comment_replies
     COMMENT_SORT = args.comment_sort
     SEARCH_QUERY = args.search
-    SEARCH_COUNT = max(1, args.search_count)
+    # None means "pick by route"; see search_depth().
+    SEARCH_COUNT = max(1, args.search_count) if args.search_count else None
     # "popularity" is what a person calls it; "views" is what it sorts on.
     SORT_BY = "views" if args.sort == "popularity" else args.sort
     THIS_MONTH = args.this_month
     IN_CHANNEL = args.in_channel
+    SEARCH_MATCH = args.match
+    INCLUDE_SHORTS = args.shorts
+    MIN_DURATION = args.min_duration
     # Nobody asking for a transcript wants a .jpg; the description is kept
     # because it is written from metadata already fetched and costs no request.
     SAVE_THUMBNAIL = not args.no_thumbnail and not TRANSCRIPT_ONLY
@@ -4061,8 +4248,15 @@ def main():
               f", replies {'on' if COMMENT_REPLIES else 'off'}")
     if SEARCH_QUERY:
         where = f" in {IN_CHANNEL}" if IN_CHANNEL else " on YouTube"
-        print(f"  Search  : {SEARCH_QUERY}{where}  (ask for {SEARCH_COUNT}, "
-              f"sort {SORT_BY})")
+        since, _label = search_window()
+        depth = search_depth(since is not None or SORT_BY in ("date", "oldest"))
+        print(f"  Search  : {SEARCH_QUERY}{where}  (scan {depth}"
+              f"{'' if SEARCH_COUNT else ' by default'}, sort {SORT_BY})")
+        if not IN_CHANNEL:
+            print(f"  Match   : {SEARCH_MATCH}"
+                  f"{' - near-matches come too' if SEARCH_MATCH == 'related' else ' - tight matches only'}")
+    floor = duration_floor()
+    print(f"  Length  : {f'at least {human_time(floor)} (no Shorts)' if floor else 'any, Shorts included'}")
     if MIN_VIEWS or LIMIT or DAYS:
         print(f"  Channels: {f'>= {MIN_VIEWS:,} views' if MIN_VIEWS else 'every video'}"
               f"{f', newest {LIMIT} each' if LIMIT else ''}"

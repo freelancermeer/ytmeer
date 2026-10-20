@@ -265,17 +265,62 @@ later run without being fetched again.
 
 ## Search
 
+Two separate questions, two separate flags:
+
+- **`--match`** — *how wide a net*. `related` (the default) is YouTube's own
+  results page, the relevance-ordered list you see in a browser. `exact` is
+  yt-dlp's much narrower `ytsearch`.
+- **`--sort`** — *how to order what came back*. Applied locally, always.
+
 ```bash
-# YouTube-wide, most watched first
-python3 downloader.py "/path/to/folder" --search "kash patel hearing" --sort popularity
+# the whole angle on a title: 150 near-matches, most watched first
+python3 downloader.py "/path/to/folder" --search "<a video title>" --sort popularity
+
+# only tight matches on that exact phrasing
+python3 downloader.py "/path/to/folder" --search "<a video title>" --match exact
+
+# reverse popularity: who tried this angle and failed
+python3 downloader.py "/path/to/folder" --search "<a video title>" --sort least-viewed
 
 # last 30 days, newest first
 python3 downloader.py "/path/to/folder" --search "kash patel hearing" --days 30 --sort date
 
-# inside one channel only
+# inside one channel only (its own search tab; --match does not apply)
 python3 downloader.py "/path/to/folder" --search "epstein" \
     --in-channel "https://www.youtube.com/@ForbesBreakingNews"
 ```
+
+### Why `--match related` is the default
+
+Measured on one long video title:
+
+| | Results |
+|---|---|
+| `--match exact` (`ytsearch100:`) | **2** |
+| `--match related` (the results page) | **150** |
+
+Relevance is the point, not a compromise. Those 150 carried the same story from
+other channels, the **opposite** angle ("Don't touch my *sister*", 320,590 views
+against the original's 46,075), and the same formula in Japanese, German and
+Arabic. Asking YouTube to sort by views instead collapses onto the exact phrase
+and loses every one of them.
+
+### Long videos only
+
+Shorts are left out of every listing and every search, because the research is
+about long-form video. The floor is **180 seconds** — a Short is at most three
+minutes, and that is the only signal a listing actually carries.
+
+```bash
+--shorts                 # include them after all
+--min-duration 600       # or set your own floor, in seconds
+--min-duration 0         # same as --shorts
+```
+
+A link to a channel's **`/shorts` tab** is a request for Shorts, so the floor is
+not applied there. Nor is it applied to a video link you name yourself in
+`links.txt` — naming a video is asking for that video. A listing that kept
+nothing says so, and says which flag undoes it.
 
 The titles and links are printed, written to `search_links.txt`, and then the
 run continues exactly as if that file had been your `links.txt` — so
@@ -301,8 +346,8 @@ Alongside the printed table the run writes two files into the folder:
 - **`search_links.txt`** — the links, with each title as a comment. This is what
   the download step then reads.
 - **`search_results.json`** — the same results machine-readably: `link`,
-  `views`, `published` (exact time, PKT), `published_epoch`, `channel`, `title`,
-  `rank`.
+  `views`, `duration` and `duration_text`, `published` (exact time, PKT),
+  `published_epoch`, `channel`, `title`, `rank`.
 
 `--sort least-viewed` is reverse popularity: the weakest performers on a title
 first. On one title this month that reads 0 views, 1 view, then 45,644 — three
@@ -324,11 +369,26 @@ Two routes, chosen by whether a date is needed, because the cost gap is large:
 
 | Route | When | Measured |
 |---|---|---|
-| Flat listing | no date filter or date sort | **1.5s** / 10 results |
-| Non-flat + `--dateafter` | a date window, or `--sort date`/`oldest` | **22.7s** / 12 scanned |
+| Flat listing | no date filter or date sort | **~0.07s** per result |
+| Non-flat + `--dateafter` | a date window, or `--sort date`/`oldest` | **~2s** per result |
 
 Resolving dates one video at a time was measured at **10.8s per video** — five
 times worse than letting the search extraction date them — so it is not used.
+`--dateafter` was checked against filtering locally on a deterministic listing:
+identical id sets, so the flag loses nothing.
+
+**`--search-count` therefore has no single default.** Scanning 150 results takes
+about 10s on the flat route but **3m 37s** once a date window forces a full
+extraction per video — longer than the REST API will hold its lock for. So the
+depth follows the route, and the run prints which it used:
+
+| | Default depth |
+|---|---|
+| no date window | **150** |
+| a date window, or `--sort date`/`oldest` | **40** |
+
+Give `--search-count N` to override either. On one title: depth 40 found 15
+videos this month in 64s; depth 150 found 44 in 3m 37s.
 
 ## The REST API
 
@@ -410,9 +470,14 @@ curl -X POST localhost:8000/api/jobs -H 'content-type: application/json' -d '{
 ```
 
 `links` and `search` are two different worklists, so sending both is refused
-rather than silently downloading one of them. `this_month` is a search window
-and nothing else reads it, so it needs `search` too; to limit a download by
+rather than silently downloading one of them. `this_month`, `match` and
+`search_count` only mean something to a search, so sending one without `search`
+is refused rather than accepted and ignored - and the refusal is judged on what
+you actually sent, so a defaulted `match` never trips it. To limit a download by
 date, use `days`.
+
+`shorts` and `min_duration` apply to downloads as well as searches, because the
+length floor is about which videos the tool goes after at all.
 
 **`GET /api/search`** searches without downloading anything and returns the
 four fields per video:
@@ -424,16 +489,24 @@ curl -G localhost:8000/api/search \
 ```
 
 ```json
-{ "sort": "least-viewed", "window": "since 01 Oct 2026",
-  "scanned": 37, "found": 3,
-  "results": [ { "rank": 1, "views": 0, "published": "19 Oct 2026, 10:46:52 PM PKT",
+{ "match": "related", "sort": "least-viewed", "window": "since 01 Oct 2026",
+  "depth": 40, "min_duration": 180, "scanned": 37, "found": 3,
+  "results": [ { "rank": 1, "views": 0, "duration_text": "18m 12s",
+                 "published": "19 Oct 2026, 10:46:52 PM PKT",
                  "channel": "Royal Storyline",
                  "link": "https://www.youtube.com/watch?v=jrshTn5bePc" } ] }
 ```
 
-`scanned` is what the search returned and `found` is what survived the filters.
-A narrow query with a month window often finds only a handful - raise `count` to
-scan further down the results before giving up on it.
+The response says what was actually done, not what was asked: `depth` is how
+far it scanned (see `--search-count` above), `min_duration` is the length floor
+it applied, and `match` comes back `null` with `in_channel`, which searches that
+channel's own tab and never uses either net. `scanned` is what the search
+returned and `found` is what survived the filters - a narrow query with a month
+window often finds only a handful, so raise `count` to scan further down.
+
+`GET /api/preview` takes `shorts` and `min_duration` too, and reports the floor
+it used: a preview that filtered differently from the job it previews would be
+answering a different question.
 
 **One at a time.** Every lookup and the channel preview reach into the
 downloader's module globals in-process, so they share one lock: a second request

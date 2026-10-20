@@ -155,7 +155,30 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(self.argv(views=1000, limit=3)[3:],
                          ["/out", "--channel", "--views", "1000", "--limit", "3",
                           "--min-height", "720", "--max-height", "1080", "--sub-lang", "en",
-                          "--yes"])
+                          "--min-duration", "180", "--yes"])
+
+    def test_asking_for_shorts_replaces_the_floor(self):
+        argv = self.argv(shorts=True)
+        self.assertIn("--shorts", argv)
+        self.assertNotIn("--min-duration", argv)
+
+    def test_a_custom_floor_reaches_the_command_line(self):
+        argv = self.argv(min_duration=600)
+        self.assertEqual(argv[argv.index("--min-duration") + 1], "600")
+
+    def test_match_reaches_the_command_line(self):
+        argv = self.search_argv(search="cats", match="exact")
+        self.assertEqual(argv[argv.index("--match") + 1], "exact")
+        self.assertEqual(self.search_argv(search="cats")[
+            self.search_argv(search="cats").index("--match") + 1], "related")
+
+    def test_a_bad_match_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            api.normalize_request({"search": "cats", "match": "sideways"})
+        self.assertIn("match must be one of", str(caught.exception))
+
+    def test_no_match_flag_without_a_query(self):
+        self.assertNotIn("--match", self.argv())
 
     def test_zeros_emit_no_flag(self):
         argv = self.argv()
@@ -217,6 +240,16 @@ class TestArgv(unittest.TestCase):
                      "--in-channel"):
             self.assertNotIn(flag, argv)
 
+    def test_search_count_zero_leaves_the_depth_to_the_route(self):
+        # Scanning 150 results costs about 10s flat but 3m37s once a date window
+        # forces a full extraction per video, so one number cannot serve both.
+        opts = api.normalize_request({"search": "cats"})
+        self.assertEqual(opts["search_count"], 0)
+        self.assertNotIn("--search-count", api.build_argv("/out", opts))
+        opts = api.normalize_request({"search": "cats", "search_count": 60})
+        argv = api.build_argv("/out", opts)
+        self.assertEqual(argv[argv.index("--search-count") + 1], "60")
+
     def test_a_search_job_needs_no_links(self):
         # The search produces the worklist, so there is nothing to supply.
         opts = api.normalize_request({"search": "cats"})
@@ -247,7 +280,7 @@ class TestArgv(unittest.TestCase):
                 ({"search": "c", "in_channel": "nonsense"}, "channel link"),
                 ({"search": "c", "days": 7, "this_month": True}, "pick one"),
                 ({"links": "x", "this_month": True}, "needs search"),
-                ({"search": "c", "search_count": 0}, "at least 1"),
+                ({"search": "c", "match": "sideways"}, "match must be one of"),
                 ({"links": "x", "transcript": True, "subs": False}, "cannot be combined"),
                 ({"links": "x", "comment_sort": "best"}, "comment_sort must be"),
                 ({"links": "x", "sort": "sideways"}, "sort must be one of"),

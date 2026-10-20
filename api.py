@@ -105,6 +105,19 @@ class PreviewBusy(Exception):
     """Another in-process request still holds the downloader's globals."""
 
 
+class BadField(ValueError):
+    """A ValueError that knows which parameter was wrong.
+
+    A route that reports every bad value against its first parameter sends the
+    caller looking in the wrong place; a 422 is only useful if it names the
+    field it is about.
+    """
+
+    def __init__(self, field, message):
+        super().__init__(message)
+        self.field = field
+
+
 class LookupFailed(Exception):
     """YouTube would not answer for this video: private, removed, or bot-gated.
 
@@ -191,22 +204,37 @@ DEFAULTS = {
     "comment_sort": "top",
     # search; "search" replaces links as the source, "in_channel" narrows it to
     # one channel's own search tab
-    "search": None, "in_channel": None, "search_count": 50,
+    # 0 = let the downloader pick by route: scanning costs about thirty times
+    # more per result once a date window forces the dated route, so one number
+    # cannot serve both (see search_depth in downloader.py).
+    "search": None, "in_channel": None, "search_count": 0,
     "sort": "relevance", "this_month": False,
+    # "match" picks how wide a net the search casts, which is a different
+    # question from "sort": related keeps YouTube's relevance list, where the
+    # near-matches live; exact uses the far narrower ytsearch route.
+    "match": "related",
+    # Long videos only, which is what the research is for. The floor is in
+    # seconds and a Short is at most 3 minutes.
+    "shorts": False, "min_duration": 180,
 }
 INT_FIELDS = ("views", "limit", "days", "min_height", "max_height",
-              "comment_limit", "search_count")
+              "comment_limit", "search_count", "min_duration")
 # Limits to keep integer bounds safe for Pydantic v1 vs v2, and SQLite's ability to
 # write it - a limit of 10**20 used to turn GET /api/jobs into a 500 for everyone.
 INT_MAX = {"views": 10**12, "limit": 10**6, "days": 10**5, "min_height": 10**4,
            "max_height": 10**4,
            # A comment page is about 20 comments and a search page about 20
            # results; these keep one job from paging YouTube indefinitely.
-           "comment_limit": 10**5, "search_count": 10**4}
+           "comment_limit": 10**5, "search_count": 10**4,
+           # Longer than any video YouTube hosts, so a floor above this would
+           # match nothing at all.
+           "min_duration": 86400}
 SUB_LANG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,34}$")   # anchored for the schema too
 BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose",
-               "transcript", "extract_comments", "comment_replies", "this_month")
+               "transcript", "extract_comments", "comment_replies", "this_month",
+               "shorts")
 COMMENT_SORTS = ("top", "new")
+MATCH_MODES = ("related", "exact")
 SORTS = ("relevance", "views", "popularity", "least-viewed", "date", "oldest")
 
 
@@ -279,11 +307,12 @@ def normalize_request(payload):
                          f"got {opts['comment_sort']!r}")
     if opts["sort"] not in SORTS:
         raise ValueError(f"sort must be one of {', '.join(SORTS)}, got {opts['sort']!r}")
+    if opts["match"] not in MATCH_MODES:
+        raise ValueError(f"match must be one of {', '.join(MATCH_MODES)}, "
+                         f"got {opts['match']!r}")
     for field in ("search", "in_channel"):
         if opts[field] is not None:
             opts[field] = str(opts[field]).strip() or None
-    if opts["search"] and opts["search_count"] < 1:
-        raise ValueError("search_count must be at least 1 (results to ask for)")
     if opts["in_channel"] and not opts["search"]:
         raise ValueError("in_channel says where to search; it needs search too")
     if opts["in_channel"] and not downloader.is_channel_url(opts["in_channel"]):
@@ -294,6 +323,15 @@ def normalize_request(payload):
         # Nothing but a search reads it, so a job would accept it and ignore it.
         raise ValueError("this_month is a search window; it needs search too. "
                          "To limit a download by date use days")
+    # Judged on what the caller actually sent, not on the filled-in value: an
+    # explicit match="related" is indistinguishable from an absent one once the
+    # defaults are applied, and only an explicit one is worth refusing.
+    if "match" in payload and not opts["search"]:
+        raise ValueError("match says how wide to cast the search; it needs "
+                         "search too")
+    if "search_count" in payload and not opts["search"]:
+        raise ValueError("search_count is the search's scan depth; it needs "
+                         "search too")
     if opts["transcript"] and not opts["subs"]:
         raise ValueError("transcript IS the transcript, so it cannot be combined "
                          "with subs=false")
@@ -352,13 +390,19 @@ def build_argv(outdir, opts, links_file=None):
                  "--comment-sort", opts["comment_sort"]]
         if opts["comment_replies"]:
             argv.append("--comment-replies")
+    if opts["shorts"]:
+        argv.append("--shorts")
+    else:
+        argv += ["--min-duration", str(opts["min_duration"])]
     if opts["search"]:
         # --search=QUERY, not --search QUERY: a query that begins with "-"
         # ("-ad reads" say) would otherwise reach argparse as an option and
         # kill the run before it started.
         argv += [f"--search={opts['search']}",
-                 "--search-count", str(opts["search_count"]),
-                 "--sort", opts["sort"]]
+                 "--sort", opts["sort"],
+                 "--match", opts["match"]]
+        if opts["search_count"]:
+            argv += ["--search-count", str(opts["search_count"])]
         if opts["in_channel"]:
             argv += ["--in-channel", opts["in_channel"]]
         if opts["this_month"]:
@@ -824,8 +868,9 @@ def shutdown_jobs(timeout=15):
 # channel preview then quietly listed only that week.
 ROUTE_GLOBALS = {
     "MIN_VIEWS": 0, "LIMIT": 0, "DAYS": 0, "THIS_MONTH": False, "SKIP_IDS": set(),
-    "SEARCH_QUERY": None, "IN_CHANNEL": None, "SEARCH_COUNT": 50,
-    "SORT_BY": "relevance",
+    "SEARCH_QUERY": None, "IN_CHANNEL": None, "SEARCH_COUNT": None,
+    "SORT_BY": "relevance", "SEARCH_MATCH": "related",
+    "INCLUDE_SHORTS": False, "MIN_DURATION": 180,
     "SUB_LANG": "en", "DOWNLOAD_SUBS": True, "TRANSCRIPT_ONLY": False,
     "EXTRACT_COMMENTS": False, "COMMENT_LIMIT": 100, "COMMENT_REPLIES": False,
     "COMMENT_SORT": "top",
@@ -874,6 +919,17 @@ def _skip_ids(skip):
                         for x in _lines(skip).split()) if v}
 
 
+def _floor_seconds(value):
+    """A length floor in seconds, checked. Raises BadField."""
+    seconds = int(value or 0)
+    if seconds < 0:
+        raise BadField("min_duration", "min_duration cannot be negative")
+    if seconds > INT_MAX["min_duration"]:
+        raise BadField("min_duration",
+                       f"min_duration is too large (at most {INT_MAX['min_duration']})")
+    return seconds
+
+
 def one_url(value, what):
     """The single link a lookup route was given. Raises ValueError."""
     url = _lines(value).strip().split("\n")[0].strip()
@@ -886,50 +942,80 @@ def one_url(value, what):
     return url
 
 
-def preview_channel(channel, views=0, limit=20, skip=""):
-    """What a channel link expands to, without downloading anything."""
+def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
+                    min_duration=180):
+    """What a channel link expands to, without downloading anything.
+
+    It takes the length knobs because a job does: a preview that quietly used a
+    different floor from the job it is previewing would be answering a
+    different question. The floor it used is reported, so a short answer is
+    never a mystery.
+    """
     url = _lines(channel).strip().split("\n")[0].strip()
     if not url:
         raise ValueError("channel is required")
     d = downloader
     if not d.is_channel_url(url):
         raise ValueError(f"not a channel link: {url}")
+    min_duration = _floor_seconds(min_duration)
     with downloader_globals(MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
-                            SKIP_IDS=_skip_ids(skip)):
+                            SKIP_IDS=_skip_ids(skip),
+                            INCLUDE_SHORTS=bool(shorts),
+                            MIN_DURATION=min_duration):
         found, name, err = d.list_channel_videos(
             url, deadline=time.monotonic() + PREVIEW_SECONDS)
+        floor_used = d.duration_floor()
     return {"channel": name or None, "tab_read": d.channel_videos_url(url),
+            "min_duration": floor_used or None,
             "matched": len(found), "videos": found, "error": err}
 
 
-def search_youtube(query, in_channel="", count=50, sort="relevance", days=0,
-                   this_month=False, views=0, limit=0, skip=""):
+def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
+                   this_month=False, views=0, limit=0, skip="",
+                   match="related", shorts=False, min_duration=180):
     """Search results - link, views, publish date and channel - downloading nothing."""
     query = _lines(query).strip()
     if not query:
         raise ValueError("query is required")
     if in_channel and not downloader.is_channel_url(in_channel):
-        raise ValueError(f"in_channel wants a channel link, got {in_channel!r}")
+        raise BadField("in_channel",
+                       f"in_channel wants a channel link, got {in_channel!r}")
     if days and this_month:
-        raise ValueError("days and this_month are two different windows; pick one")
+        raise BadField("this_month",
+                       "days and this_month are two different windows; pick one")
     if sort not in SORTS:
-        raise ValueError(f"sort must be one of {', '.join(SORTS)}, got {sort!r}")
+        raise BadField("sort", f"sort must be one of {', '.join(SORTS)}, got {sort!r}")
+    if match not in MATCH_MODES:
+        raise BadField("match", f"match must be one of {', '.join(MATCH_MODES)}, "
+                                f"got {match!r}")
+    min_duration = _floor_seconds(min_duration)
 
     d = downloader
     with downloader_globals(
             SEARCH_QUERY=query, IN_CHANNEL=in_channel or None,
-            SEARCH_COUNT=max(1, int(count or 1)),
+            # 0 leaves it None, which makes search_depth() pick by route.
+            SEARCH_COUNT=max(1, int(count)) if count else None,
             SORT_BY="views" if sort == "popularity" else sort,
             DAYS=int(days or 0), THIS_MONTH=bool(this_month),
             MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
-            SKIP_IDS=_skip_ids(skip), SEARCH_TIMEOUT=ROUTE_SECONDS):
+            SKIP_IDS=_skip_ids(skip), SEARCH_TIMEOUT=ROUTE_SECONDS,
+            SEARCH_MATCH=match, INCLUDE_SHORTS=bool(shorts),
+            MIN_DURATION=min_duration):
         items, err = d.search_items(query)
         _since, window = d.search_window()
         rows = [d.search_row(item, number) for number, item in enumerate(items, 1)]
         sort_used, channel_used, scanned = d.SORT_BY, d.IN_CHANNEL, d.SEARCH_FOUND[0]
-    return {"query": query, "in_channel": channel_used, "sort": sort_used,
-            "window": window or None, "scanned": scanned, "found": len(rows),
-            "results": rows, "error": err}
+        floor_used = d.duration_floor()
+        depth_used = d.search_depth(_since is not None
+                                    or d.SORT_BY in ("date", "oldest"))
+    return {"query": query, "in_channel": channel_used,
+            # in_channel searches the channel's own tab, which neither value of
+            # match applies to - echoing the request there would claim a net
+            # that was never cast.
+            "match": None if channel_used else match,
+            "sort": sort_used, "window": window or None,
+            "min_duration": floor_used or None, "depth": depth_used,
+            "scanned": scanned, "found": len(rows), "results": rows, "error": err}
 
 
 # --------------------------------------------------- answers, not jobs
@@ -1046,9 +1132,21 @@ def build_app():
                                    "use the results as the worklist, instead of links.")
         in_channel: str | None = Field(None, description="With search: search inside "
                                        "this channel only, using its own search tab.")
-        search_count: int = Field(50, ge=1, le=INT_MAX["search_count"],
-                                  description="Results to ask YouTube for before "
-                                  "filtering.")
+        search_count: int = Field(0, ge=0, le=INT_MAX["search_count"],
+                                  description="Results to scan before filtering. "
+                                  "0 follows the route: 150 normally, 40 with a "
+                                  "date window.")
+        match: Literal[MATCH_MODES] = Field(
+            "related", description="How wide a net the search casts: related "
+                                   "(YouTube's own results page, so near-matches "
+                                   "come too) or exact (the narrower ytsearch).")
+        shorts: bool = Field(False, description="Include short-form videos. "
+                             "Left out by default. Overrides min_duration, "
+                             "which it sets to 0.")
+        min_duration: int = Field(180, ge=0, le=INT_MAX["min_duration"],
+                                  description="Shortest video to keep, in "
+                                  "seconds. 0 = any length. Ignored when "
+                                  "shorts is true.")
         sort: Literal[SORTS] = Field("relevance", description="Order the search "
                                      "results. popularity is views; least-viewed "
                                      "is reverse popularity.")
@@ -1103,14 +1201,28 @@ def build_app():
                 views: int = Query(0, ge=0, le=INT_MAX["views"]),
                 limit: int = Query(20, ge=1, le=500, description="How many matching "
                                    "videos to list: a preview is a look, not the channel."),
-                skip: str = Query("", description="Links or ids to leave out.")):
+                skip: str = Query("", description="Links or ids to leave out."),
+                shorts: bool = Query(False, description="Include short-form "
+                                     "videos. Left out by default, as in a job."),
+                min_duration: int = Query(180, ge=0, le=INT_MAX["min_duration"],
+                                          description="Shortest video to keep, "
+                                          "in seconds. 0 = any length.")):
         """The newest videos a channel link would download, up to limit. Nothing is
-        downloaded. One preview runs at a time; another gets 503. On the public link a
-        request must finish within about 60 s, so keep the limit small there."""
+        downloaded.
+
+        Short-form videos are left out, exactly as a job leaves them out, and the
+        floor that was applied comes back as min_duration - a preview using a
+        different floor from the job it previews would answer a different
+        question. A link to a channel's /shorts tab is a request for Shorts, so
+        the floor is not applied there.
+
+        One preview, search or lookup runs at a time; another gets 503. On the
+        public link a request must finish within about 60 s, so keep the limit
+        small there."""
         try:
-            return preview_channel(channel, views, limit, skip)
+            return preview_channel(channel, views, limit, skip, shorts, min_duration)
         except ValueError as e:
-            raise unprocessable(str(e), "query", "channel")
+            raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
 
@@ -1118,11 +1230,26 @@ def build_app():
     def search(query: str = Query(..., description="What to search YouTube for."),
                in_channel: str = Query("", description="Search inside this channel "
                                        "only, using its own search tab."),
-               count: int = Query(50, ge=1, le=INT_MAX["search_count"],
-                                  description="Results to ask YouTube for before "
-                                  "filtering."),
+               count: int = Query(0, ge=0, le=INT_MAX["search_count"],
+                                  description="Results to scan before filtering. "
+                                  "0 (the default) follows the route: 150 "
+                                  "normally, 40 with a date window, because a "
+                                  "dated scan costs about thirty times more per "
+                                  "result."),
+               match: Literal[MATCH_MODES] = Query(
+                   "related", description="How wide a net: related (YouTube's "
+                   "own results page, so near-matches come too) or exact (the "
+                   "far narrower ytsearch route). Ignored with in_channel, "
+                   "which searches that channel's own tab."),
                sort: str = Query("relevance", description="relevance, views, "
                                  "popularity, least-viewed, date or oldest."),
+               shorts: bool = Query(False, description="Include short-form "
+                                    "videos. Left out by default. Overrides "
+                                    "min_duration, which it sets to 0."),
+               min_duration: int = Query(180, ge=0, le=INT_MAX["min_duration"],
+                                         description="Shortest video to keep, in "
+                                         "seconds. 0 = any length. Ignored when "
+                                         "shorts is true."),
                days: int = Query(0, ge=0, le=INT_MAX["days"],
                                  description="Only videos from the last N days."),
                this_month: bool = Query(False, description="Only videos since the "
@@ -1132,15 +1259,23 @@ def build_app():
                limit: int = Query(0, ge=0, le=INT_MAX["limit"],
                                   description="Keep only the first N results."),
                skip: str = Query("", description="Links or ids to leave out.")):
-        """Search YouTube and get back each video's link, views, publish date and
-        channel. Nothing is downloaded. A date window or a date sort costs about
-        2 s per result scanned; without one the search is about 0.15 s per result.
-        One search or channel preview runs at a time; another gets 503."""
+        """Search YouTube and get back each video's link, views, publish date,
+        channel and length. Nothing is downloaded.
+
+        match=related keeps YouTube's relevance ordering, which also carries the
+        near-matches - the same story from another channel, the opposite angle,
+        another language - and those are usually the point; sort then orders what
+        came back. Shorts are left out unless you ask for them.
+
+        A date window or a date sort costs about 2 s per result scanned; without
+        one the search is about 0.15 s per result. One search, preview or lookup
+        runs at a time; another gets 503."""
         try:
             return search_youtube(query, in_channel, count, sort, days,
-                                  this_month, views, limit, skip)
+                                  this_month, views, limit, skip,
+                                  match, shorts, min_duration)
         except ValueError as e:
-            raise unprocessable(str(e), "query", "query")
+            raise unprocessable(str(e), "query", getattr(e, "field", "query"))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
 
@@ -1206,7 +1341,12 @@ def build_app():
     def create_job(body: JobRequest):
         """Start downloading. Answers at once with a job_id; the work goes on."""
         try:
-            opts = normalize_request(body.model_dump(exclude_none=True))
+            # exclude_unset, so normalize_request sees what the caller actually
+            # sent rather than the model's filled-in defaults. DEFAULTS supplies
+            # the rest - the two agree - and it lets a flag that only means
+            # something with a search be refused when it was really asked for.
+            opts = normalize_request(body.model_dump(exclude_none=True,
+                                                     exclude_unset=True))
         except ValueError as e:
             raise unprocessable(str(e), "body")
         try:
