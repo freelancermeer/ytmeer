@@ -2888,6 +2888,20 @@ def search_window():
     return None, ""
 
 
+def channel_root(url):
+    """A channel link with any tab segment taken off.
+
+    /videos, /shorts, /about and the rest are tabs on the same channel, so a
+    link to one is a link to the channel - and appending another tab to it
+    produces a page that does not exist.
+    """
+    base = (url or "").split("?")[0].split("#")[0].rstrip("/")
+    tail = base.rsplit("/", 1)[-1].lower()
+    if tail in VIDEO_TABS or tail in OTHER_TABS or tail in ("search", "about"):
+        base = base.rsplit("/", 1)[0]
+    return base
+
+
 def channel_search_url(channel, query):
     """A channel's own search tab: <channel>/search?query=<query>.
 
@@ -2895,11 +2909,7 @@ def channel_search_url(channel, query):
     from a site-wide search filtered by uploader - it is the channel's own index,
     so it finds older videos a site-wide search would never surface.
     """
-    base = (channel or "").split("?")[0].split("#")[0].rstrip("/")
-    tail = base.rsplit("/", 1)[-1].lower()
-    if tail in VIDEO_TABS or tail in OTHER_TABS or tail == "search":
-        base = base.rsplit("/", 1)[0]        # drop a tab that is already there
-    return f"{base}/search?query={quote(query)}"
+    return f"{channel_root(channel)}/search?query={quote(query)}"
 
 
 # YouTube's "Videos" search filter - the one a person clicks under Filters.
@@ -3635,6 +3645,257 @@ def details_of(info):
     }
 
 
+# ----------------------- a channel, as data --------------------------------
+# yt-dlp gives a channel's name, id, subscriber count, description and tags,
+# and a flat listing gives every video with its view count and duration. It
+# does NOT give the three things the About page carries: when the channel was
+# created, its lifetime view total, and its country. Those are scraped, as a
+# best effort - if YouTube moves them the rest of the report is unaffected and
+# they come back None rather than failing the command.
+ABOUT_TIMEOUT = 20
+
+
+def enclosing_json(text, needle):
+    """The smallest JSON object in `text` that contains `needle`.
+
+    Anchored on a key that appears once rather than matched with a loose
+    regex: a channel page repeats most of these keys for every other channel
+    it links to, and the first match is usually somebody else's.
+    """
+    at = text.find(needle)
+    if at < 0:
+        return None
+    start, depth = at, 0
+    while start >= 0:                      # back out to the opening brace
+        if text[start] == "}":
+            depth += 1
+        elif text[start] == "{":
+            if depth == 0:
+                break
+            depth -= 1
+        start -= 1
+    if start < 0:
+        return None
+    end, depth = start, 0
+    while end < len(text):
+        if text[end] == "{":
+            depth += 1
+        elif text[end] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        end += 1
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+
+
+def about_page_extras(channel_url):
+    """(joined, lifetime_views, country) from a channel's About page, or Nones.
+
+    Scraped, which nothing else here is, because yt-dlp does not expose them.
+    Every failure is silent and returns Nones: these three are a bonus on top
+    of a report that stands without them.
+    """
+    import urllib.request
+    # The channel root plus /about. Handed a /videos link it used to build
+    # ".../videos/about", which is not a page and carries none of this.
+    url = channel_root(channel_url) + "/about"
+    try:
+        request = urllib.request.Request(url, headers={
+            # English, or the dates and counts come back in the server's guess
+            # at our language and cannot be parsed.
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        })
+        with urllib.request.urlopen(request, timeout=ABOUT_TIMEOUT) as answer:
+            html = answer.read().decode("utf-8", "replace")
+    except Exception as e:                 # scraping is best effort, always
+        log_debug("about_page", stage="channel", url=channel_url, ok=False,
+                  error=str(e))
+        return None, None, None
+    block = enclosing_json(html, '"joinedDateText"') or {}
+    joined = ((block.get("joinedDateText") or {}).get("content") or "")
+    joined = joined.replace("Joined", "").strip() or None
+    views = block.get("viewCountText")
+    if isinstance(views, dict):
+        views = views.get("simpleText") or views.get("content")
+    lifetime = as_seconds(re.sub(r"[^0-9]", "", views or "")) if views else None
+    country = block.get("country") or None
+    log_debug("about_page", stage="channel", url=channel_url, ok=True,
+              joined=joined, lifetime_views=lifetime, country=country)
+    return joined, (int(lifetime) if lifetime else None), country
+
+
+def channel_video_list(url, cap=None):
+    """Every video on a channel's video tab, newest first. (entries, error).
+
+    One flat listing, which carries each video's view count and duration but
+    no upload date - a flat listing never does. The dates of the newest and
+    oldest are fetched separately, which is two lookups rather than one per
+    video.
+    """
+    # Read now, not bound as a default: the constant is defined with the rest
+    # of the channel machinery, further down the file.
+    cap = CHANNEL_VIDEO_CAP if cap is None else cap
+    tab = channel_videos_url(url)
+    entries, start = [], 1
+    while len(entries) < cap:
+        data, err = channel_page(tab, start, start + CHANNEL_PAGE - 1)
+        if err:
+            return entries, err
+        page = [e for e in (data.get("entries") or []) if e and e.get("id")]
+        entries.extend(page)
+        if len(page) < CHANNEL_PAGE:
+            break
+        start += CHANNEL_PAGE
+    return entries[:cap], None
+
+
+def channel_details(url):
+    """(details, error) for one channel. Writes nothing, downloads nothing.
+
+    Everything that can be counted is counted from the channel's own videos
+    rather than estimated: the view total, the averages, the upload rate, the
+    long/short split, and which videos beat the channel's own average - that
+    last one being the number this kind of research actually turns on.
+    """
+    if not is_channel_url(url):
+        return None, f"not a channel link: {url}"
+    tab = channel_videos_url(url)
+    started = time.monotonic()
+    log_debug("channel_details_start", stage="channel", url=tab)
+    head, err = channel_page(tab, 1, 1)
+    if err and not head:
+        return None, err
+    entries, list_err = channel_video_list(url)
+    if not entries and list_err:
+        return None, list_err
+
+    views = [e.get("view_count") for e in entries
+             if isinstance(e.get("view_count"), (int, float))]
+    lengths = [as_seconds(e.get("duration")) for e in entries]
+    lengths = [n for n in lengths if n is not None]
+    average = (sum(views) / len(views)) if views else 0
+    # Nexlev calls this the outlier score; it is just a video's views over the
+    # channel's own average, and it is the one number that says whether a
+    # channel is growing or coasting.
+    outliers = sorted(
+        ({"id": e.get("id"), "link": watch_url(e.get("id")),
+          "title": e.get("title"), "views": e.get("view_count"),
+          "outlier": round((e.get("view_count") or 0) / average, 2)}
+         for e in entries
+         if average and isinstance(e.get("view_count"), (int, float))
+         and e["view_count"] >= average * 2),
+        key=lambda v: -v["outlier"])
+
+    newest, oldest = entries[0] if entries else {}, entries[-1] if entries else {}
+    edges = [{"id": newest.get("id"), "url": watch_url(newest.get("id")), "epoch": None},
+             {"id": oldest.get("id"), "url": watch_url(oldest.get("id")), "epoch": None}]
+    if entries:
+        resolve_dates(edges)
+    last_epoch, first_epoch = edges[0]["epoch"], edges[1]["epoch"]
+    span_days = ((last_epoch - first_epoch) / 86400.0
+                 if last_epoch and first_epoch and last_epoch > first_epoch else None)
+    joined, lifetime_views, country = about_page_extras(tab)
+
+    details = {
+        "id": head.get("channel_id"),
+        "name": head.get("channel") or head.get("uploader"),
+        "handle": head.get("uploader_id"),
+        "link": head.get("channel_url") or head.get("uploader_url"),
+        "subscribers": head.get("channel_follower_count"),
+        "verified": bool(head.get("channel_is_verified")),
+        "description": safe_text(head.get("description")) or None,
+        "tags": list(head.get("tags") or []),
+        "availability": head.get("availability"),
+        "country": country,
+        "created": joined,
+        "lifetime_views": lifetime_views,
+        # counted, not estimated
+        "videos_listed": len(entries),
+        "listing_capped": len(entries) >= CHANNEL_VIDEO_CAP,
+        "views_listed": sum(views) if views else None,
+        "average_views": int(average) if average else None,
+        "median_views": int(sorted(views)[len(views) // 2]) if views else None,
+        "best_views": max(views) if views else None,
+        "average_length": int(sum(lengths) / len(lengths)) if lengths else None,
+        "average_length_text": (human_time(sum(lengths) / len(lengths))
+                                if lengths else None),
+        "shorts": sum(1 for n in lengths if n <= SHORTS_SECONDS),
+        "long_videos": sum(1 for n in lengths if n > SHORTS_SECONDS),
+        "first_upload": upload_time_pkt({"timestamp": first_epoch}) if first_epoch else None,
+        "last_upload": upload_time_pkt({"timestamp": last_epoch}) if last_epoch else None,
+        "uploads_per_week": (round(len(entries) / (span_days / 7), 2)
+                             if span_days and span_days >= 7 else None),
+        "outliers": outliers[:10],
+        "outlier_count": len(outliers),
+        "listing_error": list_err,
+    }
+    log_debug("channel_details_finish", stage="channel", url=tab, ok=True,
+              duration=round(time.monotonic() - started, 3),
+              videos=len(entries), outliers=len(outliers),
+              subscribers=details["subscribers"], created=joined)
+    return details, None
+
+
+def print_channel_details(url):
+    """Print one channel's details. Writes nothing, downloads nothing."""
+    details, err = channel_details(url)
+    if not details:
+        print(f"\n  {url}\n    ERROR: {err}")
+        return False
+    rows = [
+        ("Channel", details["name"]),
+        ("Handle", details["handle"]),
+        ("Link", details["link"]),
+        ("Channel id", details["id"]),
+        ("Subscribers", count_or_na(details["subscribers"])),
+        ("Verified", "yes" if details["verified"] else "no"),
+        ("Country", details["country"] or "NA"),
+        ("Created", details["created"] or "NA"),
+        ("Lifetime views", count_or_na(details["lifetime_views"])),
+        ("First upload", details["first_upload"] or "NA"),
+        ("Last upload", details["last_upload"] or "NA"),
+        ("Videos read", f"{details['videos_listed']:,}"
+                        + ("  (stopped at the cap)" if details["listing_capped"] else "")),
+        ("Long / short", f"{details['long_videos']:,} long, {details['shorts']:,} short"),
+        ("Views read", count_or_na(details["views_listed"])),
+        ("Average views", count_or_na(details["average_views"])),
+        ("Median views", count_or_na(details["median_views"])),
+        ("Best video", count_or_na(details["best_views"])),
+        ("Average length", details["average_length_text"] or "NA"),
+        ("Uploads/week", details["uploads_per_week"] or "NA"),
+        ("Outliers", f"{details['outlier_count']} video(s) at 2x the channel"
+                     f" average or better"),
+    ]
+    print()
+    for label, value in rows:
+        print(f"  {label + ':':16}{value}")
+    text = one_line(details["description"] or "")
+    if text:
+        print(f"  {'Description:':16}{text[:300]}{'...' if len(text) > 300 else ''}")
+    if details["tags"]:
+        print(f"  {'Tags:':16}{', '.join(details['tags'][:12])}")
+    if details["outliers"]:
+        print("\n  Top outliers (views / channel average):")
+        for video in details["outliers"][:10]:
+            print(f"    {video['outlier']:>6}x  {count_or_na(video['views']):>12}"
+                  f"  {(video['title'] or '')[:54]}")
+            print(f"            {video['link']}")
+    if details["listing_error"]:
+        print(f"\n  NOTE: the listing stopped early: {details['listing_error']}")
+    return True
+
+
+def print_any_details(url):
+    """Print whatever this link is about - a channel, or a video."""
+    if is_channel_url(url):
+        return print_channel_details(url)
+    return print_details(url)
+
+
 def print_details(url):
     """Print one video's details. Writes nothing, downloads nothing.
 
@@ -3804,6 +4065,11 @@ OTHER_TABS = ("featured", "playlists", "community", "posts", "about", "shop",
 # Videos per listing request. --flat-playlist keeps a page to the listing alone
 # (no per-video extraction), so this is one cheap request whatever the videos are.
 CHANNEL_PAGE = 100
+
+# How many of a channel's videos --details will read. A flat page is cheap but
+# not free, and a channel with 20,000 uploads would be 200 requests; the report
+# says when it stopped at the cap rather than implying it saw everything.
+CHANNEL_VIDEO_CAP = 2000
 
 # How many videos skip.txt kept out of the channel listings this run. Counted
 # here because a listing applies skip.txt itself, before --limit, so those
@@ -4837,6 +5103,21 @@ def main():
         return
     source_links = len(links)
 
+    if DETAILS_ONLY:
+        # Before expand_sources, deliberately: in --details mode a channel link
+        # is a question about the channel, not about its 200 videos.
+        log_debug("details_mode_start", stage="details", links=len(links),
+                  channels=sum(1 for u in links if is_channel_url(u)))
+        print(f"\n{'=' * 60}")
+        ok = sum(1 for url in links if print_any_details(url))
+        log_debug("details_mode_finish", stage="details", links=len(links),
+                  reported=ok, failed=len(links) - ok)
+        print(f"\n{'=' * 60}")
+        print(f"  Reported {ok} of {len(links)} link(s). Nothing was downloaded.")
+        print("=" * 60)
+        write_empty_summary()
+        return
+
     # A channel link stands for many videos, so it is expanded before anything
     # else counts links. skip.txt is applied to what comes out (channel listings
     # already leave those videos out, so this catches the plain video links).
@@ -4852,18 +5133,6 @@ def main():
     if excluded:
         print(f"  Excluded {excluded} video(s) listed in skip.txt.")
 
-    if DETAILS_ONLY:
-        # A report, not a run: no folders, no files, no summary of downloads.
-        log_debug("details_mode_start", stage="details", links=len(links))
-        print(f"\n{'=' * 60}")
-        ok = sum(1 for item in links if print_details(link_url(item)))
-        log_debug("details_mode_finish", stage="details", links=len(links),
-                  reported=ok, failed=len(links) - ok)
-        print(f"\n{'=' * 60}")
-        print(f"  Reported {ok} of {len(links)} video(s). Nothing was downloaded.")
-        print("=" * 60)
-        write_empty_summary(excluded=excluded)
-        return
     if not links:
         print("\nNothing left to download.")
         write_empty_summary(excluded=excluded)

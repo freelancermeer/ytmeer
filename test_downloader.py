@@ -3602,6 +3602,116 @@ class PlatformCase:
             d.fetch_info = saved
         self.assertIn("NA", buf.getvalue())
 
+    # ------------------------------------------------- channels, as data
+    def test_channel_root_strips_any_tab(self):
+        # Handed a /videos link, the About scrape used to build
+        # ".../videos/about", which is not a page.
+        for tail in ("", "/videos", "/shorts", "/streams", "/about", "/playlists",
+                     "/search?query=x", "/videos/"):
+            self.assertEqual(d.channel_root("https://www.youtube.com/@H" + tail),
+                             "https://www.youtube.com/@H", repr(tail))
+
+    def test_enclosing_json_finds_the_block_that_holds_the_key(self):
+        # A channel page repeats these keys for every channel it links to, so
+        # the first loose match is usually somebody else's.
+        text = ('{"other":{"viewCountText":"1 views"},'
+                '"mine":{"viewCountText":"999 views","joinedDateText":'
+                '{"content":"Joined Mar 21, 2008"},"country":"United States"}}')
+        block = d.enclosing_json(text, '"joinedDateText"')
+        self.assertEqual(block["country"], "United States")
+        self.assertEqual(block["viewCountText"], "999 views")
+        self.assertIsNone(d.enclosing_json(text, '"nosuchkey"'))
+
+    def test_enclosing_json_survives_broken_input(self):
+        self.assertIsNone(d.enclosing_json("not json at all", "x"))
+        self.assertIsNone(d.enclosing_json('{"a":', '"a"'))
+
+    def _channel(self, entries, head=None):
+        """Drive channel_details over a scripted channel listing."""
+        pages = [entries[i:i + d.CHANNEL_PAGE]
+                 for i in range(0, max(1, len(entries)), d.CHANNEL_PAGE)] or [[]]
+        base = {"channel": "Ch", "channel_id": "UC" + "x" * 22,
+                "channel_url": "https://www.youtube.com/channel/UC" + "x" * 22,
+                "uploader_id": "@ch", "channel_follower_count": 1000,
+                "description": "about", "tags": ["a"]}
+        base.update(head or {})
+
+        def page(url, start, end):
+            index = (start - 1) // d.CHANNEL_PAGE
+            return (dict(base, entries=list(pages[index]) if index < len(pages) else []),
+                    None)
+
+        saved = (d.channel_page, d.resolve_dates, d.about_page_extras)
+        d.channel_page = page
+        d.resolve_dates = lambda items, deadline=None: (
+            [i.__setitem__("epoch", 1700000000 + (0 if n == 0 else -86400 * 30))
+             for n, i in enumerate(items)], (len(items), None))[1]
+        d.about_page_extras = lambda url: ("Dec 29, 2025", 7123072, "United Kingdom")
+        try:
+            return d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.channel_page, d.resolve_dates, d.about_page_extras = saved
+
+    def test_channel_details_counts_rather_than_estimates(self):
+        entries = [{"id": f"{n:011d}", "title": f"v{n}", "view_count": views,
+                    "duration": 900}
+                   for n, views in enumerate([100, 200, 300, 400, 5000])]
+        details, err = self._channel(entries)
+        self.assertIsNone(err)
+        self.assertEqual(details["videos_listed"], 5)
+        self.assertEqual(details["views_listed"], 6000)
+        self.assertEqual(details["average_views"], 1200)
+        self.assertEqual(details["median_views"], 300)
+        self.assertEqual(details["best_views"], 5000)
+        self.assertEqual(details["long_videos"], 5)
+        self.assertEqual(details["shorts"], 0)
+        self.assertEqual(details["country"], "United Kingdom")
+        self.assertEqual(details["created"], "Dec 29, 2025")
+
+    def test_channel_details_finds_the_outliers(self):
+        # A video's views over the channel's own average - the number this
+        # kind of research turns on.
+        entries = [{"id": f"{n:011d}", "title": f"v{n}", "view_count": views,
+                    "duration": 900}
+                   for n, views in enumerate([100, 100, 100, 100, 10000])]
+        details, _err = self._channel(entries)
+        self.assertEqual(details["average_views"], 2080)
+        self.assertEqual(details["outlier_count"], 1)
+        self.assertEqual(details["outliers"][0]["views"], 10000)
+        self.assertEqual(details["outliers"][0]["outlier"], 4.81)
+        self.assertEqual(details["outliers"][0]["link"], d.watch_url(f"{4:011d}"))
+
+    def test_channel_details_separates_shorts_from_long(self):
+        entries = [{"id": f"{n:011d}", "view_count": 10, "duration": length}
+                   for n, length in enumerate([30, 60, 180, 181, 900])]
+        details, _err = self._channel(entries)
+        self.assertEqual((details["shorts"], details["long_videos"]), (3, 2))
+
+    def test_channel_details_refuses_a_video_link(self):
+        details, err = d.channel_details("https://www.youtube.com/watch?v=" + "a" * 11)
+        self.assertIsNone(details)
+        self.assertIn("not a channel link", err)
+
+    def test_channel_details_survives_an_empty_channel(self):
+        details, err = self._channel([])
+        self.assertIsNone(err)
+        self.assertEqual(details["videos_listed"], 0)
+        self.assertIsNone(details["average_views"])
+        self.assertEqual(details["outliers"], [])
+
+    def test_the_details_dispatcher_picks_by_link(self):
+        calls = []
+        saved = (d.channel_details, d.video_details)
+        d.channel_details = lambda url: (calls.append("channel") or (None, "x"))
+        d.video_details = lambda url: (calls.append("video") or (None, "x"))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                d.print_any_details("https://www.youtube.com/@H")
+                d.print_any_details("https://www.youtube.com/watch?v=" + "a" * 11)
+        finally:
+            d.channel_details, d.video_details = saved
+        self.assertEqual(calls, ["channel", "video"])
+
     def test_no_dates_flag_parses(self):
         self.assertFalse(d.parse_args(["/tmp"]).no_dates)
         self.assertTrue(d.parse_args(["/tmp", "--no-dates"]).no_dates)
