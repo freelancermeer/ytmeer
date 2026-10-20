@@ -51,7 +51,7 @@ class PlatformCase:
                        d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
                        d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
                        d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION,
-                       d.RESOLVE_DATES)
+                       d.RESOLVE_DATES, d.DETAILS_ONLY)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -63,6 +63,7 @@ class PlatformCase:
         d.LIMIT = 0
         d.SKIP_IDS = set()
         d.TRANSCRIPT_ONLY = False
+        d.DETAILS_ONLY = False
         d.EXTRACT_COMMENTS = False
         d.COMMENT_LIMIT = 100
         d.COMMENT_REPLIES = False
@@ -100,7 +101,7 @@ class PlatformCase:
          d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
          d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
          d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION,
-         d.RESOLVE_DATES) = self._saved
+         d.RESOLVE_DATES, d.DETAILS_ONLY) = self._saved
         d.LOG_RECORDS[:] = self._records
 
     # ------------------------------------------------------------------ search
@@ -3544,6 +3545,62 @@ class PlatformCase:
         counts = d.SEARCH_COUNTS[0]
         self.assertEqual(len(kept), 1)
         self.assertEqual(counts["unreached"], 9, "one was dated, nine untouched")
+
+    # ------------------------------------------------- details, the fourth mode
+    def test_details_prints_the_fields_and_writes_nothing(self):
+        info = {"id": "a" * 11, "webpage_url": "https://youtu.be/" + "a" * 11,
+                "title": "Clip", "channel": "Chan", "channel_follower_count": 1234,
+                "view_count": 5678, "like_count": 90, "comment_count": 12,
+                "duration": 125, "timestamp": 1700000000, "categories": ["News"],
+                "tags": ["a", "b"], "description": "line one\nline two",
+                "automatic_captions": {"en": [{"ext": "json3"}]}}
+        saved = d.fetch_info
+        d.fetch_info = lambda url, *a, **k: (info, None)
+        buf = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as base:
+                before = os.listdir(base)
+                with contextlib.redirect_stdout(buf):
+                    ok = d.print_details("https://youtu.be/" + "a" * 11)
+                self.assertEqual(os.listdir(base), before, "it must write nothing")
+        finally:
+            d.fetch_info = saved
+        shown = buf.getvalue()
+        self.assertTrue(ok)
+        for text in ("Clip", "Chan", "1,234", "5,678", "News", "2 tag(s)",
+                     "auto: en", "line one line two"):
+            self.assertIn(text, shown)
+
+    def test_details_reports_a_video_it_cannot_read(self):
+        saved = d.fetch_info
+        d.fetch_info = lambda url, *a, **k: (None, "Video unavailable")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                ok = d.print_details("https://youtu.be/" + "a" * 11)
+        finally:
+            d.fetch_info = saved
+        self.assertFalse(ok)
+        self.assertIn("Video unavailable", buf.getvalue())
+
+    def test_details_flag_parses_and_refuses_the_writing_modes(self):
+        self.assertFalse(d.parse_args(["/tmp"]).details)
+        self.assertTrue(d.parse_args(["/tmp", "--details"]).details)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for clash in ("--transcript", "--extract-comments"):
+                with self.assertRaises(SystemExit, msg=f"--details {clash}"):
+                    d.parse_args(["/tmp", "--details", clash])
+
+    def test_details_survives_a_missing_field(self):
+        saved = d.fetch_info
+        d.fetch_info = lambda url, *a, **k: ({"id": "a" * 11}, None)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.assertTrue(d.print_details("https://youtu.be/" + "a" * 11))
+        finally:
+            d.fetch_info = saved
+        self.assertIn("NA", buf.getvalue())
 
     def test_no_dates_flag_parses(self):
         self.assertFalse(d.parse_args(["/tmp"]).no_dates)

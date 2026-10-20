@@ -20,6 +20,7 @@ Optional flags:
     --max-height N       Quality ceiling (default: 1080)
     --no-subs            Do NOT build transcripts (built by default)
     --sub-lang CODE      Transcript language code (default: en)
+    --details            Print each video's details and stop (writes nothing)
     --transcript         Transcript only - no video is downloaded
     --extract-comments   Also save comments_<name>.txt (top 100, replies off)
     --comment-limit N    Top-level comments per video (default: 100; 0 = all)
@@ -132,6 +133,7 @@ DAYS           = 0         # filter by last N days (0 = any time)
 SKIP_FILE      = "skip.txt"
 SKIP_IDS       = set()     # video ids listed in skip.txt - never downloaded
 TRANSCRIPT_ONLY = False    # True = write the transcript and never fetch the video
+DETAILS_ONLY   = False     # --details: print each video's details, write nothing
 
 # What a transcript-only folder records. The status is deliberately not "OK":
 # index_downloaded() wants "OK" plus a video file, so such a folder is never
@@ -3164,6 +3166,9 @@ def take_in_window(items, since, limit, cap=None, deadline=None):
         asked += len(chunk)
         got, error = resolve_dates(chunk, deadline=deadline)
         dated += got
+        log_debug("window_block", stage="search", block=len(chunk),
+                  asked=asked, dated=dated, kept=len(kept), cap=cap,
+                  at=index, of=len(items), error=error)
         if error:
             # The fetch failed rather than finding nothing. Walking on would
             # repeat the same failure for every remaining block - minutes of
@@ -3179,6 +3184,9 @@ def take_in_window(items, since, limit, cap=None, deadline=None):
                     break
         if limit and len(kept) >= limit:
             break
+    log_debug("window_finish", stage="search", since=int(since),
+              asked=asked, dated=dated, undated=asked - dated, kept=len(kept),
+              walked=index, of=len(items), cap=cap, limit=limit, error=error)
     return {"kept": kept, "dated": dated, "undated": asked - dated,
             "asked": asked,
             # Not exhausted if a failure or a deadline stopped it early: the
@@ -3627,6 +3635,58 @@ def details_of(info):
     }
 
 
+def print_details(url):
+    """Print one video's details. Writes nothing, downloads nothing.
+
+    The terminal's answer to GET /api/video. Details are data, not a file, so
+    on the command line they are printed and that is all - no folder is made
+    and nothing is left behind.
+    """
+    started = time.monotonic()
+    log_debug("details_start", stage="details", url=url)
+    details, err = video_details(url)
+    if not details:
+        log_debug("details_finish", stage="details", url=url, ok=False, error=err,
+                  duration=round(time.monotonic() - started, 3))
+        print(f"\n  {url}\n    ERROR: {err}")
+        return False
+    log_debug("details_finish", stage="details", url=url, ok=True,
+              duration=round(time.monotonic() - started, 3),
+              video_id=details["id"], channel=details["channel"],
+              views=details["views"], subscribers=details["subscribers"],
+              likes=details["likes"], comment_count=details["comment_count"],
+              seconds=details["duration"], uploaded=details["uploaded"],
+              category=details["category"], live_status=details["live_status"],
+              availability=details["availability"], captions=details["captions"],
+              tags=len(details["tags"]))
+    rows = [
+        ("Title", details["title"]),
+        ("Link", details["link"]),
+        ("Channel", details["channel"]),
+        ("Subscribers", count_or_na(details["subscribers"])),
+        ("Views", count_or_na(details["views"])),
+        ("Likes", count_or_na(details["likes"])),
+        ("Comments", count_or_na(details["comment_count"])),
+        ("Duration", details["duration_text"] or "NA"),
+        ("Uploaded", details["uploaded"]),
+        ("Category", details["category"]),
+        ("Live status", details["live_status"] or "not live"),
+        ("Availability", details["availability"] or "NA"),
+        ("Captions", ", ".join(f"{kind}: {', '.join(codes)}"
+                               for kind, codes in details["captions"].items()
+                               if codes) or "none"),
+        ("Tags", f"{len(details['tags'])} tag(s)"),
+        ("Thumbnail", details["thumbnail"] or "NA"),
+    ]
+    print()
+    for label, value in rows:
+        print(f"  {label + ':':14}{value}")
+    text = one_line(details["description"] or "")
+    if text:
+        print(f"  {'Description:':14}{text[:300]}{'...' if len(text) > 300 else ''}")
+    return True
+
+
 def video_details(url):
     """(details, error) for one video. Reads metadata only; writes nothing."""
     info, err = fetch_info(url)
@@ -3958,6 +4018,10 @@ def list_channel_recent(url, deadline=None):
     links, seen, name = [], set(), ""
     counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0,
               "short": 0, "nolength": 0}
+    started = time.monotonic()
+    log_debug("channel_start", stage="channel", route="recent", url=tab,
+              shorts_tab=shorts_tab, days=DAYS, views=MIN_VIEWS, limit=LIMIT,
+              duration_floor=duration_floor())
 
     cmd = base_cmd() + [
         # The channel name goes LAST, and the split below is bounded. A channel
@@ -4055,6 +4119,9 @@ def list_channel_recent(url, deadline=None):
     if not links:
         explain_empty_listing(counts)
     skipped_by_list[0] += counts["skipped"]
+    log_debug("channel_finish", stage="channel", url=tab, channel=name or None,
+              kept=len(links), duration=round(time.monotonic() - started, 3),
+              **counts)
     if counts["unknown"]:
         print(f"      NOTE: {counts['unknown']} video(s) had no view count and "
               f"were left out (could not be shown to clear --views).")
@@ -4080,6 +4147,10 @@ def list_channel_videos(url, deadline=None):
     links, seen, name = [], set(), ""
     counts = {"scanned": 0, "views": 0, "unknown": 0, "live": 0, "skipped": 0,
               "short": 0, "nolength": 0}
+    started = time.monotonic()
+    log_debug("channel_start", stage="channel", route="paged", url=tab,
+              shorts_tab=shorts_tab, days=DAYS, views=MIN_VIEWS, limit=LIMIT,
+              duration_floor=duration_floor())
     start = 1
     while True:
         if deadline is not None and start > 1 and time.monotonic() >= deadline:
@@ -4127,6 +4198,9 @@ def list_channel_videos(url, deadline=None):
     if not links:
         explain_empty_listing(counts)
     skipped_by_list[0] += counts["skipped"]
+    log_debug("channel_finish", stage="channel", url=tab, channel=name or None,
+              kept=len(links), duration=round(time.monotonic() - started, 3),
+              **counts)
     if counts["unknown"]:
         print(f"      NOTE: {counts['unknown']} video(s) had no view count and "
               f"were left out (could not be shown to clear --views).")
@@ -4164,6 +4238,8 @@ def expand_sources(links):
         print("\n  NOTE: --views/--limit only apply to channel links, and "
               "links.txt has none.")
 
+    log_debug("sources_start", stage="sources", links=len(links),
+              channels=len(channels), videos=len(links) - len(channels))
     out, seen = [], set()
 
     def add(url, group=None):
@@ -4244,24 +4320,34 @@ def read_skips(path):
     return ids
 
 
+def log_skip(before, after):
+    """Record what skip.txt kept out of a worklist."""
+    log_debug("skip_applied", stage="sources", before=before, after=after,
+              excluded=before - after, skip_ids=len(SKIP_IDS))
+
+
 def drop_skipped(links):
     """Drop the links named in skip.txt. Returns (kept, how many went)."""
     if not SKIP_IDS:
         return links, 0
-    
     kept = []
     for item in links:
-        u = item[0] if isinstance(item, tuple) else item
-        if video_id_from_url(u) not in SKIP_IDS:
+        if video_id_from_url(link_url(item)) not in SKIP_IDS:
             kept.append(item)
+    log_skip(len(links), len(kept))
     return kept, len(links) - len(kept)
+
+
+def link_url(item):
+    """The URL of an expanded link, which may be a (url, channel group) pair."""
+    return item[0] if isinstance(item, tuple) else item
 
 
 def plan_links(links):
     """Split eligible links into new media and already-finished videos."""
     pending, already = [], 0
     for item in links:
-        url = item[0] if isinstance(item, tuple) else item
+        url = link_url(item)
         vid = video_id_from_url(url)
         if vid and vid in DONE_INDEX:
             already += 1
@@ -4493,6 +4579,10 @@ def parse_args(argv=None):
     p.add_argument("--transcript", action="store_true",
                    help="Transcript only: write trans_/words_ .txt and never "
                         "download the video.")
+    p.add_argument("--details", action="store_true",
+                   help="Print each video's details - views, subscribers, "
+                        "upload time, category, duration, captions - and stop. "
+                        "Nothing is downloaded and no files are written.")
     p.add_argument("--extract-comments", action="store_true",
                    dest="extract_comments",
                    help="Also save each video's comments to comments_<name>.txt.")
@@ -4535,6 +4625,11 @@ def parse_args(argv=None):
         # download every video in links.txt, month or no month.
         p.error("--this-month is a search window; it needs --search QUERY too. "
                 "To limit a download by date use --days N.")
+    if args.details and (args.transcript or args.extract_comments):
+        # --details writes nothing by design; the other two exist to write
+        # files. Together there is no telling which was meant.
+        p.error("--details only reports; it cannot be combined with "
+                "--transcript or --extract-comments.")
     if args.transcript and args.no_subs:
         # --transcript asks for a transcript and --no-subs says build none.
         # Together the run would fetch metadata for every video and write
@@ -4584,7 +4679,7 @@ def main():
     global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
-    global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY
+    global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY, DETAILS_ONLY
     global EXTRACT_COMMENTS, COMMENT_LIMIT, COMMENT_REPLIES, COMMENT_SORT
     global SEARCH_QUERY, SEARCH_COUNT, SORT_BY, THIS_MONTH, IN_CHANNEL
     global SEARCH_MATCH, INCLUDE_SHORTS, MIN_DURATION, RESOLVE_DATES
@@ -4604,6 +4699,7 @@ def main():
     SUB_LANG      = args.sub_lang
     CHANNEL_MODE  = args.channel
     TRANSCRIPT_ONLY = args.transcript
+    DETAILS_ONLY = args.details
     EXTRACT_COMMENTS = args.extract_comments
     COMMENT_LIMIT = max(0, args.comment_limit)
     COMMENT_REPLIES = args.comment_replies
@@ -4640,6 +4736,8 @@ def main():
     print(f"  Speed   : {'aria2c, 16 connections' if ARIA2C else 'built-in (install aria2c for a big speedup)'}")
     print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found - some videos may fail with 403'}")
     print(f"  Layout  : {'<Channel Name>/<Video Title>/' if CHANNEL_MODE else '<Video Title>/'}")
+    if DETAILS_ONLY:
+        print("  Output  : details only - nothing is downloaded or written")
     if TRANSCRIPT_ONLY:
         print("  Output  : transcript only - no video is downloaded")
     if EXTRACT_COMMENTS:
@@ -4753,6 +4851,19 @@ def main():
     excluded += skipped_by_list[0]      # the channel listings applied it too
     if excluded:
         print(f"  Excluded {excluded} video(s) listed in skip.txt.")
+
+    if DETAILS_ONLY:
+        # A report, not a run: no folders, no files, no summary of downloads.
+        log_debug("details_mode_start", stage="details", links=len(links))
+        print(f"\n{'=' * 60}")
+        ok = sum(1 for item in links if print_details(link_url(item)))
+        log_debug("details_mode_finish", stage="details", links=len(links),
+                  reported=ok, failed=len(links) - ok)
+        print(f"\n{'=' * 60}")
+        print(f"  Reported {ok} of {len(links)} video(s). Nothing was downloaded.")
+        print("=" * 60)
+        write_empty_summary(excluded=excluded)
+        return
     if not links:
         print("\nNothing left to download.")
         write_empty_summary(excluded=excluded)
