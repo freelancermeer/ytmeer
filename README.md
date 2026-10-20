@@ -229,8 +229,9 @@ pick the lines up on the next run.
 
 ## Reports: ask, do not download
 
-Five flags answer a question and stop. **Nothing is downloaded and nothing is
-written** — not a folder, not a file.
+Five flags answer a question and stop. **Nothing is downloaded** and no folder
+or data file is written — only the report's own `report_*` logs, kept apart
+from a download's `download_*` logs so neither overwrites the other.
 
 ```bash
 R="/path/to/folder"          # holds links.txt
@@ -504,7 +505,7 @@ videos this month in 64s; depth 150 found 44 in 3m 37s.
 
 ### Lookups: an answer, not a job
 
-Four endpoints answer in the response itself. They start no job, create no
+Ten endpoints answer in the response itself. They start no job, create no
 folder and leave no files - not even a temporary one.
 
 ```bash
@@ -951,6 +952,11 @@ link as well - nothing else, no UI.
 | `GET /api/preview?channel=URL&views=1000&limit=3` | the newest videos a channel link would download |
 | `GET /api/search?query=...` | search YouTube: link, views, publish date, channel |
 | `GET /api/video?url=...` | one video's details - **answers, no job** |
+| `GET /api/channel?channel=...` | one channel's details, counted from its long videos |
+| `GET /api/channel/videos?channel=...` | a channel's long videos, each vs the channel average |
+| `GET /api/channel/playlists?channel=...` | a channel's playlists, long vs short |
+| `GET /api/similar?url=...` | long videos like this one |
+| `GET /api/resolve?url=...` | the channel behind any link |
 | `GET /api/transcript?url=...` | one video's transcript, as text - **no job** |
 | `GET /api/comments?url=...` | one video's comments, threaded - **no job** |
 | `POST /api/jobs` | start downloading, returns `job_id` |

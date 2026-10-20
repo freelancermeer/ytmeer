@@ -40,7 +40,10 @@ without checking that line.
 
 ## 1. What it does
 
-**Ten research answers. Each writes nothing and leaves nothing on disk.**
+**Ten research answers. None writes a video, a folder or a data file.** A
+report writes only its own logs — `report_log.txt`, `report_log.json`,
+`report_log.jsonl`, `report_debug.jsonl` — under those names precisely so it
+never touches the `download_*` logs of a download that ran in the same folder.
 
 | # | Answer | CLI | REST |
 |---|---|---|---|
@@ -92,7 +95,8 @@ optionally `cookies.txt` and `skip.txt`. Downloads land in the same folder.
 
 `--details  --resolve  --channel-videos  --playlists  --similar`
 
-Each prints and stops. **Nothing is downloaded and nothing is written.**
+Each prints and stops. **Nothing is downloaded, and nothing is written except
+the report's own `report_*` logs** (§7).
 **One at a time** — two reports together is an error, and so is a report with
 `--transcript` or `--extract-comments` (those exist to write files).
 
@@ -161,6 +165,21 @@ The run prints this as a `Uses :` line so there is no guessing.
 | `--yes` | Skip the confirmation prompt (required unattended) |
 | `-v`, `--verbose` | yt-dlp's full output instead of the progress bar |
 
+**What happens to a link in `links.txt`.** A bare 11-character id becomes a
+watch link. A watch link copied from a playlist loses its `&list=` and
+`&index=`; a `youtu.be` link its `?t=`; a share link its `?si=`/`&feature=` —
+none of those name a different video, and `&list=` used to make yt-dlp walk the
+whole playlist. A YouTube link that is **neither a video nor a channel** (the
+uploads playlist `playlist?list=UU...`, a bare legacy vanity URL, a `/results`
+page) and any **non-YouTube link** is refused with a message, counted in the
+summary as `refused_links`, and makes the run exit non-zero. A UTF-8 BOM,
+zero-width characters, CRLF and UTF-16 ("Unicode" in Notepad) are all handled;
+a line containing a NUL byte is dropped with a message.
+
+A `--cookies` path that does not exist is **not** fatal — cookies are optional —
+but the run says so loudly and the banner shows `NOT FOUND`, rather than
+reading "none (optional)" as before.
+
 **Aliases** you may meet in existing scripts: `--view` and `--min-views` both
 mean `--views`; `--sort-by` means `--sort`.
 
@@ -197,24 +216,37 @@ curl -H "$K" "$B/api/preview?channel=https://www.youtube.com/@X"
 
 A link or a bare 11-character id both work where a video is wanted.
 
-`shorts` and `min_duration` are accepted by `/api/video`'s channel siblings —
-`/api/channel`, `/api/channel/videos`, `/api/similar`, `/api/search`,
-`/api/preview`. `/api/resolve` and `/api/channel/playlists` take neither:
-neither answer is a list of videos.
+`shorts` and `min_duration` are accepted by every route that lists videos —
+`/api/channel`, `/api/channel/videos`, `/api/channel/playlists`, `/api/similar`,
+`/api/search`, `/api/preview`. `/api/resolve` takes neither. `skip` (links or
+ids to leave out, as `skip.txt` would) is accepted by `/api/search`,
+`/api/preview`, `/api/channel/videos` and `/api/similar`.
+
+Every lookup refuses, with a `422` naming `url`/`channel`, any link whose host
+is not YouTube's, and any YouTube link that is neither a video nor a channel —
+**before** the engine is touched. That is the SSRF guard: the id pattern alone
+used to accept any host carrying `v=<11 chars>`.
 
 **Status codes:** `422` the request was wrong — the body names the field in
-`detail[0].loc`; `502` YouTube would not answer for that video; `503` another
-in-process request holds the engine; `401` bad or missing key.
+`detail[0].loc`; `502` YouTube would not answer, **including a search whose
+engine failed and found nothing** (a bot check, a timeout — formerly a `200`
+with `found: 0`); `503` another in-process request holds the engine; `401` bad
+or missing key, including a non-ASCII one.
+
+A **partial** answer stays a `200`: results with a noted `error` or
+`date_error` (say, the publish dates could not be fetched) is still an answer.
 
 **One lookup, search or preview at a time.** They share the engine's module
 globals. A second gets `503` — retry, do not queue. Every request resets every
 global it can set, so nothing leaks between them.
 
-Every route sets a **120s wall**, and the paid-per-video work honours it: date
-fetching and the window walk stop at it. A channel *listing* is bounded instead
+Every route sets a **120s wall** (`/api/preview` keeps its own 45s). The
+paid-per-video work honours it: the metadata lookup, date fetching, the window
+walk and the playlist probes all stop at it, and a metadata **timeout is not
+retried** (it used to be, three times). A channel *listing* is bounded instead
 by its own 300s-per-request timeout and by `CHANNEL_VIDEO_CAP`, so a very large
-channel can outlast the wall — `listing_capped` in the answer says when only
-part of it was read.
+channel can still outlast the wall — `listing_capped` says when only part of it
+was read.
 
 ### 4.2 Jobs — when the files are the point
 
@@ -231,7 +263,10 @@ each video appears as soon as its folder is complete. Files from
 `POST /api/jobs/{id}/stop`.
 
 Request fields mirror the flag names (§3.2) with `_` for `-`, plus `links`,
-`skip`, `outdir`, `verbose`, `dates`. Two do not mirror: there is no job field
+`skip`, `outdir`, `verbose`, `dates`. The **negated** flags are positive
+booleans here: `--no-subs` is `subs: false`, `--no-thumbnail` is
+`thumbnail: false`, `--no-description` is `description: false`, `--no-dates` is
+`dates: false`. Two more do not mirror: there is no job field
 for the report flags (a job downloads; use the lookup routes to report), and
 the **lookup** routes name their scan depth `count` rather than `search_count`. `links` and `search` are two different worklists — sending
 both is refused. `this_month`, `match`, `search_count` and `dates` mean nothing
@@ -281,8 +316,15 @@ date**. So:
 - At most **100** videos are dated per CLI run, **20** per API request.
 
 **`found: 0` with `date_capped: true` means "did not look far enough", not
-"nothing was published."** A date fetch that *fails* is reported as an `error`,
-never as an empty result.
+"nothing was published."** A date fetch that *fails* on a windowed search is
+reported as an `error`; on an unwindowed one the results stand and the reason is
+in `date_error`.
+
+Two edges worth knowing. Without a window, dating is **all-or-nothing** past the
+cap: more survivors than the cap (20 over the API) and *none* are dated — raise
+`limit` to get them. And `--no-dates` / `dates=false` **with** a window is not
+"skip the dates": with no local dates to filter on, the window is handed back to
+YouTube's own date search, which scans only 40 deep and returns far fewer.
 
 ### 5.4 Budget from the measured costs
 
@@ -318,8 +360,8 @@ transcript: only an auto-generated track has word timings.
 
 Counted from the channel's own **long** videos, not estimated:
 
-`videos_listed`, `long_videos`, `shorts`, `unknown_length`, `excluded`,
-`metrics_over`, `shorts_tab`, `listing_capped`, `views_listed`,
+`videos_listed`, `long_videos`, `shorts`, `unknown_length`, `live_or_upcoming`,
+`excluded`, `metrics_over`, `shorts_tab`, `listing_capped`, `views_listed`,
 `average_views`, `median_views`, `best_views`, `average_length`,
 `average_length_text`, `uploads_per_week`, `first_upload`, `last_upload`,
 `date_error`, `outliers` (**every** long video at 2x the channel average or
@@ -327,8 +369,10 @@ better, with its multiplier — the printer shows ten, the data carries them
 all), `outlier_count`, `listing_error`.
 
 `shorts` is what was *measured* under the floor; `unknown_length` is what had
-no duration to measure — a livestream or a premiere, not short-form — and
-`excluded` is the two together. `median_views` is the true median (the two
+no duration to measure; `live_or_upcoming` is a stream in progress or a
+premiere, left out exactly as the download path leaves them out; and `excluded`
+is everything set aside. `date_error` is also set when only *one* of the two
+dated edges came back. `median_views` is the true median (the two
 middles averaged on an even count). The first and last upload are dated from
 the **long** videos, the same population every other number uses, and
 `date_error` says when that fetch failed rather than leaving the three date
@@ -347,8 +391,8 @@ the averages then describe only that slice.
 
 `videos` (each with `rank`, `id`, `link`, `title`, `views`, `duration`,
 `duration_text`, `outlier`), `listed`, `long_videos`, `short_form_dropped`,
-`excluded_by_skip_list`, `shorts_tab`, `listing_capped`, `average_views`,
-`listing_error`. No publish dates — see §5.3.
+`live_or_upcoming`, `excluded_by_skip_list`, `shorts_tab`, `listing_capped`,
+`average_views`, `listing_error`. No publish dates — see §5.3.
 
 `average_views` is over every long video **before** `limit`, so `outlier`
 compares a video with its channel. Past `listing_capped` it describes only the
@@ -356,8 +400,15 @@ slice that was read, and so does every ratio built on it.
 
 ### 6.4 `GET /api/channel/playlists`
 
-`playlists` (each `id`, `title`, `link`, `videos`, `long_videos`, `shorts`),
-`counted`, `count_capped`, `count_failures`, `listing_capped`.
+`playlists` (each `id`, `title`, `link`, `videos`, `long_videos`, `shorts`,
+`unknown_length`, `split_over`, `split_capped`), `counted`, `count_capped`,
+`count_failures`, `out_of_time`, `listing_capped`.
+
+The split is counted over at most **200** entries of each playlist
+(`split_over` says how many, `split_capped` when it stopped there), while
+`videos` is yt-dlp's full total — so on a huge playlist the parts do not add up
+to the total, and the row says so. `out_of_time` means the request's wall
+stopped the probes early.
 
 One listing names them all; the split needs a request per playlist, so it is
 filled in for the first **25** and is `null` after. **`videos` is yt-dlp's own
@@ -382,7 +433,7 @@ named video.
 
 `id`, `link`, `title`, `views`, `query`, `scanned`, `found`, `similar` (the same
 row shape as a search result), plus `dates_fetched`, `dates_missing`,
-`date_capped` and `filtered_out` (per-reason counts).
+`date_capped`, `date_error` and `filtered_out` (per-reason counts).
 
 YouTube's related feed is not reachable through yt-dlp, so this **searches for
 the video's own title** and leaves the video itself out. It needs a **video**
@@ -395,7 +446,7 @@ channel's own uploads. `skip.txt` still applies.
 { "query": "...", "match": "related", "sort": "views",
   "window": "since 01 Oct 2026", "depth": 150, "min_duration": 180,
   "scanned": 149, "dates_fetched": 57, "dates_missing": 0,
-  "date_capped": false, "found": 20,
+  "date_capped": false, "date_error": null, "found": 20,
   "results": [ { "rank": 1, "id": "...", "link": "...", "title": "...",
                  "channel": "...", "views": 46701, "duration": 1685,
                  "duration_text": "28m 05s",
@@ -419,20 +470,23 @@ Comments: `total_on_video` vs `fetched` shows what the limit left behind.
 
 ## 7. Reading the logs instead of re-running
 
-Every run writes four files into the folder:
+Every run writes four files into the folder. A download writes `download_*`;
+a report writes `report_*` under the same four names, so the two never
+overwrite each other:
 
 | File | What it is |
 |---|---|
-| `download_debug.jsonl` | **the structured trace — start here** |
-| `download_log.json` | the run summary |
-| `download_log.txt` | the human log |
-| `download_log.jsonl` | one record per video, streamed as it finishes |
+| `download_debug.jsonl` / `report_debug.jsonl` | **the structured trace — start here** |
+| `download_log.json` / `report_log.json` | the run summary (`run_type`, `failed`, `refused_links`, `stopped_early`) |
+| `download_log.txt` / `report_log.txt` | the human log |
+| `download_log.jsonl` / `report_log.jsonl` | one record per video, streamed as it finishes |
 
 The trace's **first line is `run_start`** and carries `settings_snapshot()` —
 *every* setting a flag can change, read from the live globals, so you never have
 to guess how a run was invoked. Then one event per stage: `sources_start`,
 `report_start` / `report_finish`, `details_start` / `details_finish`,
-`resolve`, `channel_details_start` / `channel_details_finish`,
+`link_refused` (one per link `read_links` dropped), `resolve`,
+`channel_details_start` / `channel_details_finish`,
 `channel_videos`, `channel_playlists`, `about_page`, `similar_videos`,
 `channel_start` / `channel_finish` (with the full per-reason tally),
 `search_start` / `search_finish`, `window_block` / `window_finish`,
@@ -493,7 +547,16 @@ python3 downloader.py $R --details
 **`--dry-run` first** on anything that could download. Add `--yes` only after
 seeing the plan, or when running unattended.
 
-## 9. Limits — know these before promising anything
+## 9. Exit codes
+
+The CLI exits **0** only when the run did what was asked. **1** when any link
+failed, any link was refused, or the worklist was empty (an empty `links.txt`,
+a search that matched nothing, a report with nothing to report). **130** when
+it was stopped with Ctrl+C. A `--dry-run` that finds nothing new is still 0.
+`download_log.json` / `report_log.json` carries the same facts as `failed`,
+`refused_links` and `stopped_early`.
+
+## 10. Limits — know these before promising anything
 
 - **Long videos only** (§0). Short-form is excluded from every number.
 - **One in-process API request at a time** (§4.1).
@@ -505,6 +568,7 @@ seeing the plan, or when running unattended.
 - **`--this-month` is a search window**, not a download filter. Use `--days N`
   to limit a download by date.
 - A date sort cannot reach further back than its scan depth.
+- **YouTube links only.** Anything else is refused, not fetched (§3.2, §4.1).
 - **Public data only.** There is no access to anyone's private analytics,
   revenue, retention or demographics. Revenue and RPM are not estimated here at
   all — if a number like that is wanted, this tool does not have it.

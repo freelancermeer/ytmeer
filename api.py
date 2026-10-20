@@ -189,7 +189,12 @@ def key_ok(supplied):
     """Whether a request may proceed. No key configured means no check."""
     if not API_KEY[0]:
         return True
-    return bool(supplied) and secrets.compare_digest(str(supplied), API_KEY[0])
+    if not supplied:
+        return False
+    # compare_digest on str demands ASCII and raises TypeError otherwise, which
+    # made a header with one non-ASCII byte a 500 instead of a 401.
+    return secrets.compare_digest(str(supplied).encode("utf-8"),
+                                  API_KEY[0].encode("utf-8"))
 
 
 # ----------------------------------------------------------------- requests
@@ -953,9 +958,17 @@ def one_url(value, what):
         raise ValueError(f"{what} is required")
     if downloader.BARE_ID_RE.match(url):
         return downloader.watch_url(url)
-    if not downloader.video_id_from_url(url):
-        raise ValueError(f"not a video link or 11-character id: {url[:100]!r}")
-    return url
+    # A YouTube host, or nothing: the video-id pattern alone matched any URL
+    # that carried v=<11 chars>, and the route then ran yt-dlp against a host
+    # the caller chose - a link-local one included. That is SSRF.
+    if not downloader.youtube_host(url):
+        raise BadField(what, f"not a YouTube link: {url[:100]!r}")
+    vid = downloader.video_id_from_url(url)
+    if not vid:
+        raise BadField(what, f"not a video link or 11-character id: {url[:100]!r}")
+    # Canonical, so &list= never reaches the metadata lookup (see
+    # downloader.canonical_link).
+    return downloader.watch_url(vid)
 
 
 def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
@@ -980,7 +993,9 @@ def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
                             MIN_DURATION=min_duration):
         found, name, err = d.list_channel_videos(
             url, deadline=time.monotonic() + PREVIEW_SECONDS)
-        floor_used = d.duration_floor()
+        # None on a /shorts tab, where the floor is waived (see is_shorts_tab).
+        floor_used = (None if d.is_shorts_tab(d.channel_videos_url(url))
+                      else d.duration_floor())
     return {"channel": name or None, "tab_read": d.channel_videos_url(url),
             "min_duration": floor_used or None,
             "matched": len(found), "videos": found, "error": err}
@@ -1042,6 +1057,8 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
             "dates_fetched": tally.get("dated", 0),
             "dates_missing": tally.get("undated", 0),
             "date_capped": bool(tally.get("date_capped")),
+            # Results sound, dates not: a 200, with the reason named.
+            "date_error": tally.get("date_error"),
             "found": len(rows), "results": rows, "error": err}
 
 
@@ -1065,8 +1082,8 @@ def video_transcript(url, sub_lang="en"):
     """One video's transcript, as text, in both the grouped and per-word forms."""
     url = one_url(url, "url")
     if not SUB_LANG_RE.fullmatch(str(sub_lang or "en")):
-        raise ValueError(f"sub_lang must be a language code such as en or pt-BR, "
-                         f"got {sub_lang!r}")
+        raise BadField("sub_lang", f"sub_lang must be a language code such as en "
+                                   f"or pt-BR, got {sub_lang!r}")
     with downloader_globals(SUB_LANG=str(sub_lang or "en"), DOWNLOAD_SUBS=True):
         transcript, err = downloader.video_transcript(url)
     if err:
@@ -1078,12 +1095,13 @@ def video_comments(url, limit=100, replies=False, sort="top"):
     """One video's comments, threaded, as data."""
     url = one_url(url, "url")
     if sort not in COMMENT_SORTS:
-        raise ValueError(f"sort must be one of {', '.join(COMMENT_SORTS)}, got {sort!r}")
+        raise BadField("sort", f"sort must be one of {', '.join(COMMENT_SORTS)}, "
+                               f"got {sort!r}")
     limit = int(limit or 0)
     if limit < 0:
-        raise ValueError("limit cannot be negative")
+        raise BadField("limit", "limit cannot be negative")
     if limit > INT_MAX["comment_limit"]:
-        raise ValueError(f"limit is too large (at most {INT_MAX['comment_limit']})")
+        raise BadField("limit", f"limit is too large (at most {INT_MAX['comment_limit']})")
     with downloader_globals(COMMENT_LIMIT=limit, COMMENT_REPLIES=bool(replies),
                             COMMENT_SORT=sort, COMMENT_TIMEOUT=ROUTE_SECONDS):
         comments, err = downloader.video_comments(url)
@@ -1118,6 +1136,18 @@ def resolve_link(url):
     link = _lines(url).strip().split("\n")[0].strip()
     if not link:
         raise ValueError("url is required")
+    if downloader.BARE_ID_RE.match(link):
+        link = downloader.watch_url(link)
+    # Refused BEFORE the lock is taken: a playlist or /results link used to go
+    # straight to the metadata lookup, which could hold the engine for every
+    # other caller for minutes. A bad request is a 422 naming the field, as the
+    # sibling routes answer the same links.
+    if not downloader.youtube_host(link):
+        raise BadField("url", f"not a YouTube link: {link[:100]!r}")
+    problem = downloader.unusable_youtube_link(link)
+    if problem:
+        raise BadField("url", problem)
+    link = downloader.canonical_link(link)
     with downloader_globals(SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         found, err = downloader.resolve_channel(link)
     if err:
@@ -1125,7 +1155,7 @@ def resolve_link(url):
     return found
 
 
-def channel_video_rows(channel, limit=0, shorts=False, min_duration=180):
+def channel_video_rows(channel, limit=0, shorts=False, min_duration=180, skip=""):
     """A channel's long videos, newest first, with each one's ratio to the
     channel's own average."""
     url = _lines(channel).strip().split("\n")[0].strip()
@@ -1135,6 +1165,7 @@ def channel_video_rows(channel, limit=0, shorts=False, min_duration=180):
         raise BadField("channel", f"not a channel link: {url}")
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
                             MIN_DURATION=_floor_seconds(min_duration),
+                            SKIP_IDS=_skip_ids(skip),
                             SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         answer, err = downloader.channel_videos(url, limit=max(0, int(limit or 0)))
     if err:
@@ -1158,12 +1189,12 @@ def channel_playlist_rows(channel, shorts=False, min_duration=180):
     return answer
 
 
-def similar_to(url, limit=0, shorts=False, min_duration=180, dates=True):
+def similar_to(url, limit=0, shorts=False, min_duration=180, dates=True, skip=""):
     """Long videos like this one, found by searching for its title."""
     link = one_url(url, "url")
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
                             MIN_DURATION=_floor_seconds(min_duration),
-                            RESOLVE_DATES=bool(dates),
+                            RESOLVE_DATES=bool(dates), SKIP_IDS=_skip_ids(skip),
                             SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
         answer, err = downloader.similar_videos(link, count=max(0, int(limit or 0)))
         tally = dict(downloader.SEARCH_COUNTS[0] or {})
@@ -1175,6 +1206,7 @@ def similar_to(url, limit=0, shorts=False, min_duration=180, dates=True):
     answer["dates_fetched"] = tally.get("dated", 0)
     answer["dates_missing"] = tally.get("undated", 0)
     answer["date_capped"] = bool(tally.get("date_capped"))
+    answer["date_error"] = tally.get("date_error")
     answer["filtered_out"] = {k: v for k, v in tally.items()
                               if k in ("short", "nolength", "views", "live",
                                        "skipped") and v}
@@ -1402,13 +1434,20 @@ def build_app():
 
         One search, preview or lookup runs at a time; another gets 503."""
         try:
-            return search_youtube(query, in_channel, count, sort, days,
-                                  this_month, views, limit, skip,
-                                  match, shorts, min_duration, dates)
+            answer = search_youtube(query, in_channel, count, sort, days,
+                                    this_month, views, limit, skip,
+                                    match, shorts, min_duration, dates)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "query"))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
+        if answer.get("error") and not answer.get("results"):
+            # The engine failed - a bot check, a timeout - and found nothing.
+            # That is a 502, as /api/similar already answers; a 200 with
+            # found: 0 read as "nothing matched". A partial answer (results
+            # with a noted error, say dates that failed) stays a 200.
+            raise HTTPException(502, answer["error"])
+        return answer
 
     @app.get("/api/video", tags=["lookups"], dependencies=keyed)
     def get_video(url: str = Query(..., description="A video link, or an "
@@ -1420,7 +1459,9 @@ def build_app():
         try:
             return video_info(url)
         except ValueError as e:
-            raise unprocessable(str(e), "query", "url")
+            # The field the error names, when it names one: a bad sort or
+            # sub_lang used to be blamed on "url".
+            raise unprocessable(str(e), "query", getattr(e, "field", "url"))
         except LookupFailed as e:
             raise HTTPException(502, str(e))
         except PreviewBusy as e:
@@ -1438,7 +1479,9 @@ def build_app():
         try:
             return video_transcript(url, sub_lang)
         except ValueError as e:
-            raise unprocessable(str(e), "query", "url")
+            # The field the error names, when it names one: a bad sort or
+            # sub_lang used to be blamed on "url".
+            raise unprocessable(str(e), "query", getattr(e, "field", "url"))
         except LookupFailed as e:
             raise HTTPException(502, str(e))
         except PreviewBusy as e:
@@ -1462,7 +1505,9 @@ def build_app():
         try:
             return video_comments(url, limit, replies, sort)
         except ValueError as e:
-            raise unprocessable(str(e), "query", "url")
+            # The field the error names, when it names one: a bad sort or
+            # sub_lang used to be blamed on "url".
+            raise unprocessable(str(e), "query", getattr(e, "field", "url"))
         except LookupFailed as e:
             raise HTTPException(502, str(e))
         except PreviewBusy as e:
@@ -1517,7 +1562,9 @@ def build_app():
                            min_duration: int = Query(180, ge=0,
                                                      le=INT_MAX["min_duration"],
                                                      description="Length floor, "
-                                                     "seconds.")):
+                                                     "seconds."),
+                           skip: str = Query("", description="Links or ids to "
+                                             "leave out, as skip.txt would.")):
         """A channel's long videos, newest first, each with its views, length
         and ratio to the channel's own average.
 
@@ -1526,7 +1573,7 @@ def build_app():
         this page. No publish dates: a flat listing has none and dating every
         video costs about 2.1s each."""
         try:
-            return channel_video_rows(channel, limit, shorts, min_duration)
+            return channel_video_rows(channel, limit, shorts, min_duration, skip)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
         except LookupFailed as e:
@@ -1568,13 +1615,15 @@ def build_app():
                                               le=INT_MAX["min_duration"],
                                               description="Length floor, seconds."),
                     dates: bool = Query(True, description="Fetch publish dates "
-                                        "(about 2.1s per video).")):
+                                        "(about 2.1s per video)."),
+                    skip: str = Query("", description="Links or ids to leave "
+                                      "out, as skip.txt would.")):
         """Long videos like this one. YouTube's related feed is not reachable
         through yt-dlp, so this searches YouTube for the video's own title -
         the same near-match set match=related exists for - and leaves the video
         itself out."""
         try:
-            return similar_to(url, limit, shorts, min_duration, dates)
+            return similar_to(url, limit, shorts, min_duration, dates, skip)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "url"))
         except LookupFailed as e:

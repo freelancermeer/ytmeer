@@ -116,6 +116,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 # These are filled in from command-line arguments in main().
 LINKS_FILE     = "links.txt"
 COOKIES_FILE   = "cookies.txt"
+COOKIES_MISSING = False    # --cookies named a file that is not there
 DOWNLOAD_DIR   = "."
 MAX_HEIGHT     = 1080
 MIN_HEIGHT     = 720
@@ -198,6 +199,9 @@ SEARCH_FOUND   = [0]       # results the last search returned, before filtering
 # listings use. The length floor is on by default, so a thin answer needs to
 # say which filter thinned it.
 SEARCH_COUNTS  = [{}]
+# Links read from links.txt that nothing could act on. Counted so a worklist
+# made only of them is a failed run, not a clean "nothing to do".
+REFUSED_LINKS  = [0]
 
 # How wide a net the search casts. These are two different questions asked of
 # YouTube, not two orderings of one answer - see web_search_url().
@@ -376,13 +380,79 @@ def read_links(path: str):
     if not os.path.exists(path):
         print(f"ERROR: links file not found: {path}")
         sys.exit(1)
+    if os.path.isdir(path):
+        print(f"ERROR: {path} is a folder, not a links file. Put a links.txt "
+              f"inside it, or point --links at a file.")
+        sys.exit(1)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"ERROR: could not read {path}: {e}")
+        sys.exit(1)
     links = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                links.append(line)
+    for line in decode_text_file(raw, path).splitlines():
+        line = strip_invisible(line).strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\x00" in line:
+            # A NUL cannot be passed to a subprocess; it used to be a traceback
+            # on the CLI and a job stuck at "queued" forever over the API.
+            print(f"  Ignoring a line in {os.path.basename(path)} that contains "
+                  f"a NUL byte.")
+            continue
+        links.append(canonical_link(line))
     return drop_unusable(links)
+
+
+# Zero-width characters and the byte-order mark. Pasted from a browser or a
+# chat, a channel link can arrive with one of these in front of it - invisible,
+# and enough to stop it matching the channel pattern, so it was treated as a
+# video the user had named (the one case the length floor exempts).
+# Built from code points rather than written out: the source file stays
+# ASCII, which an AST test enforces for everything that could reach a console.
+INVISIBLE = "".join(chr(c) for c in (0xFEFF, 0x200B, 0x200C, 0x200D, 0x2060))
+
+
+def strip_invisible(text):
+    """Text without zero-width characters or a byte-order mark."""
+    return "".join(ch for ch in (text or "") if ch not in INVISIBLE)
+
+
+def decode_text_file(raw, path):
+    """A user-written text file as str, whatever editor saved it.
+
+    UTF-8 with or without a BOM, UTF-16 (what Windows Notepad calls "Unicode"),
+    and finally cp1252 with a note - a links.txt is a list of ASCII URLs with
+    the odd comment, so refusing the whole file over one curly quote in a
+    comment would be the wrong failure.
+    """
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        print(f"  NOTE: {os.path.basename(path)} is not UTF-8; reading it as cp1252.")
+        return raw.decode("cp1252", errors="replace")
+
+
+def canonical_link(line):
+    """One video link in the one form the rest of the tool uses.
+
+    A bare 11-character id becomes a watch link, so skip.txt, the resume index
+    and the duplicate check - which all key on the id - see it. A watch link
+    copied from a playlist loses its &list= and &index=, a youtu.be link its
+    ?t=, a share link its ?si= and &feature=: none of them name a different
+    video, and the &list= in particular made yt-dlp walk the whole playlist.
+    Channel links and non-YouTube links pass through untouched.
+    """
+    if BARE_ID_RE.match(line):
+        return watch_url(line)
+    if youtube_host(line) and not is_channel_url(line):
+        vid = video_id_from_url(line)
+        if vid:
+            return watch_url(vid)
+    return line
 
 
 # ============================== output =====================================
@@ -461,7 +531,10 @@ def redact_url(value):
         parsed = urlsplit(text)
         if parsed.scheme and parsed.netloc:
             vid = video_id_from_url(text)
-            query = f"v={vid}" if vid else ""
+            # Keep v= only where the link carried it. /shorts/ID and youtu.be/ID
+            # name the video in the path, and used to come out as
+            # ".../shorts/ID?v=ID", which is not a link that exists.
+            query = f"v={vid}" if vid and f"v={vid}" in (parsed.query or "") else ""
             return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
     except (TypeError, ValueError):
         pass
@@ -517,8 +590,26 @@ def log_debug(event, **fields):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         return
+def child_env():
+    """The environment a yt-dlp child runs in: UTF-8 out, whatever the console.
+
+    On Windows a child inherits the console's code page, and --print then
+    replaces every character outside cp1252 - most non-English titles and
+    channel names - with "?". Forcing UTF-8 on the child's stdout is what makes
+    text=True decode the bytes we actually asked for.
+    """
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
 def run_logged(stage, cmd, **kwargs):
     """Run a captured subprocess and record its full lifecycle in the trace."""
+    kwargs.setdefault("env", child_env())
+    if kwargs.get("text") and "encoding" not in kwargs:
+        kwargs["encoding"] = "utf-8"
+        kwargs.setdefault("errors", "replace")
     started = time.monotonic()
     log_debug("command_start", stage=stage, command=cmd, timeout=kwargs.get("timeout"))
     try:
@@ -643,6 +734,7 @@ def write_empty_summary(stopped=False, excluded=0):
         "days": DAYS or None,
         "excluded_by_skip_list": excluded, "links": 0, "downloaded": 0, "skipped": 0,
         "failed": failed_before_download(),
+        "refused_links": REFUSED_LINKS[0],
         **mode_fields(),
         "stopped_early": stopped, "bytes": 0, "size": human_size(0),
         "download_seconds": 0.0, "run_seconds": 0.0, "average_speed": None,
@@ -650,7 +742,7 @@ def write_empty_summary(stopped=False, excluded=0):
     })
 
 
-def write_report_summary(report, links, reported):
+def write_report_summary(report, links, reported, stopped=False):
     """The JSON log for a report run.
 
     write_empty_summary() describes a DOWNLOAD that found nothing to do, which
@@ -661,9 +753,11 @@ def write_report_summary(report, links, reported):
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
         "run_type": "report",
         "report": report,
+        "stopped_early": stopped,
         "links": links,
         "reported": reported,
-        "failed": links - reported,
+        "failed": links - reported + REFUSED_LINKS[0],
+        "refused_links": REFUSED_LINKS[0],
         "downloaded": 0, "skipped": 0,
         **mode_fields(),
         "bytes": 0, "size": human_size(0),
@@ -698,7 +792,23 @@ def write_plan_summary(source_links, eligible_links, planned_downloads,
     })
 
 
+# What the process exits with. 0 only when the run did what was asked: a
+# failed link, an empty worklist, a search that matched nothing and a stopped
+# run all used to exit 0, so nothing scripted around this could tell.
+EXIT_CODE = [0]
+
+
 def write_json_log(summary):
+    if summary.get("stopped_early"):
+        EXIT_CODE[0] = 130
+    elif (summary.get("failed") or 0) > 0 or REFUSED_LINKS[0]:
+        EXIT_CODE[0] = 1
+    elif summary.get("links") == 0 and not summary.get("dry_run"):
+        EXIT_CODE[0] = 1
+    _write_json_log(summary)
+
+
+def _write_json_log(summary):
     """Write the JSON log: the run's totals, then a record per video."""
     if not LOG_JSON[0]:
         return
@@ -1416,7 +1526,15 @@ def build_extras(folder, url, info):
             for attempt_no in range(1, 3):
                 cmd = base_cmd() + ["--skip-download", "--no-warnings"] + thumb_flags() \
                     + list(extra) + ["-o", output_template(folder, name), "--", url]
-                out = run_logged("thumbnail", cmd, capture_output=True, text=True)
+                try:
+                    out = run_logged("thumbnail", cmd, capture_output=True, text=True,
+                                     timeout=THUMBNAIL_TIMEOUT)
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    thumb = None
+                    log_debug("thumbnail_attempt", stage="thumbnail", url=url,
+                              folder=rel(folder), route=route_no, attempt=attempt_no,
+                              found=False, error=str(e)[:200])
+                    break
                 thumb = find_thumbnail(folder)
                 log_debug("thumbnail_attempt", stage="thumbnail", url=url, folder=rel(folder),
                           route=route_no, attempt=attempt_no, found=bool(thumb),
@@ -1630,6 +1748,10 @@ def write_comments_txt(folder, info, comments):
 def fetch_comments(folder, url):
     """Run the one yt-dlp command that leaves the comments in an .info.json.
 
+    Returns (comments, error). An error means the fetch itself failed, which is
+    a different fact from a video that has no comments - see resolve_dates for
+    the same distinction and why it matters.
+
     Gets the same route escalation every lone fetch here does, because asking
     for comments on their own meets the same bot check the video download does.
     """
@@ -1638,6 +1760,7 @@ def fetch_comments(folder, url):
     log_debug("comments_start", stage="comments", url=url, folder=rel(folder),
               sort=COMMENT_SORT, limit=COMMENT_LIMIT, replies=COMMENT_REPLIES,
               routes=len(routes))
+    problem = None
     for route_no, extra in enumerate(routes, 1):
         # Two attempts per route, because the second is the point of the first:
         # when YouTube rejects cookies.txt, drop_rejected_cookies() drops it and
@@ -1659,18 +1782,30 @@ def fetch_comments(folder, url):
                           folder=rel(folder), route=route_no, attempt=attempt,
                           timed_out=True, found=0)
                 take_comments(folder)          # leave no half-written .info.json
+                problem = "Timed out while fetching comments"
                 break
+            except OSError as e:
+                return [], f"Could not run yt-dlp: {e}"
             comments = take_comments(folder)
             log_debug("comments_attempt", stage="comments", url=url, folder=rel(folder),
                       route=route_no, attempt=attempt,
                       returncode=getattr(out, "returncode", None),
                       found=len(comments), stderr_tail=getattr(out, "stderr", ""))
             if comments:
-                return comments
-            if attempt == 1 and drop_rejected_cookies(getattr(out, "stderr", "") or ""):
+                return comments, None
+            stderr = getattr(out, "stderr", "") or ""
+            if attempt == 1 and drop_rejected_cookies(stderr):
                 continue
+            if getattr(out, "returncode", 0):
+                # yt-dlp exiting cleanly with no comments means the video has
+                # none, or has them off. A non-zero exit means the FETCH failed
+                # - a bot check, a rate limit - and that used to arrive as
+                # "Comments: none" in videoinfo.txt and "fetched: 0" over the
+                # API, indistinguishable from a video with nothing to say.
+                last = stderr.strip().splitlines()
+                problem = last[-1] if last else "Could not fetch comments"
             break
-    return []
+    return [], problem
 
 
 def build_comments(folder, url, info):
@@ -1687,10 +1822,13 @@ def build_comments(folder, url, info):
     if existing:
         return existing, 0, "saved"
     try:
-        comments = fetch_comments(folder, url)
+        comments, fetch_err = fetch_comments(folder, url)
         if not comments:
             log_debug("comments_finish", stage="comments", url=url,
-                      folder=rel(folder), saved=False, count=0)
+                      folder=rel(folder), saved=False, count=0, error=fetch_err)
+            if fetch_err:
+                note(f"      (comments unavailable: {fetch_err})")
+                return None, 0, "failed"
             return None, 0, "none"
         path = write_comments_txt(folder, info or {}, comments)
         COMMENT_COUNT[0] += len(comments)
@@ -1927,7 +2065,20 @@ def fetch_caption(folder, url, lang, source, client=()):
             cmd = base_cmd() + ["--skip-download", "--ignore-no-formats-error"] + flags + list(extra) + [
                 "--no-warnings", "-o", output_template(folder, name), "--", url,
             ]
-            out = run_logged("caption", cmd, capture_output=True, text=True)
+            try:
+                out = run_logged("caption", cmd, capture_output=True, text=True,
+                                 timeout=CAPTION_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # No timeout here meant one hung yt-dlp held the REST API's
+                # lock until a restart.
+                log_debug("caption_attempt", stage="caption", url=url,
+                          folder=rel(folder), route=route_no, attempt=attempt_no,
+                          timed_out=True, found=False)
+                break
+            except OSError as e:
+                log_debug("caption_attempt", stage="caption", url=url,
+                          folder=rel(folder), route=route_no, error=str(e))
+                break
             found = find_json3(folder)
             log_debug("caption_attempt", stage="caption", url=url, folder=rel(folder),
                       language=lang, source=source, route=route_no, attempt=attempt_no,
@@ -1947,6 +2098,10 @@ def fetch_caption(folder, url, lang, source, client=()):
 # How many caption tracks to try before settling. Enough to exhaust a video's
 # English tracks, few enough that a long batch never looks like hammering.
 MAX_CAPTION_TRIES = 4
+# One caption or thumbnail fetch's own wall. Both are small files; a minute is
+# generous, and without a wall one hung yt-dlp held the API lock indefinitely.
+CAPTION_TIMEOUT = 120
+THUMBNAIL_TIMEOUT = 120
 
 
 def caption_candidates(url, info):
@@ -2181,16 +2336,25 @@ def download_subs(folder, url):
 # the download retries can do anything about it, so it is worth a couple of goes.
 INFO_ATTEMPTS = 3
 INFO_RETRY_DELAY = 5
+INFO_TIMEOUT = 120
+INFO_TIMEOUT_MESSAGE = "Timed out while fetching video info"
 
 
 def fetch_info_once(url: str, extra_flags=()):
     """One metadata lookup. Returns (info, error)."""
-    cmd = base_cmd() + ["--skip-download", "--dump-single-json",
+    # --no-playlist: a watch link copied from a playlist or a mix carries
+    # &list=..., and without this yt-dlp walks the WHOLE list - 28s and 14 MB
+    # for one video, and the answer described the playlist, not the video.
+    cmd = base_cmd() + ["--skip-download", "--dump-single-json", "--no-playlist",
                         "--no-warnings"] + list(extra_flags) + ["--", url]
+    budget = INFO_TIMEOUT
+    if SEARCH_DEADLINE is not None:
+        # Inside a REST request the wall is the route's, not this call's.
+        budget = max(1, min(budget, int(SEARCH_DEADLINE - time.monotonic())))
     try:
-        out = run_logged("metadata", cmd, capture_output=True, text=True, timeout=120)
+        out = run_logged("metadata", cmd, capture_output=True, text=True, timeout=budget)
     except subprocess.TimeoutExpired:
-        return None, "Timed out while fetching video info"
+        return None, INFO_TIMEOUT_MESSAGE
     except OSError as e:
         return None, f"Could not run yt-dlp: {e}"
     if out.returncode != 0:
@@ -2201,9 +2365,14 @@ def fetch_info_once(url: str, extra_flags=()):
         return None, "upload date is not in range"
 
     try:
-        return json.loads(out.stdout), None
+        info = json.loads(out.stdout)
     except json.JSONDecodeError:
         return None, "Could not parse video info (invalid JSON from yt-dlp)"
+    if not isinstance(info, dict):
+        # Valid JSON, wrong shape: a bare number or string here used to take
+        # the whole run down with an AttributeError at the first .get().
+        return None, "Could not parse video info (yt-dlp returned no object)"
+    return info, None
 
 
 def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
@@ -2234,6 +2403,10 @@ def fetch_info(url: str, extra_flags=(), attempts=INFO_ATTEMPTS):
                 return info, None
             return None, err
         if is_permanent(err):
+            return None, err
+        if err == INFO_TIMEOUT_MESSAGE:
+            # A timeout already waited its whole budget. Three of them plus
+            # two sleeps held the REST API's lock for 370s against a 120s wall.
             return None, err
         if attempt < attempts:
             if attempt == attempts - 1 and not extra_flags:
@@ -2950,7 +3123,9 @@ def search_window():
     if DAYS:
         return time.time() - DAYS * 86400, f"last {DAYS} days"
     if THIS_MONTH:
-        now = datetime.datetime.now()
+        # In PKT, like every date this tool prints. The server's local midnight
+        # put the 1st up to ten hours away from the 1st the output names.
+        now = datetime.datetime.now(PKT)
         first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return first.timestamp(), f"since {first.strftime('%d %b %Y')}"
     return None, ""
@@ -2964,9 +3139,13 @@ def channel_root(url):
     produces a page that does not exist.
     """
     base = (url or "").split("?")[0].split("#")[0].rstrip("/")
-    tail = base.rsplit("/", 1)[-1].lower()
-    if tail in VIDEO_TABS or tail in OTHER_TABS or tail in ("search", "about"):
-        base = base.rsplit("/", 1)[0]
+    head, _slash, tail = base.rpartition("/")
+    if tail.lower() in VIDEO_TABS or tail.lower() in OTHER_TABS \
+            or tail.lower() in ("search", "about"):
+        # Only when what is left still names a channel: /c/shorts is a legacy
+        # channel called "shorts", not a Shorts tab on a channel called "c".
+        if CHANNEL_URL_RE.search(head):
+            return head
     return base
 
 
@@ -3076,15 +3255,19 @@ def search_dated(query, count, since=None):
     # videos_only: this route resolves whatever it is given, and a channel card
     # resolves into that channel's uploads.
     cmd += ["--", search_target(query, count, videos_only=True)]
+    timed_out = False
     try:
         out = run_logged("search_dated", cmd, capture_output=True, text=True,
                          timeout=SEARCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return [], "Timed out while searching"
+        printed, stderr, code = out.stdout or "", out.stderr or "", out.returncode
+    except subprocess.TimeoutExpired as e:
+        # yt-dlp prints a line per video as it goes, so what reached us is
+        # real and already paid for. Only whole lines - see flushed_lines.
+        timed_out, printed, stderr, code = True, flushed_lines(e.stdout), "", None
     except OSError as e:
         return [], f"Could not run yt-dlp: {e}"
     items = []
-    for line in (out.stdout or "").splitlines():
+    for line in printed.splitlines():
         parts = line.split("\t", 6)
         if len(parts) < 7 or len(parts[0]) != 11:
             continue
@@ -3104,9 +3287,13 @@ def search_dated(query, count, since=None):
             # rule for reading a duration wherever it comes from.
             "duration": as_seconds(length),
         })
-    if not items and out.returncode != 0:
-        msg = (out.stderr or "").strip().splitlines()
+    if not items and timed_out:
+        return [], "Timed out while searching"
+    if not items and code:
+        msg = stderr.strip().splitlines()
         return [], (msg[-1] if msg else "Search failed")
+    if timed_out:
+        note(f"      (search timed out; using the {len(items)} result(s) it had printed)")
     return items, None
 
 
@@ -3440,6 +3627,10 @@ def search_items(query):
                 dated, err = resolve_dates(items, deadline=SEARCH_DEADLINE)
                 counts["dated"] = dated
                 counts["undated"] = len(items) - dated
+                # Recorded, not only printed: over the API the results were
+                # sound but every row's published was null with error null,
+                # which read as YouTube publishing no dates.
+                counts["date_error"] = err
                 if err:
                     # Not fatal here: the dates are an extra on this path, and
                     # the results themselves are sound without them.
@@ -3523,6 +3714,9 @@ def write_search_links(path, query, items, label):
     file's reader treats as a link to download. The links themselves are rebuilt
     from the video id rather than copied, so only a real watch URL can appear.
     """
+    # Raised on purpose, as OSError, for run_search to turn into a failed
+    # search with a summary - it used to be a bare traceback after the search
+    # had already been paid for.
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# search: {one_line(query)}\n")
         f.write(f"# sort: {SORT_BY}{'  window: ' + one_line(label) if label else ''}\n")
@@ -3624,7 +3818,13 @@ def run_search(args):
     # different thing from a curated list, and writing over someone's
     # links.txt to store it would destroy the input they chose.
     path = os.path.join(DOWNLOAD_DIR, "search_links.txt")
-    write_search_links(path, query, items, label)
+    try:
+        write_search_links(path, query, items, label)
+    except OSError as e:
+        print(f"\n  Search ran, but its links file could not be written: {e}")
+        log_record(url=f"ytsearch:{query}", status="failed",
+                   error=f"could not write search_links.txt: {e}")
+        return None
     results = write_search_results(os.path.join(DOWNLOAD_DIR, "search_results.json"),
                                    query, items, label)
     print(f"\n  Wrote {len(items)} link(s) to {os.path.basename(path)}"
@@ -3706,7 +3906,8 @@ def details_of(info):
         "uploaded": upload_time_pkt(info) if info.get("timestamp")
                     or info.get("upload_date") else None,
         "upload_epoch": info.get("timestamp"),
-        "category": (category_or_na(info) if info.get("categories") else None),
+        "category": (", ".join(str(c).strip() for c in (info.get("categories") or [])
+                               if str(c).strip()) or None),
         "categories": list(info.get("categories") or []),
         "tags": list(info.get("tags") or []),
         "thumbnail": info.get("thumbnail"),
@@ -3818,7 +4019,7 @@ def channel_video_list(url, cap=None):
     while len(entries) <= cap:
         data, err = channel_page(tab, start, start + CHANNEL_PAGE - 1)
         if err:
-            return entries, err
+            return entries, err, False
         returned = data.get("entries") or []
         entries.extend(e for e in returned if e and e.get("id"))
         # The RAW count decides whether there is another page. Judging it by
@@ -3827,7 +4028,9 @@ def channel_video_list(url, cap=None):
         if len(returned) < CHANNEL_PAGE:
             break
         start += CHANNEL_PAGE
-    return entries[:cap], None
+    # Judged before the cut: reading one past the cap is what lets "capped"
+    # mean "there were more" rather than "it was exactly the round number".
+    return entries[:cap], None, len(entries) > cap
 
 
 def channel_details(url):
@@ -3846,7 +4049,7 @@ def channel_details(url):
     head, err = channel_page(tab, 1, 1)
     if err and not head:
         return None, err
-    entries, list_err = channel_video_list(url)
+    entries, list_err, listing_capped = channel_video_list(url)
     if not entries and list_err:
         return None, list_err
 
@@ -3859,7 +4062,11 @@ def channel_details(url):
     # the channel listings make. Without it, asking about that tab filtered
     # every video out and reported an empty channel.
     asked_for_shorts = is_shorts_tab(tab)
-    long_videos, shorts_dropped = long_only(entries, counts=why,
+    # A premiere or a stream in progress is not a long video yet; the download
+    # path has always left them out, and a report must count the same things.
+    settled = [e for e in entries if not is_live_entry(e)]
+    why["live"] = len(entries) - len(settled)
+    long_videos, shorts_dropped = long_only(settled, counts=why,
                                             allow_short=asked_for_shorts)
     views = [e.get("view_count") for e in long_videos
              if isinstance(e.get("view_count"), (int, float))]
@@ -3894,6 +4101,9 @@ def channel_details(url):
         if len(long_videos) == 1:
             edges[1]["epoch"] = edges[0]["epoch"]
     last_epoch, first_epoch = edges[0]["epoch"], edges[1]["epoch"]
+    if long_videos and not date_error and (last_epoch is None or first_epoch is None):
+        which = [w for w, e in (("newest", last_epoch), ("oldest", first_epoch)) if e is None]
+        date_error = f"the {' and '.join(which)} video could not be dated"
     span_days = ((last_epoch - first_epoch) / 86400.0
                  if last_epoch and first_epoch and last_epoch > first_epoch else None)
     joined, lifetime_views, country = about_page_extras(tab)
@@ -3913,13 +4123,14 @@ def channel_details(url):
         "lifetime_views": lifetime_views,
         # counted, not estimated - and counted over the long videos only
         "videos_listed": len(entries),
-        "listing_capped": len(entries) >= CHANNEL_VIDEO_CAP,
+        "listing_capped": listing_capped,
         "long_videos": len(long_videos),
         "shorts": why.get("short", 0),
         # Kept apart from the Shorts: a livestream or a premiere whose length
         # the listing did not give is not short-form, it is unmeasured.
         "unknown_length": why.get("nolength", 0),
-        "excluded": shorts_dropped,
+        "live_or_upcoming": why.get("live", 0),
+        "excluded": shorts_dropped + why.get("live", 0),
         "metrics_over": ("every video" if asked_for_shorts or not duration_floor()
                          else "long videos only"),
         "shorts_tab": asked_for_shorts,
@@ -3965,6 +4176,11 @@ def median_of(numbers):
     return (ordered[middle - 1] + ordered[middle]) / 2
 
 
+def is_live_entry(entry):
+    """A stream in progress, a premiere, or a stream that just ended."""
+    return (entry or {}).get("live_status") in ("is_upcoming", "is_live", "post_live")
+
+
 def long_only(entries, counts=None, allow_short=False):
     """The entries that clear the length floor, and how many were dropped.
 
@@ -4006,6 +4222,9 @@ def resolve_channel(url):
     url = (url or "").strip()
     if not url:
         return None, "a link is required"
+    problem = unusable_youtube_link(url)
+    if problem:
+        return None, f"cannot resolve {url}: {problem}"
     if is_channel_url(url):
         head, err = channel_page(channel_videos_url(url), 1, 1)
         if not head:
@@ -4047,11 +4266,13 @@ def channel_videos(url, limit=0):
     """
     if not is_channel_url(url):
         return None, f"not a channel link: {url}"
-    entries, err = channel_video_list(url)
+    entries, err, capped = channel_video_list(url)
     if not entries and err:
         return None, err
     asked_for_shorts = is_shorts_tab(channel_videos_url(url))
-    kept, dropped = long_only(entries, allow_short=asked_for_shorts)
+    settled = [e for e in entries if not is_live_entry(e)]
+    live = len(entries) - len(settled)
+    kept, dropped = long_only(settled, allow_short=asked_for_shorts)
     excluded = 0
     if SKIP_IDS:
         before = len(kept)
@@ -4080,7 +4301,6 @@ def channel_videos(url, limit=0):
             "outlier": (round(count / average, 2)
                         if average and isinstance(count, (int, float)) else None),
         })
-    capped = len(entries) >= CHANNEL_VIDEO_CAP
     log_debug("channel_videos", stage="channel", url=url, shown=len(rows),
               long_videos=long_count, short_form_dropped=dropped,
               listing_capped=capped,
@@ -4088,6 +4308,7 @@ def channel_videos(url, limit=0):
     return {"videos": rows, "listed": len(entries), "long_videos": long_count,
             "short_form_dropped": dropped,
             "excluded_by_skip_list": excluded,
+            "live_or_upcoming": live,
             "shorts_tab": asked_for_shorts,
             # Past the cap the average - and so every ratio built on it -
             # describes only the slice that was read.
@@ -4119,9 +4340,16 @@ def channel_playlists(url, counts_for=None):
             continue
         rows.append({"id": entry["id"], "title": entry.get("title"),
                      "link": f"https://www.youtube.com/playlist?list={entry['id']}",
-                     "videos": None, "long_videos": None, "shorts": None})
-    counted, failures = 0, 0
+                     "videos": None, "long_videos": None, "shorts": None,
+                     "unknown_length": None, "split_over": None,
+                     "split_capped": False})
+    counted, failures, out_of_time = 0, 0, False
     for row in rows[:counts_for]:
+        if SEARCH_DEADLINE is not None and time.monotonic() >= SEARCH_DEADLINE:
+            # 25 probes at a few seconds each can outlast a REST request; the
+            # ones not reached stay None and the answer says why.
+            out_of_time = True
+            break
         # The playlist's own flat listing, which carries each entry's duration -
         # so the long/short split is counted here rather than taking yt-dlp's
         # playlist_count, which counts Shorts and says nothing about them. A
@@ -4131,10 +4359,17 @@ def channel_playlists(url, counts_for=None):
             failures += 1
             continue
         items = [e for e in (page.get("entries") or []) if e and e.get("id")]
-        long_items, shorts = long_only(items)
+        why = {}
+        long_items, _dropped = long_only(items, counts=why)
         row["videos"] = page.get("playlist_count") or len(items) or None
         row["long_videos"] = len(long_items)
-        row["shorts"] = shorts
+        row["shorts"] = why.get("short", 0)
+        row["unknown_length"] = why.get("nolength", 0)
+        # The split is counted over at most PLAYLIST_VIDEO_CAP entries while
+        # `videos` is yt-dlp's full total; past the cap the two do not add up,
+        # and the row has to say so rather than leave the reader to subtract.
+        row["split_over"] = len(items)
+        row["split_capped"] = len(items) >= PLAYLIST_VIDEO_CAP
         counted += 1
     log_debug("channel_playlists", stage="channel", url=tab, playlists=len(rows),
               counted=counted, count_failures=failures,
@@ -4144,6 +4379,7 @@ def channel_playlists(url, counts_for=None):
             # whether the LIST itself was cut short.
             "count_capped": len(rows) > counts_for,
             "count_failures": failures,
+            "out_of_time": out_of_time,
             "listing_capped": len(returned) >= PLAYLIST_LIST_CAP,
             "error": err}, None
 
@@ -4218,12 +4454,24 @@ def print_channel_videos(url):
     rows = answer["videos"]
     dropped = answer["short_form_dropped"]
     note_text = f", {dropped} short-form left out" if dropped else ""
+    if answer.get("excluded_by_skip_list"):
+        note_text += f", {answer['excluded_by_skip_list']} in skip.txt"
+    if answer.get("shorts_tab"):
+        note_text += "  (/shorts tab: the length floor is waived)"
+    if answer.get("listing_capped"):
+        note_text += (f"  (stopped at the {CHANNEL_VIDEO_CAP}-video cap; the average"
+                      f" describes only what was read)")
     shown = (f"showing {len(rows)} of " if len(rows) < answer["long_videos"] else "")
     print(f"\n  {shown}{answer['long_videos']} long video(s)"
           f" from {answer['listed']} listed{note_text}")
     if answer["average_views"]:
         print(f"  Channel average: {answer['average_views']:,} views"
               f"  (over all {answer['long_videos']} long videos)")
+    if not rows and answer["listed"]:
+        explain_empty_listing({"scanned": answer["listed"],
+                               "short": answer["short_form_dropped"],
+                               "live": answer.get("live_or_upcoming", 0),
+                               "skipped": answer.get("excluded_by_skip_list", 0)})
     print(f"\n  {'#':>4}  {'VIEWS':>11}  {'LENGTH':>9}  {'VS AVG':>7}  TITLE")
     for row in rows:
         # Computed first: a ratio that rounds to 0.0 is still a measurement,
@@ -4232,7 +4480,7 @@ def print_channel_videos(url):
         print(f"  {row['rank']:>4}  {count_or_na(row['views']):>11}"
               f"  {(row['duration_text'] or 'NA'):>9}"
               f"  {ratio:>7}"
-              f"  {(row['title'] or '')[:46]}")
+              f"  {one_line(row['title'])[:46]}")
         print(f"        {row['link']}")
     if answer["listing_error"]:
         print(f"\n  NOTE: the listing stopped early: {answer['listing_error']}")
@@ -4246,12 +4494,21 @@ def print_playlists(url):
         print(f"\n  {url}\n    ERROR: {err}")
         return False
     rows = answer["playlists"]
-    note_text = (f" (video counts for the first {answer['counted']})"
-                 if answer["capped"] else "")
-    print(f"\n  {len(rows)} playlist(s){note_text}")
-    print(f"\n  {'#':>4}  {'VIDEOS':>7}  TITLE")
+    notes = []
+    if answer["count_capped"]:
+        notes.append(f"split counted for the first {answer['counted']} only")
+    if answer["listing_capped"]:
+        notes.append(f"list stopped at {PLAYLIST_LIST_CAP}; there may be more")
+    if answer["count_failures"]:
+        notes.append(f"{answer['count_failures']} could not be read")
+    print(f"\n  {len(rows)} playlist(s)" + (f"  ({'; '.join(notes)})" if notes else ""))
+    # VIDEOS is yt-dlp's own total and counts Shorts; LONG and SHORT are
+    # counted here from the playlist's entries. The split is the point.
+    print(f"\n  {'#':>4}  {'VIDEOS':>7}  {'LONG':>6}  {'SHORT':>6}  TITLE")
     for rank, row in enumerate(rows, 1):
-        print(f"  {rank:>4}  {count_or_na(row['videos']):>7}  {(row['title'] or '')[:52]}")
+        print(f"  {rank:>4}  {count_or_na(row['videos']):>7}"
+              f"  {count_or_na(row['long_videos']):>6}"
+              f"  {count_or_na(row['shorts']):>6}  {one_line(row['title'])[:46]}")
         print(f"        {row['link']}")
     return True
 
@@ -4266,11 +4523,13 @@ def print_similar(url):
     print(f"        {answer['link']}  ({count_or_na(answer['views'])} views)")
     print(f"\n  {answer['found']} similar of {answer['scanned']} scanned"
           f"  (searched for the title)")
+    if not answer["similar"] and answer["scanned"]:
+        explain_empty_listing(SEARCH_COUNTS[0] or {})
     print(f"\n  {'#':>4}  {'VIEWS':>11}  {'LENGTH':>9}  {'CHANNEL':<22}  TITLE")
     for row in answer["similar"]:
         print(f"  {row['rank']:>4}  {count_or_na(row['views']):>11}"
               f"  {(row['duration_text'] or 'NA'):>9}"
-              f"  {(row['channel'] or 'NA')[:22]:<22}  {(row['title'] or '')[:40]}")
+              f"  {one_line(row['channel']) or 'NA':<22.22}  {one_line(row['title'])[:40]}")
         print(f"        {row['link']}")
     return True
 
@@ -4299,17 +4558,23 @@ def print_channel_details(url):
         ("Country", details["country"] or "NA"),
         ("Created", details["created"] or "NA"),
         ("Lifetime views", count_or_na(details["lifetime_views"])),
-        ("First upload", details["first_upload"] or "NA"),
+        ("First upload", details["first_upload"] or
+                         (f"NA ({details['date_error']})" if details["date_error"] else "NA")),
         ("Last upload", details["last_upload"] or "NA"),
         ("Videos read", f"{details['videos_listed']:,}"
                         + ("  (stopped at the cap)" if details["listing_capped"] else "")),
-        ("Long / short", f"{details['long_videos']:,} long, {details['shorts']:,} short"),
+        ("Counted over", details["metrics_over"]
+                         + ("  (/shorts tab: the floor is waived)" if details["shorts_tab"] else "")),
+        ("Long / short", f"{details['long_videos']:,} counted, {details['shorts']:,} short-form"
+                         + (f", {details['unknown_length']:,} of unknown length"
+                            if details["unknown_length"] else "")),
         ("Views read", count_or_na(details["views_listed"])),
         ("Average views", count_or_na(details["average_views"])),
         ("Median views", count_or_na(details["median_views"])),
         ("Best video", count_or_na(details["best_views"])),
         ("Average length", details["average_length_text"] or "NA"),
-        ("Uploads/week", details["uploads_per_week"] or "NA"),
+        ("Uploads/week", "NA" if details["uploads_per_week"] is None
+                         else details["uploads_per_week"]),
         ("Outliers", f"{details['outlier_count']} video(s) at 2x the channel"
                      f" average or better"),
     ]
@@ -4383,8 +4648,8 @@ def print_details(url):
         ("Likes", count_or_na(details["likes"])),
         ("Comments", count_or_na(details["comment_count"])),
         ("Duration", details["duration_text"] or "NA"),
-        ("Uploaded", details["uploaded"]),
-        ("Category", details["category"]),
+        ("Uploaded", details["uploaded"] or "NA"),
+        ("Category", details["category"] or "NA"),
         ("Live status", details["live_status"] or "not live"),
         ("Availability", details["availability"] or "NA"),
         ("Captions", ", ".join(f"{kind}: {', '.join(codes)}"
@@ -4478,7 +4743,10 @@ def video_comments(url):
     if not info:
         return None, err or "Could not read this video"
     with scratch_dir() as folder:
-        comments = fetch_comments(folder, url)
+        comments, fetch_err = fetch_comments(folder, url)
+    if fetch_err:
+        # A 502 over the API, not a 200 with fetched: 0.
+        return None, fetch_err
     threads = thread_comments(comments)
     return {
         "id": info.get("id"),
@@ -4514,7 +4782,8 @@ CHANNEL_URL_RE = re.compile(
 # /videos is what "the channel's long videos" means.
 VIDEO_TABS = ("videos", "shorts", "streams", "live")
 OTHER_TABS = ("featured", "playlists", "community", "posts", "about", "shop",
-              "podcasts", "releases", "channels", "store")
+              "podcasts", "releases", "channels", "store", "membership",
+              "courses", "join")
 
 # Videos per listing request. --flat-playlist keeps a page to the listing alone
 # (no per-video extraction), so this is one cheap request whatever the videos are.
@@ -4999,11 +5268,18 @@ def drop_unusable(links):
     expand_sources and would otherwise have missed it entirely.
     """
     kept = []
+    REFUSED_LINKS[0] = 0
     for link in links:
         problem = unusable_youtube_link(link)
+        if not problem and not youtube_host(link) and "://" in link:
+            # Any other host would be handed to yt-dlp as it stands. This is
+            # a YouTube tool; nothing good comes of fetching somewhere else.
+            problem = "not a YouTube link"
         if problem:
+            REFUSED_LINKS[0] += 1
             print(f"\n  Ignoring {link}\n    {problem}.")
             log_debug("link_refused", stage="sources", url=link, reason=problem)
+            log_record(url=link, status="failed", error=problem)
             continue
         kept.append(link)
     return kept
@@ -5057,7 +5333,8 @@ def expand_sources(links):
     channel_results = {}  # url -> (found, name, err)
     if channels:
         workers = min(len(channels), 6)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = {pool.submit(list_channel_videos, u): u for u in channels}
             for future in as_completed(futures):
                 url = futures[future]
@@ -5065,6 +5342,14 @@ def expand_sources(links):
                     channel_results[url] = future.result()
                 except Exception as e:
                     channel_results[url] = ([], url, str(e))
+        except KeyboardInterrupt:
+            # The with-block's shutdown waits for every queued listing to run
+            # to completion first - so Ctrl+C on a ten-channel run kept listing
+            # the other nine. Cancel what has not started; what has is bounded
+            # by channel_page's own timeout.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
 
     for url in links:
         if not is_channel_url(url):
@@ -5106,15 +5391,17 @@ def read_skips(path):
     if not os.path.exists(path):
         return ids
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
+        with open(path, "rb") as f:
+            raw = f.read()
     except OSError as e:
         print(f"  NOTE: could not read {os.path.basename(path)} ({e}); "
               f"nothing will be excluded.")
         return ids
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
+    # Decoded like links.txt: a skip.txt saved by Notepad as "Unicode" is
+    # UTF-16, and opening it as UTF-8 was an uncaught UnicodeDecodeError.
+    for line in decode_text_file(raw, path).splitlines():
+        line = strip_invisible(line).strip()
+        if not line or line.startswith("#") or "\x00" in line:
             continue
         vid = video_id_from_url(line) or (line if BARE_ID_RE.match(line) else None)
         if vid:
@@ -5421,6 +5708,11 @@ def parse_args(argv=None):
     # is now always written; no flag is needed.
     p.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    for name, value in (("--search", args.search), ("--in-channel", args.in_channel),
+                        ("--cookies", args.cookies), ("--links", args.links)):
+        if value and "\x00" in value:
+            # A NUL cannot be passed to a subprocess: it was a traceback here.
+            p.error(f"{name} contains a NUL byte.")
     if args.search is not None and not args.search.strip():
         # An empty --search used to fall through to links.txt, which downloads
         # something quite different from what was asked for.
@@ -5513,7 +5805,7 @@ def stop_on_sigterm(signum, frame):
 
 
 def main():
-    global LINKS_FILE, COOKIES_FILE, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
+    global LINKS_FILE, COOKIES_FILE, COOKIES_MISSING, DOWNLOAD_DIR, MAX_HEIGHT, MIN_HEIGHT, FORMAT
     global DOWNLOAD_SUBS, SUB_LANG, CHANNEL_MODE, DONE_INDEX
     global SAVE_THUMBNAIL, SAVE_DESCRIPTION, VERBOSE
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY, DETAILS_ONLY
@@ -5529,6 +5821,13 @@ def main():
     signal.signal(signal.SIGTERM, stop_on_sigterm)
     COOKIES_FILE  = (os.path.expanduser(args.cookies) if args.cookies
                      else os.path.join(DOWNLOAD_DIR, "cookies.txt"))
+    # Cookies are optional, so a --cookies path that does not exist is not
+    # fatal - but it used to be SILENT: the banner said "none (optional)" and
+    # a later NOTE blamed the folder's cookies.txt, never the path given.
+    COOKIES_MISSING = bool(args.cookies) and not os.path.isfile(COOKIES_FILE)
+    if COOKIES_MISSING:
+        print(f"\nNOTE: --cookies file not found: {COOKIES_FILE}\n"
+              f"      Carrying on without cookies (fine for public videos).")
     LINKS_FILE    = (os.path.expanduser(args.links) if args.links
                      else os.path.join(DOWNLOAD_DIR, "links.txt"))
     MIN_HEIGHT    = args.min_height
@@ -5570,7 +5869,9 @@ def main():
     print(f"  YouTube Downloader (yt-dlp) - {MAX_HEIGHT}p priority / {MIN_HEIGHT}p floor")
     print("=" * 60)
     print(f"  Folder  : {DOWNLOAD_DIR}")
-    print(f"  Cookies : {COOKIES_FILE if os.path.exists(COOKIES_FILE) else 'none (optional)'}")
+    print("  Cookies : " + (COOKIES_FILE if os.path.exists(COOKIES_FILE)
+                            else f"NOT FOUND - {COOKIES_FILE}" if COOKIES_MISSING
+                            else "none (optional)"))
     print(f"  Links   : {LINKS_FILE}")
     print(f"  Speed   : {'aria2c, 16 connections' if ARIA2C else 'built-in (install aria2c for a big speedup)'}")
     print(f"  PO token: {'bgutil script (headless)' if BGUTIL_SCRIPT else 'none found - some videos may fail with 403'}")
@@ -5624,10 +5925,15 @@ def main():
         print(f"\nERROR: directory not found: {DOWNLOAD_DIR}")
         sys.exit(1)
 
-    LOG_FILE[0] = os.path.join(DOWNLOAD_DIR, "download_log.txt")
-    LOG_JSON[0] = os.path.join(DOWNLOAD_DIR, "download_log.json")
-    LOG_JSONL[0] = os.path.join(DOWNLOAD_DIR, "download_log.jsonl")
-    LOG_DEBUG[0] = os.path.join(DOWNLOAD_DIR, "download_debug.jsonl")
+    # A report keeps its logs under its own names. It writes nothing else, and
+    # it used to open download_log.* for writing - truncating the record of
+    # whatever download last ran in the folder, which the manual promises it
+    # never touches.
+    stem = "report" if REPORT else "download"
+    LOG_FILE[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_log.txt")
+    LOG_JSON[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_log.json")
+    LOG_JSONL[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_log.jsonl")
+    LOG_DEBUG[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_debug.jsonl")
     RUN_ID[0] = (datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
                  + f"-{os.getpid()}")
     try:
@@ -5660,7 +5966,7 @@ def main():
         print("  Windows: see requirements.txt")
         sys.exit(1)
 
-    if not os.path.exists(COOKIES_FILE):
+    if not os.path.exists(COOKIES_FILE) and not COOKIES_MISSING:
         print("\nNOTE: no cookies.txt in the folder - that is fine for public "
               "videos.\n      Add one only for private / members-only / "
               "age-restricted videos.")
@@ -5885,5 +6191,13 @@ if __name__ == "__main__":
                     pass
             if not LOG_JSON[0] and os.path.isdir(folder):
                 LOG_JSON[0] = os.path.join(folder, "download_log.json")
-            print("\n\n  Stopped before anything was downloaded.")
-            write_empty_summary(stopped=True)
+            if SEARCH_QUERY:
+                # The last search's files would otherwise read as this one's.
+                clear_search_answers()
+            if REPORT:
+                print(f"\n\n  Stopped during the {REPORT} report.")
+                write_report_summary(REPORT, 0, 0, stopped=True)
+            else:
+                print("\n\n  Stopped before anything was downloaded.")
+                write_empty_summary(stopped=True)
+    sys.exit(EXIT_CODE[0])

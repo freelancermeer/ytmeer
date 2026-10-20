@@ -768,11 +768,20 @@ class TestRoutes(unittest.TestCase):
                                                "Sign in to confirm you are not a bot"))
         r = self.c.get("/api/search?query=x&sort=views&this_month=true",
                        headers=self.h)
+        # A 502, as /api/similar answers the same failure; a 200 with found: 0
+        # read as "nothing matched".
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("bot", r.json()["detail"])
+
+    def test_a_partial_search_answer_stays_a_200(self):
+        # Results plus a noted error (dates that failed, say) is still an answer.
+        self._stub(search_items=lambda q: (
+            [{"id": "a" * 11, "url": "u", "title": "T", "views": 5,
+              "duration": 900, "epoch": None}], "dates could not be fetched"))
+        r = self.c.get("/api/search?query=x", headers=self.h)
         self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(body["found"], 0)
-        self.assertIsNotNone(body["error"])
-        self.assertIn("bot", body["error"])
+        self.assertEqual(r.json()["found"], 1)
+        self.assertIn("dates", r.json()["error"])
 
     def test_a_request_gets_a_smaller_date_cap_than_the_terminal(self):
         d = api.downloader
@@ -893,6 +902,69 @@ class TestRoutes(unittest.TestCase):
         self._stub(resolve_channel=lambda url: (None, "Video unavailable"))
         r = self.c.get("/api/resolve?url=" + "a" * 11, headers=self.h)
         self.assertEqual(r.status_code, 502)
+
+    def test_the_api_key_check_survives_a_non_ascii_header(self):
+        # compare_digest on str raises TypeError on non-ASCII, which made such a
+        # header a 500 where a 401 belongs. The test client refuses to send one
+        # (headers are latin-1 on the wire), so the check is exercised directly:
+        # it must answer False, not raise.
+        saved = api.API_KEY[0]
+        api.API_KEY[0] = "k"
+        try:
+            self.assertFalse(api.key_ok("k\u00e9y"))
+            self.assertFalse(api.key_ok("\u00e9"))
+            self.assertTrue(api.key_ok("k"))
+            self.assertFalse(api.key_ok(""))
+            self.assertFalse(api.key_ok(None))
+        finally:
+            api.API_KEY[0] = saved
+
+    def test_lookups_refuse_a_host_that_is_not_youtube(self):
+        # The id pattern alone matched any URL carrying v=<11 chars>, and the
+        # route then ran yt-dlp against a host the caller chose.
+        for path in ("/api/video", "/api/transcript", "/api/comments",
+                     "/api/similar", "/api/resolve"):
+            r = self.c.get(f"{path}?url=https://169.254.169.254/x?v=" + "a" * 11,
+                           headers=self.h)
+            self.assertEqual(r.status_code, 422, path)
+            self.assertEqual(r.json()["detail"][0]["loc"][-1], "url")
+
+    def test_resolve_refuses_a_playlist_before_taking_the_lock(self):
+        d = api.downloader
+        calls = []
+        self._stub(resolve_channel=lambda url: (calls.append(url) or (None, "x")))
+        r = self.c.get("/api/resolve?url=https://www.youtube.com/playlist?list=UU"
+                       + "x" * 22, headers=self.h)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(calls, [], "the engine must never be asked")
+
+    def test_a_bad_sort_or_sub_lang_is_blamed_on_itself(self):
+        for path, params, field in (("/api/comments", "url=" + "a" * 11 + "&sort=best", "sort"),
+                                    ("/api/transcript", "url=" + "a" * 11 + "&sub_lang=no good", "sub_lang")):
+            r = self.c.get(f"{path}?{params}", headers=self.h)
+            self.assertEqual(r.status_code, 422, path)
+            self.assertEqual(r.json()["detail"][0]["loc"][-1], field)
+
+    def test_a_shorts_tab_preview_reports_no_floor(self):
+        self._stub(is_channel_url=lambda url: True,
+                   list_channel_videos=lambda url, deadline=None: ([], "Ch", None))
+        r = self.c.get("/api/preview?channel=https://www.youtube.com/@X/shorts",
+                       headers=self.h).json()
+        self.assertIsNone(r["min_duration"])
+
+    def test_skip_reaches_the_two_routes_the_manual_says_honour_it(self):
+        d = api.downloader
+        seen = {}
+        self._stub(is_channel_url=lambda url: True,
+                   channel_videos=lambda url, limit=0: (
+                       seen.update(videos=set(d.SKIP_IDS)) or ({"videos": [], "long_videos": 0}, None)),
+                   similar_videos=lambda url, count=0: (
+                       seen.update(similar=set(d.SKIP_IDS)) or ({"id": "a" * 11, "similar": []}, None)))
+        self.c.get("/api/channel/videos?channel=https://www.youtube.com/@X&skip="
+                   + "z" * 11, headers=self.h)
+        self.c.get("/api/similar?url=" + "a" * 11 + "&skip=" + "z" * 11, headers=self.h)
+        self.assertEqual(seen["videos"], {"z" * 11})
+        self.assertEqual(seen["similar"], {"z" * 11})
 
     def test_a_blocked_run_says_so(self):
         os.environ["FAKE_MODE"] = "blocked"

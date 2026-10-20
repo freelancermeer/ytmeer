@@ -105,6 +105,8 @@ class PlatformCase:
         d.TRANSCRIPT_COUNT[0] = 0
         d.COMMENT_COUNT[0] = 0
         d.SEARCH_FOUND[0] = 0
+        d.REFUSED_LINKS[0] = 0
+        d.EXIT_CODE[0] = 0
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
@@ -2462,7 +2464,7 @@ class PlatformCase:
 
         def comments_for(folder, url):
             made.append(folder)
-            return flat
+            return flat, None
 
         d.fetch_comments = comments_for
         d.COMMENT_SORT, d.COMMENT_REPLIES = "new", True
@@ -2581,7 +2583,7 @@ class PlatformCase:
         try:
             with tempfile.TemporaryDirectory() as folder:
                 with contextlib.redirect_stdout(io.StringIO()):
-                    got = d.fetch_comments(folder, "https://youtu.be/aaaaaaaaaaa")
+                    got, _err = d.fetch_comments(folder, "https://youtu.be/aaaaaaaaaaa")
         finally:
             (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
              d.po_token_first[0]) = saved
@@ -4122,10 +4124,11 @@ class PlatformCase:
         saved = d.channel_page
         d.channel_page = page
         try:
-            entries, err = d.channel_video_list("https://www.youtube.com/@ch")
+            entries, err, capped = d.channel_video_list("https://www.youtube.com/@ch")
         finally:
             d.channel_page = saved
         self.assertIsNone(err)
+        self.assertFalse(capped, "two pages is not the cap")
         self.assertEqual(len(asked), 2, "it must ask for the second page")
         self.assertEqual(len(entries), d.CHANNEL_PAGE)   # 99 + 1
 
@@ -4362,13 +4365,319 @@ class PlatformCase:
         self.assertIn("Ignoring", buf.getvalue())
         self.assertIn("not a video or channel link", buf.getvalue())
 
-    def test_read_links_leaves_a_non_youtube_link_alone(self):
+    def test_read_links_refuses_a_non_youtube_link(self):
+        # This is a YouTube tool; a vimeo link used to be handed to yt-dlp as
+        # it stood, and over the API that is a host the caller chose.
         with tempfile.TemporaryDirectory() as base:
             path = os.path.join(base, "links.txt")
             with open(path, "w", encoding="utf-8") as f:
                 f.write("https://vimeo.com/123\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(d.read_links(path), [])
+        self.assertIn("not a YouTube link", buf.getvalue())
+
+    def test_a_failed_comment_fetch_is_not_an_absence(self):
+        # rc != 0 with nothing parsed is a failure; rc == 0 with nothing is a
+        # video that has no comments. They used to be the same "none".
+        _items, got, calls = None, None, None
+        saved = (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
+                 d.po_token_first[0])
+        d.po_token_first[0] = True
+        d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 1, "", "ERROR: Sign in to confirm you are not a bot")
+        d.take_comments = lambda folder: []
+        d.drop_rejected_cookies = lambda text: False
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got, err = d.fetch_comments(folder, "https://youtu.be/aaaaaaaaaaa")
+        finally:
+            (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
+             d.po_token_first[0]) = saved
+        self.assertEqual(got, [])
+        self.assertIn("bot", err)
+
+    def test_a_clean_exit_with_no_comments_is_an_absence(self):
+        saved = (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
+                 d.po_token_first[0])
+        d.po_token_first[0] = True
+        d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", "")
+        d.take_comments = lambda folder: []
+        d.drop_rejected_cookies = lambda text: False
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got, err = d.fetch_comments(folder, "https://youtu.be/aaaaaaaaaaa")
+        finally:
+            (d.subprocess.run, d.take_comments, d.drop_rejected_cookies,
+             d.po_token_first[0]) = saved
+        self.assertEqual((got, err), ([], None))
+
+    def test_build_comments_records_a_failed_fetch_as_failed(self):
+        d.EXTRACT_COMMENTS = True
+        saved = d.fetch_comments
+        d.fetch_comments = lambda folder, url: ([], "Sign in to confirm")
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    path, count, state = d.build_comments(folder, "u", {})
+        finally:
+            d.fetch_comments = saved
+        self.assertEqual((path, count, state), (None, 0, "failed"),
+                         "not 'none' - the video may well have comments")
+
+    def test_video_comments_reports_a_failed_fetch(self):
+        saved = (d.fetch_info, d.fetch_comments)
+        d.fetch_info = lambda url, *a, **k: ({"id": "a" * 11, "title": "T"}, None)
+        d.fetch_comments = lambda folder, url: ([], "Timed out while fetching comments")
+        try:
+            answer, err = d.video_comments("https://youtu.be/" + "a" * 11)
+        finally:
+            d.fetch_info, d.fetch_comments = saved
+        self.assertIsNone(answer, "a 502 over the API, not fetched: 0")
+        self.assertIn("Timed out", err)
+
+    # ------------------------------------ regressions: the production round
+    def test_the_playlists_printer_runs_on_the_real_shape(self):
+        # It crashed with KeyError 'capped' on every channel: the key had been
+        # renamed and the only test covering it stubbed the OLD shape.
+        saved = d.channel_page
+        d.channel_page = lambda url, s, e: (
+            ({"entries": [{"id": "PL1", "title": "One"}]}, None) if "/playlists" in url
+            else ({"playlist_count": 3, "entries": [{"id": "a" * 11, "duration": 900},
+                                                      {"id": "b" * 11, "duration": 30}]}, None))
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                ok = d.print_playlists("https://www.youtube.com/@x")
+        finally:
+            d.channel_page = saved
+        self.assertTrue(ok)
+        shown = buf.getvalue()
+        self.assertIn("LONG", shown)
+        self.assertIn("SHORT", shown)
+        self.assertIn("One", shown)
+
+    def test_fetch_info_stays_on_the_one_video(self):
+        # A watch link copied from a playlist carries &list=; without
+        # --no-playlist yt-dlp walked the whole list and answered with it.
+        cmds, saved = [], d.subprocess.run
+        d.subprocess.run = lambda cmd, **kw: (cmds.append(cmd) or
+                                             subprocess.CompletedProcess(cmd, 0, "{}", ""))
+        try:
+            d.fetch_info_once("https://www.youtube.com/watch?v=" + "a" * 11 + "&list=PLx")
+        finally:
+            d.subprocess.run = saved
+        self.assertIn("--no-playlist", cmds[0])
+
+    def test_fetch_info_refuses_a_scalar(self):
+        saved = d.subprocess.run
+        d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "42", "")
+        try:
+            info, err = d.fetch_info_once("https://youtu.be/" + "a" * 11)
+        finally:
+            d.subprocess.run = saved
+        self.assertIsNone(info)
+        self.assertIn("no object", err)
+
+    def test_a_metadata_timeout_is_not_retried(self):
+        # Three timeouts plus two sleeps held the API lock for 370s.
+        calls, saved = [], (d.subprocess.run, d.time.sleep)
+        def run(cmd, **kw):
+            calls.append(1)
+            raise subprocess.TimeoutExpired(cmd, 1)
+        d.subprocess.run = run
+        d.time.sleep = lambda s: None
+        try:
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(d.read_links(path), ["https://vimeo.com/123"])
+                info, err = d.fetch_info("https://youtu.be/" + "a" * 11)
+        finally:
+            d.subprocess.run, d.time.sleep = saved
+        self.assertIsNone(info)
+        self.assertEqual(len(calls), 1, "one timeout is the answer")
+        self.assertEqual(err, d.INFO_TIMEOUT_MESSAGE)
+
+    def test_read_links_strips_a_bom_and_zero_width_characters(self):
+        # Pasted from a browser, a channel link can arrive with an invisible
+        # prefix - enough to miss the channel pattern and become a "named video".
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "links.txt")
+            with open(path, "wb") as f:
+                f.write("\ufeffhttps://www.youtube.com/@handle\n".encode("utf-8"))
+                f.write("\u200bhttps://www.youtube.com/@other\n".encode("utf-8"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                links = d.read_links(path)
+        self.assertEqual(links, ["https://www.youtube.com/@handle",
+                                 "https://www.youtube.com/@other"])
+        self.assertTrue(all(d.is_channel_url(u) for u in links))
+
+    def test_read_links_reads_utf16_and_rejects_nul(self):
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "links.txt")
+            with open(path, "wb") as f:
+                f.write(("https://www.youtube.com/@handle\n"
+                         "https://www.youtube.com/@nul\x00here\n").encode("utf-16"))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                links = d.read_links(path)
+        self.assertEqual(links, ["https://www.youtube.com/@handle"])
+        self.assertIn("NUL", buf.getvalue())
+
+    def test_read_links_refuses_a_directory(self):
+        with tempfile.TemporaryDirectory() as base:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    d.read_links(base)
+
+    def test_canonical_link_normalises_what_names_the_same_video(self):
+        vid = "a" * 11
+        want = d.watch_url(vid)
+        for form in (vid,
+                     f"https://www.youtube.com/watch?v={vid}&list=PLx&index=3",
+                     f"https://youtu.be/{vid}?t=42&si=abc",
+                     f"https://www.youtube.com/shorts/{vid}",
+                     f"https://m.youtube.com/watch?v={vid}&feature=share"):
+            self.assertEqual(d.canonical_link(form), want, form)
+        # A channel link and a non-YouTube link are left exactly as they are.
+        for form in ("https://www.youtube.com/@handle", "https://vimeo.com/1"):
+            self.assertEqual(d.canonical_link(form), form)
+
+    def test_this_month_begins_in_pkt(self):
+        d.THIS_MONTH = True
+        since, _label = d.search_window()
+        first = datetime.datetime.fromtimestamp(since, d.PKT)
+        self.assertEqual((first.day, first.hour, first.minute), (1, 0, 0))
+
+    def test_channel_root_keeps_a_legacy_channel_named_like_a_tab(self):
+        # /c/shorts is a channel called "shorts", not a Shorts tab on "c".
+        self.assertEqual(d.channel_root("https://www.youtube.com/c/shorts"),
+                         "https://www.youtube.com/c/shorts")
+        self.assertEqual(d.channel_root("https://www.youtube.com/@h/shorts"),
+                         "https://www.youtube.com/@h")
+        self.assertEqual(d.channel_root("https://www.youtube.com/@h/membership"),
+                         "https://www.youtube.com/@h")
+
+    def test_reports_leave_live_and_upcoming_out(self):
+        d.MIN_DURATION = 180
+        saved = (d.resolve_dates, d.about_page_extras)
+        d.resolve_dates = lambda items, deadline=None: (0, None)
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": "a" * 11, "view_count": 10, "duration": 900},
+                      {"id": "b" * 11, "view_count": 10, "duration": 900,
+                       "live_status": "is_upcoming"},
+                      {"id": "c" * 11, "view_count": 10, "duration": 900,
+                       "live_status": "is_live"}])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+            videos, _e = d.channel_videos("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertEqual(details["long_videos"], 1)
+        self.assertEqual(details["live_or_upcoming"], 2)
+        self.assertEqual(len(videos["videos"]), 1)
+        self.assertEqual(videos["live_or_upcoming"], 2)
+
+    def test_a_partial_date_failure_is_named(self):
+        saved = (d.resolve_dates, d.about_page_extras)
+
+        def half(items, deadline=None):
+            items[0]["epoch"] = 1700000000       # the newest dates, the oldest does not
+            return 1, None
+
+        d.resolve_dates = half
+        d.about_page_extras = lambda url: (None, None, None)
+        self.listing([{"id": "a" * 11, "view_count": 10, "duration": 900},
+                      {"id": "b" * 11, "view_count": 10, "duration": 900}])
+        try:
+            details, _err = d.channel_details("https://www.youtube.com/@ch")
+        finally:
+            d.resolve_dates, d.about_page_extras = saved
+        self.assertIsNotNone(details["last_upload"])
+        self.assertIsNone(details["first_upload"])
+        self.assertIn("oldest", details["date_error"])
+
+    def test_the_playlist_split_names_unknown_length(self):
+        saved = d.channel_page
+        d.channel_page = lambda url, s, e: (
+            ({"entries": [{"id": "PL1", "title": "One"}]}, None) if "/playlists" in url
+            else ({"playlist_count": 3, "entries": [{"id": "a" * 11, "duration": 900},
+                                                      {"id": "b" * 11, "duration": 30},
+                                                      {"id": "c" * 11, "duration": None}]}, None))
+        d.MIN_DURATION = 180
+        try:
+            answer, _err = d.channel_playlists("https://www.youtube.com/@x")
+        finally:
+            d.channel_page = saved
+        row = answer["playlists"][0]
+        self.assertEqual((row["long_videos"], row["shorts"], row["unknown_length"]),
+                         (1, 1, 1))
+        self.assertEqual(row["split_over"], 3)
+        self.assertFalse(row["split_capped"])
+
+    def test_search_dated_keeps_the_lines_printed_before_the_wall(self):
+        timeout = subprocess.TimeoutExpired("yt-dlp", 1)
+        timeout.stdout = (f"{'a' * 11}\t1700000000\t500\tnot_live\t900\tChan\tT\n"
+                          f"{'b' * 11}\t17000").encode()
+        saved = d.subprocess.run
+        def run(cmd, **kw):
+            raise timeout
+        d.subprocess.run = run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                items, err = d.search_dated("cats", 10, None)
+        finally:
+            d.subprocess.run = saved
+        self.assertIsNone(err)
+        self.assertEqual([i["id"] for i in items], ["a" * 11],
+                         "the whole line is kept, the cut one is not")
+
+    def test_a_report_logs_under_its_own_names(self):
+        # It used to open download_log.* for writing and truncate the record
+        # of the last download in the folder.
+        d.REPORT = "resolve"
+        snapshot = d.settings_snapshot()
+        self.assertEqual(snapshot["mode"], "report:resolve")
+
+    def test_redact_url_leaves_a_path_form_link_alone(self):
+        self.assertEqual(d.redact_url("https://www.youtube.com/shorts/" + "a" * 11),
+                         "https://www.youtube.com/shorts/" + "a" * 11)
+        self.assertEqual(d.redact_url("https://youtu.be/" + "a" * 11 + "?t=4"),
+                         "https://youtu.be/" + "a" * 11)
+        self.assertEqual(d.redact_url("https://www.youtube.com/watch?v=" + "a" * 11
+                                      + "&pot=SECRET"),
+                         "https://www.youtube.com/watch?v=" + "a" * 11)
+
+    def test_the_exit_code_follows_the_summary(self):
+        with tempfile.TemporaryDirectory() as base:
+            d.LOG_JSON[0] = os.path.join(base, "x.json")
+            d.write_json_log({"failed": 0, "links": 3})
+            self.assertEqual(d.EXIT_CODE[0], 0)
+            d.write_json_log({"failed": 1, "links": 3})
+            self.assertEqual(d.EXIT_CODE[0], 1)
+            d.EXIT_CODE[0] = 0
+            d.write_json_log({"failed": 0, "links": 0})
+            self.assertEqual(d.EXIT_CODE[0], 1, "an empty worklist is not success")
+            d.EXIT_CODE[0] = 0
+            d.write_json_log({"failed": 0, "links": 0, "dry_run": True})
+            self.assertEqual(d.EXIT_CODE[0], 0, "a dry run with nothing new is fine")
+            d.write_json_log({"failed": 0, "links": 2, "stopped_early": True})
+            self.assertEqual(d.EXIT_CODE[0], 130)
+            d.LOG_JSON[0] = None
+
+    def test_run_logged_gives_the_child_utf8(self):
+        seen = {}
+        saved = d.subprocess.run
+        def run(cmd, **kw):
+            seen.update(kw)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        d.subprocess.run = run
+        try:
+            d.run_logged("unit", ["yt-dlp"], capture_output=True, text=True)
+        finally:
+            d.subprocess.run = saved
+        self.assertEqual(seen["env"].get("PYTHONIOENCODING"), "utf-8")
+        self.assertEqual(seen["encoding"], "utf-8")
 
     def test_no_dates_flag_parses(self):
         self.assertFalse(d.parse_args(["/tmp"]).no_dates)
