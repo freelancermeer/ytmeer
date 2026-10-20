@@ -16,6 +16,7 @@ import datetime
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -3711,6 +3712,43 @@ class PlatformCase:
         finally:
             d.channel_details, d.video_details = saved
         self.assertEqual(calls, ["channel", "video"])
+
+    def test_the_agent_manual_names_real_trace_events(self):
+        # AGENTS.md tells an agent to grep the trace for these. A renamed event
+        # would send it looking for something that no longer exists.
+        here = os.path.dirname(os.path.abspath(__file__))
+        manual = os.path.join(here, "AGENTS.md")
+        if not os.path.exists(manual):
+            self.skipTest("AGENTS.md is not in this checkout")
+        source = open(os.path.join(here, "downloader.py"), encoding="utf-8").read()
+        emitted = set(re.findall(r'log_debug\("([a-z_]+)"', source))
+        text = open(manual, encoding="utf-8").read()
+        # Only the backticked names inside the logging section, so prose is
+        # not mistaken for an event name.
+        section = text.split("## 6.", 1)[-1].split("## 7.", 1)[0]
+        named = set(re.findall(r"`([a-z_]+(?:_start|_finish|_block|_timeout|_dates))`",
+                               section))
+        self.assertTrue(named, "the logging section should name some events")
+        missing = sorted(n for n in named if n not in emitted)
+        self.assertEqual(missing, [], f"AGENTS.md names events the code never emits: {missing}")
+
+    def test_the_agent_manual_matches_the_real_defaults(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        manual = os.path.join(here, "AGENTS.md")
+        if not os.path.exists(manual):
+            self.skipTest("AGENTS.md is not in this checkout")
+        text = open(manual, encoding="utf-8").read()
+        args = d.parse_args(["/tmp"])
+        # Each claim the manual makes in numbers, checked against the code.
+        for claim, value in (("floor is **180s**", d.SHORTS_SECONDS),
+                             ("150 normally, 40 for a date sort", d.SEARCH_DEPTH_FLAT),
+                             ("(2000) videos", d.CHANNEL_VIDEO_CAP)):
+            self.assertIn(str(value), claim,
+                          f"the manual's wording no longer matches {value}")
+            self.assertIn(claim, text, f"AGENTS.md should still say: {claim}")
+        self.assertEqual(args.min_duration, d.SHORTS_SECONDS)
+        self.assertEqual(args.match, "related")
+        self.assertIsNone(args.search_count)
 
     def test_no_dates_flag_parses(self):
         self.assertFalse(d.parse_args(["/tmp"]).no_dates)

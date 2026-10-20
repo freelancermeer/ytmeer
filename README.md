@@ -3,6 +3,11 @@
 A tool for **researching** YouTube, not only for downloading it. Built on
 **yt-dlp**. Runs on macOS and Windows; no cookies needed for public videos.
 
+> **Driving this from an AI agent?** Read **[AGENTS.md](AGENTS.md)** instead -
+> every flag, every response shape, the measured cost of each operation, the
+> four things that are easy to get wrong, and how to read the trace. It is
+> written to be sufficient on its own.
+
 Five things it does:
 
 | What you want | How to ask for it |
