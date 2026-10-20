@@ -50,7 +50,8 @@ class PlatformCase:
                        d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
                        d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
                        d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
-                       d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION)
+                       d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION,
+                       d.RESOLVE_DATES)
         d.IS_WINDOWS = self.WINDOWS
         d.NAME_LIMIT = 60 if self.WINDOWS else 150
         d.TRANSCRIPT_WRAP = 40
@@ -67,12 +68,15 @@ class PlatformCase:
         d.COMMENT_REPLIES = False
         d.COMMENT_SORT = "top"
         d.SEARCH_QUERY = None
-        d.SEARCH_COUNT = 50
+        d.SEARCH_COUNT = None          # as the module ships: pick by route
         d.SORT_BY = "relevance"
         d.THIS_MONTH = False
         d.IN_CHANNEL = None
         d.DAYS = 0
         d.SEARCH_MATCH = "related"
+        # Fetching publish dates is a network call per video. The tests that
+        # care about it stub the subprocess and switch it on themselves.
+        d.RESOLVE_DATES = False
         d.INCLUDE_SHORTS = False
         # The length floor is a concern of its own, with its own tests below.
         # Left off here so a fixture written to test a view floor or the
@@ -95,7 +99,8 @@ class PlatformCase:
          d.TRANSCRIPT_ONLY, d.EXTRACT_COMMENTS, d.COMMENT_LIMIT,
          d.COMMENT_REPLIES, d.COMMENT_SORT, d.SEARCH_QUERY,
          d.SEARCH_COUNT, d.SORT_BY, d.THIS_MONTH, d.IN_CHANNEL,
-         d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION) = self._saved
+         d.DAYS, d.SEARCH_MATCH, d.INCLUDE_SHORTS, d.MIN_DURATION,
+         d.RESOLVE_DATES) = self._saved
         d.LOG_RECORDS[:] = self._records
 
     # ------------------------------------------------------------------ search
@@ -3061,6 +3066,282 @@ class PlatformCase:
         self.assertIsInstance(d.as_seconds(900.0), int)
         self.assertIsInstance(d.as_seconds("900.5"), float)
         self.assertEqual(d.as_seconds("900.0"), 900)
+
+    # ------------------------------------------- publish dates for a search
+    def _resolve(self, stdout, returncode=0, raises=None):
+        """Drive resolve_dates against a scripted yt-dlp; returns (items, urls)."""
+        urls = {}
+
+        def run(cmd, **kw):
+            if raises:
+                raise raises
+            urls["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, returncode, stdout, "")
+
+        saved = d.subprocess.run
+        d.subprocess.run = run
+        items = [{"id": "a" * 11, "url": d.watch_url("a" * 11), "epoch": None},
+                 {"id": "b" * 11, "url": d.watch_url("b" * 11), "epoch": None}]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                dated = d.resolve_dates(items)
+        finally:
+            d.subprocess.run = saved
+        return items, dated, urls.get("cmd", [])
+
+    def test_dates_are_fetched_for_the_results_that_survived(self):
+        items, dated, cmd = self._resolve(
+            f"{'a' * 11}\t1700000000\n{'b' * 11}\t1700000001\n")
+        self.assertEqual(dated, 2)
+        self.assertEqual([i["epoch"] for i in items], [1700000000, 1700000001])
+        self.assertIn(d.watch_url("a" * 11), cmd)
+        self.assertIn(d.watch_url("b" * 11), cmd)
+
+    def test_a_video_that_cannot_be_dated_keeps_no_date(self):
+        # A removed or private video simply has none; inventing one would be
+        # worse than reporting the gap.
+        items, dated, _cmd = self._resolve(f"{'a' * 11}\t1700000000\n")
+        self.assertEqual(dated, 1)
+        self.assertEqual(items[0]["epoch"], 1700000000)
+        self.assertIsNone(items[1]["epoch"])
+
+    def test_an_na_timestamp_is_not_read_as_a_date(self):
+        items, dated, _cmd = self._resolve(f"{'a' * 11}\tNA\n{'b' * 11}\t\n")
+        self.assertEqual(dated, 0)
+        self.assertEqual([i["epoch"] for i in items], [None, None])
+
+    def test_dating_survives_a_timeout(self):
+        items, dated, _cmd = self._resolve(
+            "", raises=subprocess.TimeoutExpired("yt-dlp", 1))
+        self.assertEqual(dated, 0)
+        self.assertEqual([i["epoch"] for i in items], [None, None])
+
+    def test_nothing_is_asked_for_when_every_date_is_known(self):
+        saved = d.subprocess.run
+        calls = []
+        d.subprocess.run = lambda cmd, **kw: calls.append(cmd)
+        try:
+            self.assertEqual(d.resolve_dates(
+                [{"id": "a" * 11, "url": "u", "epoch": 1700000000}]), 0)
+        finally:
+            d.subprocess.run = saved
+        self.assertEqual(calls, [], "the dated route already has them")
+
+    def test_a_search_dates_what_it_kept(self):
+        d.RESOLVE_DATES = True
+        saved = d.resolve_dates
+        seen = {}
+
+        def fake(items):
+            seen["n"] = len(items)
+            for number, item in enumerate(items):
+                item["epoch"] = 1700000000 + number
+            return len(items)
+
+        d.resolve_dates = fake
+        try:
+            kept, _err, _found, _skipped = self._search_items([
+                {"id": c * 11, "url": d.watch_url(c * 11), "title": c,
+                 "views": 100, "duration": 900} for c in "abc"
+            ], dated=False)
+        finally:
+            d.resolve_dates = saved
+        self.assertEqual(seen["n"], 3, "only the survivors are dated")
+        self.assertEqual([i["epoch"] for i in kept],
+                         [1700000000, 1700000001, 1700000002])
+
+    def test_a_search_too_wide_to_date_says_so_instead(self):
+        d.RESOLVE_DATES = True
+        d.DATE_RESOLVE_MAX = 2
+        saved = d.resolve_dates
+        d.resolve_dates = lambda items: self.fail("must not date past the cap")
+        buf = io.StringIO()
+        try:
+            saved_flat = d.search_flat
+            d.search_flat = lambda q, c: ([
+                {"id": c * 11, "url": d.watch_url(c * 11), "title": c,
+                 "view_count": 100, "duration": 900} for c in "abc"], None)
+            with contextlib.redirect_stdout(buf):
+                kept, _err = d.search_items("cats")
+        finally:
+            d.resolve_dates = saved
+            d.search_flat = saved_flat
+            d.DATE_RESOLVE_MAX = 40
+        self.assertEqual(len(kept), 3)
+        self.assertIn("publish dates left out", buf.getvalue())
+        self.assertIn("--limit", buf.getvalue())
+
+    def test_a_date_sort_still_takes_the_dated_route(self):
+        # Ordering BY date needs every date before anything can be ordered, so
+        # that one route still asks YouTube for them.
+        d.RESOLVE_DATES = True
+        d.SORT_BY = "date"
+        saved = d.resolve_dates
+        d.resolve_dates = lambda items: self.fail("the dated route has dates already")
+        try:
+            kept, _err, _found, _skipped = self._search_items([
+                {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "A",
+                 "views": 100, "duration": 900, "epoch": int(time.time() - 3600)},
+            ])
+        finally:
+            d.resolve_dates = saved
+        self.assertEqual(len(kept), 1)
+
+    def test_a_window_is_applied_locally_not_by_youtube(self):
+        # YouTube's own date search throws away the relevance breadth: on one
+        # long title it returned 3 videos where the unfiltered list returned 148.
+        d.RESOLVE_DATES = True
+        d.DAYS = 30
+        d.SORT_BY = "views"
+        now = int(time.time())
+        pool = [
+            {"id": "a" * 11, "url": d.watch_url("a" * 11), "title": "fresh big",
+             "view_count": 9000, "duration": 900},
+            {"id": "b" * 11, "url": d.watch_url("b" * 11), "title": "old big",
+             "view_count": 8000, "duration": 900},
+            {"id": "c" * 11, "url": d.watch_url("c" * 11), "title": "fresh small",
+             "view_count": 7000, "duration": 900},
+        ]
+        ages = {"a" * 11: now - 3600, "b" * 11: now - 90 * 86400,
+                "c" * 11: now - 7200}
+        asked, saved = [], (d.search_flat, d.search_dated, d.resolve_dates)
+        d.search_flat = lambda q, c: (list(pool), None)
+        d.search_dated = lambda *a, **k: self.fail("a window must not take the dated route")
+
+        def fake_resolve(items):
+            asked.extend(i["id"] for i in items)
+            for item in items:
+                item["epoch"] = ages[item["id"]]
+            return len(items)
+
+        d.resolve_dates = fake_resolve
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                kept, err = d.search_items("cats")
+        finally:
+            d.search_flat, d.search_dated, d.resolve_dates = saved
+        self.assertIsNone(err)
+        # Sorted by views, then the window keeps only the two fresh ones.
+        self.assertEqual([i["id"] for i in kept], ["a" * 11, "c" * 11])
+        self.assertEqual(len(asked), 3, "every candidate had to be dated")
+
+    def test_the_window_walk_stops_as_soon_as_the_limit_is_filled(self):
+        # The point of walking a list that is already in the caller's order:
+        # "top 1 by views this month" dates one video, not all of them.
+        d.RESOLVE_DATES = True
+        d.DAYS = 30
+        d.SORT_BY = "views"
+        d.LIMIT = 1
+        now = int(time.time())
+        pool = [{"id": c * 11, "url": d.watch_url(c * 11), "title": c,
+                 "view_count": 9000 - n, "duration": 900}
+                for n, c in enumerate("abcdefghij")]
+        asked, saved = [], (d.search_flat, d.resolve_dates)
+        d.search_flat = lambda q, cnt: (list(pool), None)
+
+        def fake_resolve(items):
+            asked.extend(i["id"] for i in items)
+            for item in items:
+                item["epoch"] = now - 3600
+            return len(items)
+
+        d.resolve_dates = fake_resolve
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                kept, _err = d.search_items("cats")
+        finally:
+            d.search_flat, d.resolve_dates = saved
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+        self.assertLessEqual(len(asked), 10)
+        self.assertEqual(asked[0], "a" * 11, "it must start at the top of the order")
+
+    def test_the_window_walk_respects_the_date_cap(self):
+        d.RESOLVE_DATES = True
+        d.DATE_RESOLVE_MAX = 4
+        now = int(time.time())
+        items = [{"id": c * 11, "url": d.watch_url(c * 11), "epoch": None}
+                 for c in "abcdefghij"]
+        asked, saved = [], d.resolve_dates
+
+        def fake_resolve(chunk):
+            asked.extend(i["id"] for i in chunk)
+            for item in chunk:
+                item["epoch"] = now - 90 * 86400      # all outside the window
+            return len(chunk)
+
+        d.resolve_dates = fake_resolve
+        try:
+            kept, dated, exhausted = d.take_in_window(
+                items, now - 30 * 86400, limit=5)
+        finally:
+            d.resolve_dates = saved
+            d.DATE_RESOLVE_MAX = 40
+        self.assertEqual(kept, [])
+        self.assertEqual(dated, 4, "it must stop at the cap")
+        self.assertEqual(len(asked), 4)
+        self.assertFalse(exhausted, "the list was not exhausted, the cap was hit")
+
+    def test_the_window_walk_reports_an_exhausted_list(self):
+        now = int(time.time())
+        items = [{"id": c * 11, "url": d.watch_url(c * 11), "epoch": None}
+                 for c in "ab"]
+        saved = d.resolve_dates
+
+        def fake_resolve(chunk):
+            for item in chunk:
+                item["epoch"] = now - 3600
+            return len(chunk)
+
+        d.resolve_dates = fake_resolve
+        try:
+            kept, dated, exhausted = d.take_in_window(items, now - 30 * 86400, limit=5)
+        finally:
+            d.resolve_dates = saved
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dated, 2)
+        self.assertTrue(exhausted)
+
+    def test_no_dates_sends_a_window_back_to_youtube(self):
+        # Without local dates there is nothing to filter on here, so the window
+        # has to be asked of YouTube after all.
+        d.RESOLVE_DATES = False
+        d.DAYS = 30
+        d.SORT_BY = "views"
+        took, saved = [], (d.search_dated, d.search_flat)
+        d.search_dated = lambda q, c, since=None: (took.append("dated") or ([], None))
+        d.search_flat = lambda q, c: (took.append("flat") or ([], None))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                d.search_items("cats")
+        finally:
+            d.search_dated, d.search_flat = saved
+        self.assertEqual(took, ["dated"])
+
+    def test_the_route_decision_has_one_answer(self):
+        # The banner printed the dated route's shallow depth while the run took
+        # the cheap route and scanned 150, so the two disagreed on screen.
+        d.RESOLVE_DATES = True
+        d.SORT_BY = "views"
+        d.THIS_MONTH = True
+        self.assertFalse(d.needs_dated_route(), "a window is applied locally")
+        self.assertEqual(d.search_depth(d.needs_dated_route()), d.SEARCH_DEPTH_FLAT)
+        d.SORT_BY = "date"
+        self.assertTrue(d.needs_dated_route(), "a date sort needs every date")
+        self.assertEqual(d.search_depth(d.needs_dated_route()), d.SEARCH_DEPTH_DATED)
+        d.SORT_BY = "views"
+        d.RESOLVE_DATES = False
+        self.assertTrue(d.needs_dated_route(), "without local dates, ask YouTube")
+
+    def test_a_search_with_no_window_needs_no_dated_route(self):
+        d.RESOLVE_DATES = True
+        d.SORT_BY = "views"
+        self.assertFalse(d.needs_dated_route())
+        d.RESOLVE_DATES = False
+        self.assertFalse(d.needs_dated_route(), "no window, so nothing to filter")
+
+    def test_no_dates_flag_parses(self):
+        self.assertFalse(d.parse_args(["/tmp"]).no_dates)
+        self.assertTrue(d.parse_args(["/tmp", "--no-dates"]).no_dates)
 
 
 class TestMacOS(PlatformCase, unittest.TestCase):

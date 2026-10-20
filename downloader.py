@@ -160,6 +160,20 @@ SEARCH_QUERY   = None      # --search QUERY: run a YouTube search first
 # prints which one it used.
 SEARCH_DEPTH_FLAT  = 150
 SEARCH_DEPTH_DATED = 40
+
+# The flat route returns no upload dates - YouTube's flat listing simply has
+# none - so they are fetched afterwards, for the videos that SURVIVED the
+# filters and the limit rather than for everything scanned. Measured at about
+# 2.1s per video (20 in 42.6s, one yt-dlp call), so dating the 20 results of a
+# search costs 42s where dating the 150 it looked at would cost five minutes.
+#
+# The cap is what stops an unlimited search from quietly spending those five
+# minutes: past it the dates are left out and the run says so, naming --limit.
+RESOLVE_DATES    = True    # --no-dates turns it off
+# At about 2.1s each this is the longest a run will spend on dates: a shade
+# over three minutes. The REST API lowers it for itself, because a request
+# cannot hold the downloader's globals for that long (see ROUTE_GLOBALS).
+DATE_RESOLVE_MAX = 100
 SEARCH_COUNT   = None      # --search-count N; None = pick by route
 SORT_BY        = "relevance"   # relevance | views | date | oldest
 THIS_MONTH     = False     # --this-month: since the 1st of the current month
@@ -3004,6 +3018,70 @@ def search_dated(query, count, since=None):
     return items, None
 
 
+def resolve_dates(items):
+    """Fill in the upload date of each item, in one yt-dlp pass.
+
+    Returns how many were dated. Items left undated keep epoch None, which the
+    row then reports as a missing date rather than a wrong one.
+    """
+    urls = [i["url"] for i in items if i.get("epoch") is None and i.get("id")]
+    if not urls:
+        return 0
+    cmd = base_cmd() + [
+        "--no-warnings", "--ignore-errors", "--skip-download",
+        "--print", "%(id)s\t%(timestamp)s", "--",
+    ] + urls
+    try:
+        out = run_logged("search_dates", cmd, capture_output=True, text=True,
+                         timeout=SEARCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        note("      (ran out of time fetching publish dates)")
+        return 0
+    except OSError as e:
+        note(f"      (could not fetch publish dates: {e})")
+        return 0
+    dates = {}
+    for line in (out.stdout or "").splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            dates[parts[0]] = int(parts[1])
+    for item in items:
+        if item.get("epoch") is None:
+            item["epoch"] = dates.get(item.get("id"))
+    return len(dates)
+
+
+def take_in_window(items, since, limit, cap=None):
+    """Walk an already-sorted list, dating as it goes, keeping what is in the
+    window. Returns (kept, how many were dated, whether the list ran out).
+
+    The window cannot be applied before the dates are known, and the dates are
+    the expensive part, so they are fetched a block at a time DOWN A LIST THAT
+    IS ALREADY IN THE ORDER THE CALLER ASKED FOR. A "top 20 by views, this
+    month" therefore stops as soon as it has twenty, instead of dating all 150
+    - and it keeps the full relevance breadth, which is what asking YouTube to
+    filter by date costs: on one long title YouTube's own Videos-plus-date
+    search returned 3 videos where the unfiltered relevance list returned 148.
+    """
+    cap = DATE_RESOLVE_MAX if cap is None else cap
+    block = max(10, limit or 20)
+    kept, dated, index = [], 0, 0
+    while index < len(items) and dated < cap:
+        chunk = items[index:index + min(block, cap - dated)]
+        if not chunk:
+            break
+        index += len(chunk)
+        dated += len(chunk)
+        resolve_dates(chunk)
+        for item in chunk:
+            epoch = item.get("epoch")
+            if epoch and epoch >= since:
+                kept.append(item)
+                if limit and len(kept) >= limit:
+                    return kept, dated, index >= len(items)
+    return kept, dated, index >= len(items)
+
+
 def sort_items(items):
     """Order the results. "relevance" keeps the order YouTube returned them in.
 
@@ -3023,6 +3101,23 @@ def sort_items(items):
     return items
 
 
+def needs_dated_route():
+    """Whether this search has to ask YouTube for the dates.
+
+    Sorting BY date needs every date before anything can be ordered, so that
+    takes the dated route. A date WINDOW does not: the cheap route brings the
+    whole relevance list and the window is applied locally over dates fetched
+    afterwards - unless --no-dates means they cannot be fetched at all.
+
+    One function, because the banner and the run must not disagree about which
+    route (and therefore which scan depth) this search is going to use.
+    """
+    if SORT_BY in ("date", "oldest"):
+        return True
+    since, _label = search_window()
+    return since is not None and not RESOLVE_DATES
+
+
 def search_depth(needs_dates):
     """How many results this search will scan.
 
@@ -3037,9 +3132,14 @@ def search_depth(needs_dates):
 def search_items(query):
     """Run the search and return (items, error), filtered, sorted and capped."""
     since, label = search_window()
-    # A date sort needs upload dates, which only this route returns; a window
-    # needs them too. Either reason is enough to take it.
-    needs_dates = since is not None or SORT_BY in ("date", "oldest")
+    # A date SORT needs every date before it can order anything, so it has to
+    # take the dated route. A date WINDOW does not: the cheap route brings the
+    # whole relevance list, and the window is applied here over dates fetched
+    # for the results that survive. That keeps the breadth YouTube's own date
+    # search throws away - on one long title it returned 3 videos where the
+    # unfiltered relevance list returned 148.
+    needs_dates = needs_dated_route()
+    window_here = since is not None and not needs_dates
     depth = search_depth(needs_dates)
     log_debug("search_start", stage="search", query=redact_text(query),
               count=depth, asked=SEARCH_COUNT, sort=SORT_BY, days=DAYS,
@@ -3101,9 +3201,37 @@ def search_items(query):
         seen.add(item["id"])
         unique.append(item)
     items = sort_items(unique)
-    if LIMIT:
-        items = items[:LIMIT]
     skipped_by_list[0] += counts["skipped"]
+
+    if window_here:
+        # Dates fetched down the sorted list, keeping what is in the window and
+        # stopping as soon as --limit is satisfied.
+        print(f"  Dates   : fetching publish dates down the list to find"
+              f"{f' {LIMIT}' if LIMIT else ''} video(s) {label}"
+              f" (about 2.1s each)...")
+        items, dated, exhausted = take_in_window(items, since, LIMIT)
+        counts["dated"] = dated
+        print(f"            dated {dated}, kept {len(items)}")
+        if not exhausted and (not LIMIT or len(items) < LIMIT):
+            print(f"            stopped at the {DATE_RESOLVE_MAX}-video date cap;"
+                  f" there may be more further down the list")
+    else:
+        if LIMIT:
+            items = items[:LIMIT]
+        # The flat route brings no dates. Fetch them for what is left rather
+        # than for everything scanned - see DATE_RESOLVE_MAX.
+        if RESOLVE_DATES and items and all(i.get("epoch") is None for i in items):
+            if len(items) <= DATE_RESOLVE_MAX:
+                print(f"  Dates   : fetching {len(items)} publish date(s)"
+                      f" (about {round(len(items) * 2.1)}s)...")
+                dated = resolve_dates(items)
+                counts["dated"] = dated
+                if dated < len(items):
+                    print(f"            {len(items) - dated} could not be dated")
+            else:
+                print(f"  Dates   : {len(items)} results is past the"
+                      f" {DATE_RESOLVE_MAX} this will date in one run; publish"
+                      f" dates left out.  (--limit {DATE_RESOLVE_MAX} to get them)")
     # What the search returned, kept apart from what survived the filters: the
     # log record needs both, and only this function ever sees the first.
     SEARCH_FOUND[0] = found
@@ -4187,6 +4315,11 @@ def parse_args(argv=None):
                         "ytsearch and returns far fewer.")
     p.add_argument("--this-month", action="store_true", dest="this_month",
                    help="Search window: since the 1st of the current month.")
+    p.add_argument("--no-dates", action="store_true", dest="no_dates",
+                   help=f"Do not fetch publish dates for search results. They "
+                        f"cost about 2.1s per video and are fetched only for "
+                        f"the results that survive the filters, up to "
+                        f"{DATE_RESOLVE_MAX} of them.")
     p.add_argument("--shorts", action="store_true",
                    help="Include short-form videos (Shorts). Left out by default.")
     p.add_argument("--min-duration", type=count, default=SHORTS_SECONDS, metavar="SECONDS",
@@ -4299,7 +4432,7 @@ def main():
     global MIN_VIEWS, LIMIT, DAYS, SKIP_FILE, SKIP_IDS, TRANSCRIPT_ONLY
     global EXTRACT_COMMENTS, COMMENT_LIMIT, COMMENT_REPLIES, COMMENT_SORT
     global SEARCH_QUERY, SEARCH_COUNT, SORT_BY, THIS_MONTH, IN_CHANNEL
-    global SEARCH_MATCH, INCLUDE_SHORTS, MIN_DURATION
+    global SEARCH_MATCH, INCLUDE_SHORTS, MIN_DURATION, RESOLVE_DATES
 
     use_utf8_output()
     args = parse_args()
@@ -4328,6 +4461,7 @@ def main():
     THIS_MONTH = args.this_month
     IN_CHANNEL = args.in_channel
     SEARCH_MATCH = args.match
+    RESOLVE_DATES = not args.no_dates
     INCLUDE_SHORTS = args.shorts
     MIN_DURATION = args.min_duration
     # Nobody asking for a transcript wants a .jpg; the description is kept
@@ -4358,8 +4492,7 @@ def main():
               f", replies {'on' if COMMENT_REPLIES else 'off'}")
     if SEARCH_QUERY:
         where = f" in {IN_CHANNEL}" if IN_CHANNEL else " on YouTube"
-        since, _label = search_window()
-        depth = search_depth(since is not None or SORT_BY in ("date", "oldest"))
+        depth = search_depth(needs_dated_route())
         print(f"  Search  : {SEARCH_QUERY}{where}  (scan {depth}"
               f"{'' if SEARCH_COUNT else ' by default'}, sort {SORT_BY})")
         if not IN_CHANNEL:

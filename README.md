@@ -380,9 +380,28 @@ Measured on `how to learn guitar --sort date` without the filter: all ten
 "results" were one channel's uploads, not one of them a hit for the query, and
 the run took 101s instead of 17s.
 
-So the two routes answer slightly different questions, which is the honest
-price of wanting both full relevance breadth *and* upload dates. A future
-version could keep the breadth and date only the survivors.
+### Publish dates, without giving up the breadth
+
+The cheap route returns no upload dates — YouTube's flat listing has none — so
+they are fetched afterwards, in one yt-dlp pass over the results that **survived
+the filters**, measured at about **2.1s per video** (20 in 42.6s). Dating the 20
+results of a search therefore costs 42s where dating the 150 it looked at would
+cost five minutes. `--no-dates` skips it.
+
+A **date window** is applied here too, not by YouTube, and that is the whole
+point: dates are fetched a block at a time *down the list already in the order
+you asked for*, keeping what is in the window, stopping as soon as `--limit` is
+satisfied. On one long title, `--sort views --this-month --limit 20`:
+
+| | Results this month |
+|---|---|
+| YouTube's own Videos+date search | **3** |
+| full relevance list, window applied locally | **20** (dated 80 of 149 to find them) |
+
+A **date sort** (`--sort date`/`oldest`) still takes the dated route, because
+ordering by date needs every date before anything can be ordered. At most
+`DATE_RESOLVE_MAX` videos are dated in one run — 100 on the command line, 40
+through the REST API, which cannot hold its lock for three minutes.
 
 **Sorting** stays local on purpose, not for want of `sp=`. YouTube's own
 sort-by-views collapses onto the exact phrase and discards the near-matches,

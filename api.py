@@ -213,6 +213,10 @@ DEFAULTS = {
     # question from "sort": related keeps YouTube's relevance list, where the
     # near-matches live; exact uses the far narrower ytsearch route.
     "match": "related",
+    # Publish dates cost about 2.1s per video and the flat search route brings
+    # none, so they are fetched for the results that survive - see
+    # DATE_RESOLVE_MAX in downloader.py.
+    "dates": True,
     # Long videos only, which is what the research is for. The floor is in
     # seconds and a Short is at most 3 minutes.
     "shorts": False, "min_duration": 180,
@@ -232,7 +236,7 @@ INT_MAX = {"views": 10**12, "limit": 10**6, "days": 10**5, "min_height": 10**4,
 SUB_LANG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,34}$")   # anchored for the schema too
 BOOL_FIELDS = ("channel", "subs", "thumbnail", "description", "verbose",
                "transcript", "extract_comments", "comment_replies", "this_month",
-               "shorts")
+               "shorts", "dates")
 COMMENT_SORTS = ("top", "new")
 MATCH_MODES = ("related", "exact")
 SORTS = ("relevance", "views", "popularity", "least-viewed", "date", "oldest")
@@ -390,6 +394,8 @@ def build_argv(outdir, opts, links_file=None):
                  "--comment-sort", opts["comment_sort"]]
         if opts["comment_replies"]:
             argv.append("--comment-replies")
+    if not opts["dates"]:
+        argv.append("--no-dates")
     if opts["shorts"]:
         argv.append("--shorts")
     else:
@@ -869,7 +875,10 @@ def shutdown_jobs(timeout=15):
 ROUTE_GLOBALS = {
     "MIN_VIEWS": 0, "LIMIT": 0, "DAYS": 0, "THIS_MONTH": False, "SKIP_IDS": set(),
     "SEARCH_QUERY": None, "IN_CHANNEL": None, "SEARCH_COUNT": None,
-    "SORT_BY": "relevance", "SEARCH_MATCH": "related",
+    "SORT_BY": "relevance", "SEARCH_MATCH": "related", "RESOLVE_DATES": True,
+    # 40 x ~2.1s fits inside ROUTE_SECONDS; the CLI's own default is higher
+    # because a person at a terminal can wait and a held lock cannot.
+    "DATE_RESOLVE_MAX": 40,
     "INCLUDE_SHORTS": False, "MIN_DURATION": 180,
     "SUB_LANG": "en", "DOWNLOAD_SUBS": True, "TRANSCRIPT_ONLY": False,
     "EXTRACT_COMMENTS": False, "COMMENT_LIMIT": 100, "COMMENT_REPLIES": False,
@@ -972,7 +981,7 @@ def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
 
 def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
                    this_month=False, views=0, limit=0, skip="",
-                   match="related", shorts=False, min_duration=180):
+                   match="related", shorts=False, min_duration=180, dates=True):
     """Search results - link, views, publish date and channel - downloading nothing."""
     query = _lines(query).strip()
     if not query:
@@ -1000,7 +1009,7 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
             MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
             SKIP_IDS=_skip_ids(skip), SEARCH_TIMEOUT=ROUTE_SECONDS,
             SEARCH_MATCH=match, INCLUDE_SHORTS=bool(shorts),
-            MIN_DURATION=min_duration):
+            MIN_DURATION=min_duration, RESOLVE_DATES=bool(dates)):
         items, err = d.search_items(query)
         _since, window = d.search_window()
         rows = [d.search_row(item, number) for number, item in enumerate(items, 1)]
@@ -1140,6 +1149,9 @@ def build_app():
             "related", description="How wide a net the search casts: related "
                                    "(YouTube's own results page, so near-matches "
                                    "come too) or exact (the narrower ytsearch).")
+        dates: bool = Field(True, description="Fetch each search result's "
+                            "publish date. About 2.1s per video, for the "
+                            "results that survive the filters.")
         shorts: bool = Field(False, description="Include short-form videos. "
                              "Left out by default. Overrides min_duration, "
                              "which it sets to 0.")
@@ -1243,6 +1255,12 @@ def build_app():
                    "which searches that channel's own tab."),
                sort: str = Query("relevance", description="relevance, views, "
                                  "popularity, least-viewed, date or oldest."),
+               dates: bool = Query(True, description="Fetch each result's "
+                                   "publish date. The cheap search route "
+                                   "returns none, so these cost about 2.1s per "
+                                   "video and are fetched only for the results "
+                                   "that survive the filters - use limit to "
+                                   "keep that small."),
                shorts: bool = Query(False, description="Include short-form "
                                     "videos. Left out by default. Overrides "
                                     "min_duration, which it sets to 0."),
@@ -1273,7 +1291,7 @@ def build_app():
         try:
             return search_youtube(query, in_channel, count, sort, days,
                                   this_month, views, limit, skip,
-                                  match, shorts, min_duration)
+                                  match, shorts, min_duration, dates)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "query"))
         except PreviewBusy as e:
