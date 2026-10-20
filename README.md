@@ -353,17 +353,42 @@ Alongside the printed table the run writes two files into the folder:
 first. On one title this month that reads 0 views, 1 view, then 45,644 — three
 channels, the same angle, wildly different results.
 
-### Why the filters are applied locally
+### Why the sorting is done locally
 
-YouTube's own search filters are not reachable through yt-dlp. Its
-`youtube:search_url` extractor keeps the `search_query` and **drops the `sp=`
-parameter** that carries them — a "last hour only" filter returned the identical
-video ids as no filter at all, and "sort by views" returned them unsorted.
-`ytsearchdate:` is not supported by this yt-dlp either.
+An earlier version of this README claimed YouTube's `sp=` search filters were
+unreachable through yt-dlp. **That was wrong**, and it is corrected here:
+`sp=` reaches YouTube intact. Measured on `how to learn guitar`:
 
-So every filter and every sort is applied here. That is the better answer
-anyway: **`--days 30` is exactly 30 days**, where YouTube's "this month" covers
-one day on the 1st.
+| URL | Result |
+|---|---|
+| no `sp=` | relevance order, 3 of the first 10 entries are channel/playlist cards |
+| `&sp=EgIQAQ%3D%3D` (Videos) | the cards are gone, relevance order kept |
+| `&sp=CAMSAhAB` (sort by views) | 39.7M, 39.5M, 20.5M … genuinely sorted |
+| `&sp=EgIIAg%3D%3D` (this week) | all fresh uploads |
+
+The **Videos** filter is applied to the **dated route only**, and that scoping
+is deliberate. It does not merely hide the non-video cards — it changes which
+search YouTube runs, and by a lot in both directions, as the table above shows:
+the same long title goes from 150 results to 3.
+
+It is load-bearing exactly where it is used. A channel or playlist card is
+harmless to the flat route, which leaves it as one entry with a non-video id
+that gets dropped. The dated route cannot use `--flat-playlist` (it needs
+timestamps) so yt-dlp **resolves** each card — and a channel card resolves into
+that channel's own uploads, which then arrive as if they were search results.
+Measured on `how to learn guitar --sort date` without the filter: all ten
+"results" were one channel's uploads, not one of them a hit for the query, and
+the run took 101s instead of 17s.
+
+So the two routes answer slightly different questions, which is the honest
+price of wanting both full relevance breadth *and* upload dates. A future
+version could keep the breadth and date only the survivors.
+
+**Sorting** stays local on purpose, not for want of `sp=`. YouTube's own
+sort-by-views collapses onto the exact phrase and discards the near-matches,
+which are the whole reason to search at all — see `--match related` above. The
+same goes for the window: **`--days 30` is exactly 30 days**, where YouTube's
+"this month" covers one day on the 1st.
 
 Two routes, chosen by whether a date is needed, because the cost gap is large:
 

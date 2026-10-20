@@ -114,6 +114,64 @@ class PlatformCase:
                          "https://www.youtube.com/results?"
                          "search_query=two%20words%20%26%20more")
 
+    def test_only_the_dated_route_asks_for_videos_only(self):
+        # The filter does not merely hide the non-video cards, it changes which
+        # search YouTube runs - measured 150 -> 3 on one long title and 23 ->
+        # 150 on a broad one. So it goes only where it is load-bearing: the
+        # dated route, which resolves cards into their channels' uploads.
+        self.assertNotIn("sp=", d.search_target("cats", 25))
+        self.assertIn(f"&sp={d.VIDEOS_ONLY}",
+                      d.search_target("cats", 25, videos_only=True))
+        d.SEARCH_MATCH = "exact"
+        self.assertNotIn("sp=", d.search_target("cats", 25, videos_only=True))
+
+    def test_the_dated_route_really_passes_the_filter(self):
+        _items, _err, cmd = self._dated("")
+        target = cmd[-1]
+        self.assertIn("/results?search_query=", target)
+        self.assertIn(f"&sp={d.VIDEOS_ONLY}", target)
+
+    def test_a_pipe_in_a_channel_name_cannot_shift_the_duration(self):
+        # "NOOR | Holy Quran" adds a field to a "|"-joined record. With the name
+        # in the middle that shifted duration off the end, and the length floor
+        # then dropped all 32 of that channel's hour-long videos.
+        d.MIN_DURATION = 180
+        d.DAYS = 21
+        lines = [
+            "b-2e7duVMbM|418|not_live|3451|NOOR | Holy Quran - Quran",
+            "c-3e7duVMbN|500|not_live|2800|Plain Name",
+            "d-4e7duVMbO|600|not_live|30|Short | Channel",      # a real Short
+            "e-5e7duVMbP|700|not_live|NA|No Length | Channel",
+        ]
+        saved = d.subprocess.run
+        d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 0, "\n".join(lines) + "\n", "")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                links, name, err = d.list_channel_recent(
+                    "https://www.youtube.com/@X")
+        finally:
+            d.subprocess.run = saved
+        self.assertIsNone(err)
+        self.assertEqual(links, [d.watch_url("b-2e7duVMbM"), d.watch_url("c-3e7duVMbN")],
+                         "the piped name must not cost that channel its videos")
+        self.assertEqual(name, "NOOR | Holy Quran - Quran",
+                         "and the name must come back whole")
+
+    def test_a_short_record_is_skipped_not_read_as_blanks(self):
+        d.MIN_DURATION = 0
+        d.DAYS = 7
+        saved = d.subprocess.run
+        d.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 0, "aaaaaaaaaaa|500|not_live\n"
+                    "bbbbbbbbbbb|500|not_live|900|Ch\n", "")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                links, _name, _err = d.list_channel_recent("https://www.youtube.com/@X")
+        finally:
+            d.subprocess.run = saved
+        self.assertEqual(links, [d.watch_url("bbbbbbbbbbb")])
+
     def test_a_query_may_contain_a_colon(self):
         # Only the first colon separates the prefix from the query.
         d.SEARCH_MATCH = "exact"
@@ -2861,6 +2919,148 @@ class PlatformCase:
         row = d.search_row({"id": "a" * 11, "url": "u", "title": "T"}, 1)
         self.assertIsNone(row["duration"])
         self.assertIsNone(row["duration_text"])
+
+    # -------------------------------- saying what the filters actually did
+    def test_a_search_emptied_by_the_floor_names_the_floor(self):
+        # "Try a wider window" is useless advice when there is no window and the
+        # length floor is what emptied the answer - and the floor is on by default.
+        d.MIN_DURATION = 180
+        saved = (d.search_flat, d.LOG_JSON[0])
+        d.search_flat = lambda q, c: ([
+            {"id": "a" * 11, "title": "S1", "view_count": 500, "duration": 30},
+            {"id": "b" * 11, "title": "S2", "view_count": 600, "duration": 45},
+        ], None)
+        buf = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as base:
+                d.DOWNLOAD_DIR = base
+                args = d.parse_args(["/tmp", "--search", "cats"])
+                with contextlib.redirect_stdout(buf):
+                    path = d.run_search(args)
+        finally:
+            d.search_flat, d.LOG_JSON[0] = saved
+        shown = buf.getvalue()
+        self.assertIsNone(path)
+        self.assertIn("none of 2 video(s) matched", shown)
+        self.assertIn("2 shorter than", shown)
+        self.assertIn("--shorts", shown)
+        self.assertNotIn("wider window", shown)
+
+    def test_a_search_that_truly_matched_nothing_still_says_so(self):
+        saved = d.search_flat
+        d.search_flat = lambda q, c: ([], None)
+        buf = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as base:
+                d.DOWNLOAD_DIR = base
+                args = d.parse_args(["/tmp", "--search", "cats"])
+                with contextlib.redirect_stdout(buf):
+                    d.run_search(args)
+        finally:
+            d.search_flat = saved
+        self.assertIn("Nothing matched", buf.getvalue())
+
+    def test_the_search_table_says_how_many_were_scanned(self):
+        d.MIN_DURATION = 180
+        d.SEARCH_FOUND[0] = 59
+        d.SEARCH_COUNTS[0] = {"scanned": 59, "short": 28, "nolength": 1,
+                              "views": 0, "live": 0, "skipped": 0, "unknown": 0}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.print_search_results([{"id": "a" * 11, "url": "u", "title": "T",
+                                     "views": 5, "duration": 900}], "")
+        shown = buf.getvalue()
+        self.assertIn("1 video(s) of 59 scanned", shown)
+        self.assertIn("28 under", shown)
+        self.assertIn("1 of unknown length", shown)
+
+    def test_the_search_table_is_quiet_when_nothing_was_filtered(self):
+        d.SEARCH_FOUND[0] = 1
+        d.SEARCH_COUNTS[0] = {"scanned": 1, "short": 0, "nolength": 0, "views": 0,
+                              "live": 0, "skipped": 0, "unknown": 0}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.print_search_results([{"id": "a" * 11, "url": "u", "title": "T",
+                                     "views": 5, "duration": 900}], "")
+        self.assertNotIn("Filtered out", buf.getvalue())
+        self.assertNotIn("scanned", buf.getvalue())
+
+    def test_search_items_keeps_the_reason_for_every_drop(self):
+        d.MIN_DURATION = 180
+        d.MIN_VIEWS = 100
+        d.SKIP_IDS = {"e" * 11}
+        kept, _err, found, _skipped = self._search_items([
+            {"id": "a" * 11, "url": "u", "title": "keep", "views": 500, "duration": 900},
+            {"id": "b" * 11, "url": "u", "title": "short", "views": 500, "duration": 30},
+            {"id": "c" * 11, "url": "u", "title": "nolen", "views": 500, "duration": None},
+            {"id": "d" * 11, "url": "u", "title": "quiet", "views": 5, "duration": 900},
+            {"id": "e" * 11, "url": "u", "title": "skip", "views": 500, "duration": 900},
+        ], dated=False)
+        self.assertEqual([i["id"] for i in kept], ["a" * 11])
+        self.assertEqual(found, 5)
+        counts = d.SEARCH_COUNTS[0]
+        self.assertEqual((counts["short"], counts["nolength"], counts["views"],
+                          counts["skipped"]), (1, 1, 1, 1))
+
+    def test_a_shorts_tab_says_the_floor_does_not_apply(self):
+        d.MIN_DURATION = 180
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertTrue(d.shorts_tab_note("https://www.youtube.com/@H/shorts"))
+        self.assertIn("Shorts tab", buf.getvalue())
+        self.assertIn("@H/shorts", buf.getvalue())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertFalse(d.shorts_tab_note("https://www.youtube.com/@H/videos"))
+        self.assertEqual(buf.getvalue(), "")
+        d.INCLUDE_SHORTS = True            # no floor, so nothing to explain
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertTrue(d.shorts_tab_note("https://www.youtube.com/@H/shorts"))
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_the_summary_records_the_net_and_the_floor(self):
+        d.SEARCH_QUERY = "cats"
+        d.SEARCH_MATCH = "exact"
+        d.MIN_DURATION = 600
+        fields = d.mode_fields()
+        self.assertEqual(fields["search_match"], "exact")
+        self.assertEqual(fields["min_duration"], 600)
+        self.assertFalse(fields["shorts"])
+        d.IN_CHANNEL = "https://www.youtube.com/@H"
+        self.assertIsNone(d.mode_fields()["search_match"],
+                          "an in-channel search uses neither net")
+        d.INCLUDE_SHORTS = True
+        self.assertIsNone(d.mode_fields()["min_duration"])
+
+    def test_the_results_json_records_the_net_and_the_floor(self):
+        d.SEARCH_MATCH = "related"
+        d.MIN_DURATION = 180
+        d.SEARCH_FOUND[0] = 42
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "search_results.json")
+            d.write_search_results(path, "cats", [
+                {"id": "a" * 11, "url": "u", "title": "T", "views": 5, "duration": 900}], "")
+            payload = json.load(open(path, encoding="utf-8"))
+        self.assertEqual(payload["match"], "related")
+        self.assertEqual(payload["min_duration"], 180)
+        self.assertEqual(payload["scanned"], 42)
+        self.assertEqual(payload["found"], 1)
+
+    def test_the_results_json_reports_no_net_for_an_in_channel_search(self):
+        d.IN_CHANNEL = "https://www.youtube.com/@H"
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "search_results.json")
+            d.write_search_results(path, "cats", [], "")
+            self.assertIsNone(json.load(open(path, encoding="utf-8"))["match"])
+
+    def test_a_whole_duration_stays_a_whole_number(self):
+        # Otherwise the same video's duration changes JSON type depending on
+        # which route --sort happened to pick.
+        self.assertIsInstance(d.as_seconds("900"), int)
+        self.assertIsInstance(d.as_seconds(900.0), int)
+        self.assertIsInstance(d.as_seconds("900.5"), float)
+        self.assertEqual(d.as_seconds("900.0"), 900)
 
 
 class TestMacOS(PlatformCase, unittest.TestCase):
