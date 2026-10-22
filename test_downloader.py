@@ -3829,12 +3829,13 @@ class PlatformCase:
         documented = set(re.findall(r"(--[a-z][a-z-]+)", text))
         missing = sorted(real - documented)
         self.assertEqual(missing, [], f"AGENTS.md documents no: {missing}")
-        # The manual also shows api.py's own flags, a curl invocation and the
-        # pip command that installs the MCP server's one dependency, so those
-        # are not downloader flags it invented.
+        # The manual also shows api.py's and mcp_server.py's own flags, a curl
+        # invocation and the pip command that installs the MCP server's one
+        # dependency, so those are not downloader flags it invented.
         elsewhere = {"--new-key", "--share", "--port", "--outdir",
                      "--data-urlencode",
-                     "--user", "--break-system-packages"}
+                     "--user", "--break-system-packages",
+                     "--http", "--no-auth"}
         invented = sorted(documented - real - elsewhere)
         self.assertEqual(invented, [],
                          f"AGENTS.md documents flags the downloader does not have:"

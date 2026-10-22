@@ -247,6 +247,141 @@ def test_health_answers_without_a_network():
     assert set(health["tools"]) >= {"yt-dlp", "ffmpeg", "node"}
 
 
+# ------------------------------------------------------- the HTTP transport
+# Only --http is authenticated. stdio deliberately is not: the spec says a
+# stdio server should take credentials from the environment rather than follow
+# the authorization spec, and the editor already launched the process.
+
+def test_no_token_means_no_auth_at_all():
+    verifier, auth = mcp_server._http_auth("")
+    assert verifier is None and auth is None
+
+
+def test_a_token_builds_a_verifier_without_switching_oauth_on():
+    verifier, auth = mcp_server._http_auth("s3cret")
+    assert isinstance(verifier, mcp_server.StaticTokenVerifier)
+    # The one field that matters: a real resource_server_url is what makes the
+    # SDK mount /.well-known/oauth-protected-resource and start an RFC 9728
+    # discovery dance. None keeps the server to a single /mcp endpoint.
+    assert auth.resource_server_url is None
+
+
+def test_an_empty_token_is_refused_rather_than_accepted_as_open():
+    with pytest.raises(ValueError):
+        mcp_server.StaticTokenVerifier("")
+
+
+@pytest.mark.parametrize("given, ok", [
+    ("s3cret", True), ("s3creT", False), ("s3cre", False), ("", False),
+    ("s3cret ", False), ("bearer s3cret", False),
+])
+def test_the_verifier_accepts_only_the_exact_token(given, ok):
+    verifier = mcp_server.StaticTokenVerifier("s3cret")
+    assert bool(asyncio.run(verifier.verify_token(given))) is ok
+
+
+def test_http_without_a_token_refuses_to_start(monkeypatch):
+    """Fail closed. This process shells out to yt-dlp and reads a cookies.txt
+    holding a live session, so an open HTTP transport is not a default.
+
+    HTTP_TOKEN is read once at import, so the module attribute is what main()
+    sees - clearing the environment variable here would change nothing.
+    """
+    monkeypatch.setattr(mcp_server, "HTTP_TOKEN", "")
+    with pytest.raises(SystemExit) as caught:
+        mcp_server.main(["--http"])
+    assert caught.value.code == 2
+
+
+def test_no_auth_is_refused_on_a_non_loopback_address():
+    with pytest.raises(SystemExit) as caught:
+        mcp_server.main(["--http", "--no-auth", "--host", "0.0.0.0"])
+    assert caught.value.code == 2
+
+
+def test_no_auth_on_loopback_is_allowed(monkeypatch):
+    started = {}
+    monkeypatch.setattr(mcp_server.mcp, "run",
+                        lambda **kw: started.update(kw))
+    mcp_server.main(["--http", "--no-auth", "--port", "8799"])
+    assert started["transport"] == "streamable-http"
+    assert started["host"] == "127.0.0.1" and started["port"] == 8799
+
+
+def test_the_http_flags_need_http():
+    for argv in (["--no-auth"], ["--host", "1.2.3.4"], ["--port", "80"]):
+        with pytest.raises(SystemExit):
+            mcp_server.main(argv)
+
+
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _post(url, token=None, timeout=20):
+    """An MCP initialize over streamable HTTP. Returns the status code."""
+    import urllib.error
+    import urllib.request
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18",
+                                  "capabilities": {},
+                                  "clientInfo": {"name": "t", "version": "1"}}})
+    request = urllib.request.Request(
+        url, data=body.encode(), method="POST",
+        headers={"content-type": "application/json",
+                 "accept": "application/json, text/event-stream",
+                 **({"authorization": f"Bearer {token}"} if token else {})})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
+            return answer.status, answer.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+@pytest.mark.network      # no network, but it binds a port and spawns a server
+def test_the_http_transport_demands_the_token():
+    port = _free_port()
+    env = {**os.environ, "YTMEER_HTTP_TOKEN": "the-right-token"}
+    proc = subprocess.Popen([sys.executable, SERVER, "--http", "--port", str(port)],
+                            env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    url = f"http://127.0.0.1:{port}/mcp"
+    try:
+        for _ in range(80):                   # wait for the port to answer
+            try:
+                _post(url, timeout=2)
+                break
+            except Exception:
+                time.sleep(0.25)
+
+        assert _post(url)[0] == 401, "no header must be refused"
+        assert _post(url, "wrong")[0] == 401, "a wrong token must be refused"
+        status, text = _post(url, "the-right-token")
+        assert status == 200, text[:200]
+        assert "serverInfo" in text and "ytmeer" in text
+
+        # No OAuth machinery: AuthSettings(resource_server_url=None) must leave
+        # the app with one route, so a client is never sent discovering.
+        import urllib.error
+        import urllib.request
+        for path in (".well-known/oauth-protected-resource",
+                     ".well-known/oauth-protected-resource/mcp",
+                     ".well-known/oauth-authorization-server",
+                     "authorize", "token", "register"):
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/{path}", timeout=10) as got:
+                    code = got.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            assert code == 404, f"/{path} exists, so OAuth got switched on"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=20)
+
 # ------------------------------------------------------------- with YouTube
 @pytest.mark.network
 def test_resolve_and_video_agree_on_the_channel():

@@ -45,11 +45,14 @@ import asyncio
 import atexit
 import contextlib
 import os
+import secrets
 import signal
 import sys
 import threading
 from typing import Annotated, Any, AsyncIterator
 
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
@@ -89,6 +92,55 @@ BUSY_WAIT = max(1, int(os.environ.get("YTMEER_BUSY_WAIT") or 90))
 api.PREVIEW_WAIT = BUSY_WAIT
 
 MAX_JOBS = max(1, int(os.environ.get("YTMEER_MAX_JOBS") or 50))
+
+# The shared secret the HTTP transport requires, and nothing else uses. Set it
+# and --http demands "Authorization: Bearer <it>" on every request; leave it
+# unset and --http refuses to start (see main). stdio never consults it: the
+# SDK's run_stdio_async does not read the verifier or the auth settings at all,
+# and the spec says a stdio server should take credentials from the
+# environment rather than follow the authorization spec. So an editor's config
+# can carry it harmlessly, or leave it out entirely.
+HTTP_TOKEN = os.environ.get("YTMEER_HTTP_TOKEN") or ""
+
+
+class StaticTokenVerifier(TokenVerifier):
+    """One shared secret, compared in constant time. No OAuth.
+
+    The spec makes authorization optional and its OAuth machinery opt-in, and
+    claude.ai's custom connectors can send a fixed Authorization header, so a
+    bearer token is the whole of what is needed here. Paired with
+    AuthSettings(resource_server_url=None) the SDK adds no OAuth routes - no
+    /authorize, /token, /register, and no protected-resource metadata
+    document - just the one /mcp endpoint behind an auth gate.
+    """
+
+    def __init__(self, token):
+        if not token:
+            raise ValueError("a bearer token must not be empty")
+        self._expected = token.encode("utf-8", "surrogateescape")
+
+    async def verify_token(self, token):
+        # compare_digest, so a wrong token cannot be found a character at a
+        # time by timing the replies.
+        if not secrets.compare_digest(token.encode("utf-8", "surrogateescape"),
+                                      self._expected):
+            return None
+        return AccessToken(token=token, client_id="ytmeer-static", scopes=[])
+
+
+def _http_auth(token):
+    """(token_verifier, AuthSettings) for the HTTP transport, or (None, None).
+
+    issuer_url is a required field that nothing reads in this configuration -
+    it is used only by the OAuth route builders, which are not built because
+    there is no auth_server_provider. resource_server_url MUST stay None:
+    giving it a real URL is what switches RFC 9728 discovery on.
+    """
+    if not token:
+        return None, None
+    return (StaticTokenVerifier(token),
+            AuthSettings(issuer_url="https://localhost/ytmeer-no-oauth",
+                         resource_server_url=None))
 
 INSTRUCTIONS = f"""\
 YTmeer researches YouTube with yt-dlp and downloads videos, on this machine.
@@ -138,8 +190,11 @@ async def _lifespan(_server) -> AsyncIterator[dict]:
     yield {}
 
 
+_VERIFIER, _AUTH = _http_auth(HTTP_TOKEN)
+
 mcp = MCPServer(SERVER_NAME, title="YTmeer", version=VERSION,
-                instructions=INSTRUCTIONS, lifespan=_lifespan)
+                instructions=INSTRUCTIONS, lifespan=_lifespan,
+                token_verifier=_VERIFIER, auth=_AUTH)
 
 # Every file kind api.folder_files reports. Named here so a video that is not
 # yet done still carries all of them as None - api.describe hands back an empty
@@ -783,19 +838,42 @@ def main(argv=None):
                                                      "(default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=None,
                         help="HTTP port (default 8765)")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="serve HTTP with no token. Loopback only, for a "
+                             "local test; never behind a tunnel")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     # Refused rather than ignored: silently accepting --port on the stdio path
     # leaves someone waiting on a port nothing is listening to.
-    if not args.http and (args.host is not None or args.port is not None):
-        parser.error("--host and --port need --http")
+    if not args.http and (args.host is not None or args.port is not None
+                          or args.no_auth):
+        parser.error("--host, --port and --no-auth need --http")
+
+    host = args.host or "127.0.0.1"
+    if args.http:
+        # Fail closed. This process shells out to yt-dlp, reads a cookies.txt
+        # holding a live YouTube session and reports paths from this disk, so an
+        # unauthenticated HTTP transport is not a default worth having - the
+        # earlier version of this file simply bound to localhost and left the
+        # token to the README, which is one forgotten flag away from an open
+        # server.
+        if not HTTP_TOKEN and not args.no_auth:
+            parser.error(
+                "--http needs a token. Make one and put it in the environment:\n"
+                "    export YTMEER_HTTP_TOKEN=\"$(python3 -c "
+                "'import secrets;print(secrets.token_urlsafe(32))')\"\n"
+                "  Callers then send it as:  Authorization: Bearer <token>\n"
+                "  For a local test with no token at all, pass --no-auth "
+                "(loopback only).")
+        if args.no_auth and host not in ("127.0.0.1", "::1", "localhost"):
+            parser.error(f"--no-auth serves no token, so it is loopback only; "
+                         f"--host {host} would put an open server on the network")
 
     _install_shutdown()
     if args.http:
-        host = args.host or "127.0.0.1"
         port = args.port or 8765
-        # Bound to localhost on purpose. Putting this on a public address needs
-        # a token check in front of it first - see the MCP section of README.md.
-        print(f"ytmeer MCP on http://{host}:{port}/mcp", file=sys.stderr)
+        guard = ("token required (Authorization: Bearer ...)" if HTTP_TOKEN
+                 else "NO AUTH - loopback only")
+        print(f"ytmeer MCP on http://{host}:{port}/mcp  [{guard}]", file=sys.stderr)
         mcp.run(transport="streamable-http", host=host, port=port)
     else:
         mcp.run()

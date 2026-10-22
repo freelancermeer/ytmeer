@@ -1189,17 +1189,74 @@ can open beats a URL it cannot.
 - **Jobs are stopped when the process exits**, so no download is left running
   unseen into a folder the next server thinks is free.
 
-### Remote, if you ever need it
+### Remote: claude.ai in a browser
 
-`python3 mcp_server.py --http` serves the same tools over streamable HTTP on
-`127.0.0.1:8765/mcp`, for a client that cannot launch a local process -
-claude.ai in a browser, for instance. That needs a public HTTPS URL in front of
-it, so read this first: a tunnel turns a tool that shells out to yt-dlp, reads
-your `cookies.txt` (a live YouTube session) and serves files off disk into
-something reachable from the internet. Before exposing it, add a bearer-token
-check inside the server, and IP-allowlist the client at the tunnel edge
-(Anthropic's outbound range is `160.79.104.0/23`). Local stdio needs none of
-this, which is why it is the default.
+A browser client cannot launch a process on this machine, so stdio is out. The
+server still runs here - what changes is only how it is reached:
+
+```
+claude.ai  →  https://ytmeer.yourdomain.com/mcp  →  Cloudflare edge
+                                                         │  the tunnel daemon's
+                                                         ▼  outbound connection
+                                   THIS MACHINE: cloudflared → 127.0.0.1:8765
+                                                → mcp_server.py --http → yt-dlp
+```
+
+**Read this first.** The useful tools over a browser are the ones that return
+**data**: `yt_search`, `yt_video`, `yt_channel`, `yt_channel_videos`,
+`yt_similar`, `yt_transcript`, `yt_comments`. The download tools still work,
+but the files land here and `yt_job_status` hands back absolute paths on *this*
+disk, which a browser cannot open. And the machine has to be awake with the
+tunnel up, or the connector simply fails.
+
+**1. A token. `--http` refuses to start without one.**
+
+```bash
+export YTMEER_HTTP_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+python3 mcp_server.py --http
+```
+
+Every request must then carry `Authorization: Bearer <token>`, checked with
+`secrets.compare_digest`. No OAuth: the server mounts `/mcp` and nothing else -
+no `/authorize`, no `/token`, no protected-resource metadata. `--no-auth`
+exists for a local test and is refused on any non-loopback address. stdio never
+consults the token, so the same variable can sit in an editor's config
+harmlessly.
+
+**2. A tunnel.** It must pass **Server-Sent Events** - streamable HTTP answers
+a POST with `text/event-stream`, and progress only flows that way.
+
+| | Cost | Stable URL | SSE |
+|---|---|---|---|
+| **Cloudflare named tunnel** | free, needs a domain on Cloudflare | yes | yes — **use this** |
+| Cloudflare *quick* tunnel | free, no domain | no | **no — disqualified**, their docs say Quick Tunnels do not support SSE |
+| ngrok | free: 1 GB/mo, 20k requests | mostly | undocumented; quickest to first byte |
+| Tailscale Funnel | free, no domain | yes | undocumented; no inbound ACL, so auth is all yours |
+
+```bash
+brew install cloudflared
+cloudflared tunnel login
+cloudflared tunnel create ytmeer
+# route ytmeer.yourdomain.com at http://127.0.0.1:8765, then:
+cloudflared tunnel run ytmeer
+```
+
+**3. The connector.** On claude.ai: **Customize → Connectors → Add custom
+connector**. URL `https://ytmeer.yourdomain.com/mcp` — do not end it in `/sse`,
+which selects the deprecated transport. Authentication **No sign-in**. Open
+**Request headers**, choose `authorization`, and paste `Bearer <your token>` -
+Claude adds no prefix, so the word `Bearer` goes in the value. Mark it
+Required.
+
+> Request headers is in beta and limited to some organizations. If that section
+> is missing, claude.ai cannot send a fixed header at all and this approach has
+> no way to authenticate - do not fall back to running it open.
+
+**4. Narrow it.** Anthropic's outbound MCP traffic comes from
+`160.79.104.0/21` (the `/23` is their *inbound* range - a different thing). One
+WAF rule allowing only that range makes the URL invisible to everyone else. The
+token stays the thing that actually guards the server; the allowlist is the
+second lock.
 
 ## Google Colab
 

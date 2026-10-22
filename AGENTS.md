@@ -617,6 +617,16 @@ Everything else is unchanged: the long-form floor, one in-process request at a
 time, the cost table in §5.4, and the limits in §10 all apply exactly as they do
 over HTTP.
 
+**Remote.** `--http` serves the same tools as streamable HTTP for a client that
+cannot launch a local process (claude.ai in a browser). It **refuses to start
+without `YTMEER_HTTP_TOKEN`**, and then requires
+`Authorization: Bearer <token>` on every request — no OAuth, just `/mcp`.
+`--no-auth` is loopback-only and refused on any other address. stdio never
+consults the token. Over a browser the data tools are the useful ones: a
+download still lands on *this* disk, and `yt_job_status` returns paths the
+browser cannot open. See the README's "Remote" section for the tunnel (it must
+pass SSE) and the connector setup.
+
 ## 12. One run per folder
 
 Two runs of the same kind in one folder would each truncate that kind's three
