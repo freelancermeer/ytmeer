@@ -2513,6 +2513,65 @@ def choose_folder(parent, folder_name, vid):
     return folder
 
 
+def stub_folder_names(vid):
+    """The names a failed attempt at this video would have given its folder.
+
+    With no metadata there is no title to name it after, so download_one falls
+    back to the id - and choose_folder appends " [<id>]" if something else
+    already sat there.
+    """
+    base = sanitize(f"video_{vid}")
+    return (base, f"{base} [{vid}]")
+
+
+def drop_stale_stub(vid, folder):
+    """Remove the error folder a failed first attempt left, once a retry has
+    finished the video somewhere else.
+
+    The final sweep gives what failed a fresh set of attempts. A video whose
+    METADATA fetch failed had no title, so its folder was named after the id;
+    the retry has the title, writes a differently-named folder, and the
+    id-named one is left behind reading "Status: ERROR" for a video that in
+    fact succeeded. It also turns up in the API's and MCP's file listings, and
+    in the folder the person opens.
+
+    Deliberately narrow, because this removes a directory: only one named
+    exactly after this video's id, holding nothing but a videoinfo.txt that
+    records THIS video as failed, and never the folder the video just landed
+    in. Anything else is left exactly where it is.
+    """
+    if not vid:
+        return
+    done = os.path.realpath(folder)
+    parent = channel_dir(None)            # where the attempt without metadata went
+    for name in stub_folder_names(vid):
+        stub = os.path.join(parent, name)
+        try:
+            if not os.path.isdir(stub) or os.path.realpath(stub) == done:
+                continue
+            held = set(os.listdir(stub))
+            if held - {".DS_Store"} != {"videoinfo.txt"}:
+                continue                  # it holds something this did not write
+            was = read_info(stub)
+            if (was.get("Status") != "ERROR"
+                    or video_id_from_url(was.get("Link", "")) != vid):
+                continue                  # not this video's own error record
+            for leftover in held:
+                os.remove(os.path.join(stub, leftover))
+            os.rmdir(stub)
+        except OSError as e:
+            # Nothing here is worth failing a finished download over.
+            log_debug("stale_stub_kept", stage="video", folder=rel(stub), error=str(e))
+        else:
+            log_debug("stale_stub_removed", stage="video", folder=rel(stub),
+                      kept=rel(folder))
+            # In --channel mode the attempt went under "Unknown Channel";
+            # rmdir drops it only if this stub was the last thing in it.
+            if os.path.realpath(parent) != os.path.realpath(DOWNLOAD_DIR):
+                with contextlib.suppress(OSError):
+                    os.rmdir(parent)
+
+
 # video id -> folder of a finished download. Built once at startup, then kept
 # up to date as videos complete, so resuming costs no rescans and no network.
 DONE_INDEX = {}
@@ -3009,6 +3068,7 @@ def download_one(url, index, total):
     # Register it so a link repeated later in this same run is skipped too.
     if vid:
         DONE_INDEX[vid] = folder
+        drop_stale_stub(vid, folder)      # an earlier attempt's error folder
     return "ok"
 
 
@@ -3098,6 +3158,7 @@ def transcript_only(folder, url, vid, title, info, bar):
     TRANSCRIPT_COUNT[0] += 1
     if vid:
         DONE_INDEX[vid] = folder          # a repeat of this link now skips
+        drop_stale_stub(vid, folder)      # an earlier attempt's error folder
     return "ok"
 
 

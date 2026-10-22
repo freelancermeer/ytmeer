@@ -492,7 +492,9 @@ to guess how a run was invoked. Then one event per stage: `sources_start`,
 `channel_start` / `channel_finish` (with the full per-reason tally),
 `search_start` / `search_finish`, `window_block` / `window_finish`,
 `search_dates`, `video_start` / `video_finish`, `caption_*`, `comments_*`,
-`extras_*`, and `command_start` / `command_finish` / `command_timeout` for
+`extras_*`, `stale_stub_removed` (the final sweep succeeded, so the failed
+attempt's `video_<id>` folder went — `stale_stub_kept` says when one could not
+be), and `command_start` / `command_finish` / `command_timeout` for
 **every** subprocess, with cookies and tokens redacted from the command line.
 
 ```bash

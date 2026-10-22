@@ -4801,5 +4801,128 @@ time.sleep(90)
             self.assertEqual(f.read().strip(), "SENTINEL")
 
 
+class TestStaleStub(unittest.TestCase):
+    """A failed metadata fetch names its folder after the video id; the final
+    sweep's retry has the title and writes a differently-named folder, leaving
+    the id-named one behind saying ERROR for a video that in fact succeeded.
+
+    Every "kept" test below matters more than the "removed" one: this function
+    deletes a directory, so it must do nothing at all unless the folder is
+    unmistakably one failed attempt's own error record.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self._saved = (d.DOWNLOAD_DIR, d.CHANNEL_MODE)
+        d.DOWNLOAD_DIR, d.CHANNEL_MODE = self.dir, False
+
+    def tearDown(self):
+        d.DOWNLOAD_DIR, d.CHANNEL_MODE = self._saved
+
+    def stub(self, name, vid, status="ERROR", extra=(), parent=None):
+        folder = os.path.join(parent or self.dir, name)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "videoinfo.txt"), "w", encoding="utf-8") as f:
+            f.write("Title:   Unknown Title\n"
+                    f"Link:    https://www.youtube.com/watch?v={vid}\n"
+                    f"Quality: FAILED\nStatus:  {status}\n")
+        for name in extra:
+            open(os.path.join(folder, name), "w").close()
+        return folder
+
+    def finished(self, title="The Real Title"):
+        folder = os.path.join(self.dir, title)
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    # ---------------------------------------------------------- it goes
+    def test_the_id_named_error_folder_is_removed(self):
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q")
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertFalse(os.path.exists(stub))
+
+    def test_a_ds_store_beside_it_does_not_save_it(self):
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q", extra=(".DS_Store",))
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertFalse(os.path.exists(stub))
+
+    def test_the_clash_suffixed_name_is_removed_too(self):
+        # choose_folder appends " [<id>]" when something else already sat there.
+        stub = self.stub("video_NiCgcUTL9_Q [NiCgcUTL9_Q]", "NiCgcUTL9_Q")
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertFalse(os.path.exists(stub))
+
+    # --------------------------------------------------------- it stays
+    def test_the_folder_the_video_landed_in_is_never_removed(self):
+        """The id-named folder can BE the finished one - a video whose title
+        really is unavailable still downloads."""
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q")
+        d.drop_stale_stub("NiCgcUTL9_Q", stub)
+        self.assertTrue(os.path.isfile(os.path.join(stub, "videoinfo.txt")))
+
+    def test_a_folder_holding_anything_else_is_left_alone(self):
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q",
+                         extra=("trans_something.txt",))
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertTrue(os.path.isdir(stub))
+
+    def test_a_record_that_is_not_an_error_is_left_alone(self):
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q", status="OK")
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertTrue(os.path.isdir(stub))
+
+    def test_another_videos_error_record_is_left_alone(self):
+        stub = self.stub("video_NiCgcUTL9_Q", "dQw4w9WgXcQ")
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertTrue(os.path.isdir(stub))
+
+    def test_a_real_titled_folder_is_never_a_candidate(self):
+        other = self.stub("Some Other Video", "NiCgcUTL9_Q")
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertTrue(os.path.isdir(other))
+
+    def test_an_unknown_id_does_nothing(self):
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q")
+        d.drop_stale_stub("", self.finished())
+        self.assertTrue(os.path.isdir(stub))
+
+    def test_a_missing_stub_is_not_an_error(self):
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())   # nothing to remove
+
+    # ------------------------------------------------- --channel layout
+    def test_in_channel_mode_the_stub_sits_under_unknown_channel(self):
+        """Without metadata there is no channel name either, so the attempt
+        went to <base>/Unknown Channel/video_<id>."""
+        d.CHANNEL_MODE = True
+        parent = os.path.join(self.dir, "Unknown Channel")
+        os.makedirs(parent, exist_ok=True)
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q", parent=parent)
+        landed = os.path.join(self.dir, "Veritasium", "The Real Title")
+        os.makedirs(landed, exist_ok=True)
+        d.drop_stale_stub("NiCgcUTL9_Q", landed)
+        self.assertFalse(os.path.exists(stub))
+        # It was the only thing in there, so the empty parent goes as well.
+        self.assertFalse(os.path.exists(parent))
+
+    def test_unknown_channel_is_kept_when_it_still_holds_something(self):
+        d.CHANNEL_MODE = True
+        parent = os.path.join(self.dir, "Unknown Channel")
+        os.makedirs(parent, exist_ok=True)
+        stub = self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q", parent=parent)
+        keep = self.stub("video_dQw4w9WgXcQ", "dQw4w9WgXcQ", parent=parent)
+        landed = os.path.join(self.dir, "Veritasium", "The Real Title")
+        os.makedirs(landed, exist_ok=True)
+        d.drop_stale_stub("NiCgcUTL9_Q", landed)
+        self.assertFalse(os.path.exists(stub))
+        self.assertTrue(os.path.isdir(keep))
+        self.assertTrue(os.path.isdir(parent))
+
+    def test_the_base_folder_itself_is_never_removed(self):
+        self.stub("video_NiCgcUTL9_Q", "NiCgcUTL9_Q")
+        d.drop_stale_stub("NiCgcUTL9_Q", self.finished())
+        self.assertTrue(os.path.isdir(self.dir))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

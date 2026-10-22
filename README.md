@@ -873,6 +873,14 @@ summary rather than burning attempts. Each keeps its own folder and
 `videoinfo.txt` naming the reason, so two dead links never overwrite each
 other's record.
 
+A video whose **metadata** lookup failed has no title yet, so that attempt's
+folder is named `video_<id>`. When the final sweep then succeeds it has the
+title, writes the properly named folder, and the `video_<id>` one is removed —
+it would otherwise sit there reading `Status: ERROR` for a video that worked,
+and show up in `/api/jobs/{id}/files`. Only that folder is removed, only when
+it holds nothing but its own failed `videoinfo.txt`; a video that genuinely
+ends up failing keeps its record.
+
 ### When something goes wrong
 
 Nothing in a batch takes the whole run down:
