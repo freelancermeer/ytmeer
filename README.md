@@ -1,3 +1,5 @@
+<img src="brand/ytmeer-logo.svg" alt="" width="230">
+
 # ytmeer - a YouTube toolkit
 
 A tool for **researching** YouTube, not only for downloading it. Built on
@@ -1034,6 +1036,17 @@ start; the reason is in `error`). `POST /stop` interrupts the downloader and the
 yt-dlp it is running, like Ctrl+C in a terminal; finished videos stay. Stopping
 the server stops its jobs the same way, so no download is left running unseen.
 
+**One download per folder, across every process.** Two runs in one folder would
+each truncate `download_log.txt`/`.json`/`.jsonl` at startup and then append, so
+neither summary would describe one run. Every run - a job, or `downloader.py`
+typed in a terminal - takes an exclusive lock on `<folder>/.ytmeer-download.lock`
+before touching a log, and the CLI exits **75** if it cannot. `POST /api/jobs`
+asks first and answers **409**, the same as a clash with one of its own jobs; a
+server's in-memory job table cannot see another process's, which is the hole this
+closes. The lock dies with the process, so a crash leaves nothing to clean up. A
+report keeps its own `report_*` logs and so may run alongside a download; two
+reports may not.
+
 `summary` is `null` when the downloader crashed or could not write it - the job is
 then `error`, with the reason in `error` - or when the job was stopped before the
 downloader had started.
@@ -1052,6 +1065,133 @@ otherwise save rotated cookies back into yours; one left by a run killed outrigh
 removed a day later). If the file cannot be
 read, or YouTube rejects it ("The page needs to be reloaded" - it was rotated after
 export, or is used from another IP), the run carries on without it and says so.
+
+## MCP
+
+`mcp_server.py` puts the whole toolkit inside an AI code editor: ask in English,
+and the editor's model calls the tools itself.
+
+**There is nothing to host.** An MCP server is not a web server - no port, no
+URL, no key, no cloud. The editor launches this file as a child process and
+talks to it over stdin/stdout, the way it already launches a language server.
+Downloads happen on this machine, into this machine's folders. Close the editor
+and the process goes with it.
+
+```bash
+python3 -m pip install --user --break-system-packages mcp
+```
+
+`mcp` **2.x** is required; the 1.x `FastMCP` class it replaced is gone. Both pip
+flags are needed on a Homebrew Python (PEP 668).
+
+### Register it
+
+One line for Claude Code:
+
+```bash
+claude mcp add -s user -t stdio ytmeer -- python3 "$PWD/mcp_server.py"
+```
+
+For the rest, paste the block into the file below. Use an **absolute** path for
+the script - a GUI editor starts its servers from an undefined working
+directory. Add `"env": {"YTDL_OUTDIR": "/path/to/your/folder"}` to choose where
+downloads land.
+
+| Editor | File | Top-level key |
+|---|---|---|
+| Claude Code | `~/.claude.json`, or `.mcp.json` in the repo | `mcpServers` |
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` | `mcpServers` |
+| **Antigravity** (IDE **and** `agy` CLI) | `~/.gemini/config/mcp_config.json`, or `.agents/mcp_config.json` per project | `mcpServers` |
+| Cursor | `~/.cursor/mcp.json`, or `.cursor/mcp.json` | `mcpServers` |
+| VS Code + Copilot | `.vscode/mcp.json` | **`servers`** |
+| Windsurf | `~/.config/devin/mcp_config.json` | `mcpServers` |
+| Zed | `~/.config/zed/settings.json` | **`context_servers`** |
+| Codex CLI | `~/.codex/config.toml` | `[mcp_servers.ytmeer]` |
+
+```json
+{
+  "mcpServers": {
+    "ytmeer": {
+      "command": "python3",
+      "args": ["/ABSOLUTE/PATH/TO/mcp_server.py"]
+    }
+  }
+}
+```
+
+Three keys differ and that is the usual reason a server "does not appear": VS
+Code wants `servers` plus `"type": "stdio"`, Zed wants `context_servers` and no
+`type` at all, and everyone else wants `mcpServers`. Antigravity's remote form
+uses `serverUrl` - `url` and `httpUrl` are not supported there.
+
+### The tools
+
+Same split as the REST API: an answer comes back in the response, a file is a job.
+
+| Tool | What it answers |
+|---|---|
+| `yt_health` | which external tools are on PATH, where downloads go, is there a cookies.txt |
+| `yt_search` | a YouTube search - link, title, views, channel, length, publish date |
+| `yt_video` | one video's details |
+| `yt_channel` | a channel's averages, uploads/week, first/last upload, outliers |
+| `yt_channel_videos` | its long videos, each with its ratio to the channel's own average |
+| `yt_channel_playlists` | its playlists, split into long videos and short-form |
+| `yt_similar` | videos like this one |
+| `yt_resolve` | the channel behind any link |
+| `yt_transcript` | a transcript as text - no files, no job |
+| `yt_comments` | a video's comments, threaded |
+| `yt_preview` | what a channel link would download, without downloading |
+| `yt_download` | start a download; answers at once with a `job_id` |
+| `yt_job_status` | progress, finished videos, **absolute paths** to every file, failures |
+| `yt_job_files` | everything on disk in the job's folder |
+| `yt_job_stop` | Ctrl+C the job; finished videos stay |
+| `yt_jobs` / `yt_job_forget` | list the jobs this process started; drop one |
+
+The `AGENTS.md` rules are written into the tool descriptions, so the model
+follows them without reading that file: long-form only, an outlier ratio is
+relative to its own channel, `--channel-videos` carries no dates, and
+`found: 0` with `date_capped` is "did not look far enough", not "nothing was
+published".
+
+A download is deliberately start-and-poll: a run takes minutes, so
+`yt_download` returns immediately and `yt_job_status` is polled. Each finished
+video arrives with absolute paths - the editor is on this machine, so a path it
+can open beats a URL it cannot.
+
+### Environment
+
+| Variable | Default | What it does |
+|---|---|---|
+| `YTDL_OUTDIR` | `./downloads` | where downloads go, and where `cookies.txt` is looked for. Read at import, so set it in the editor's `env` block |
+| `YTMEER_BUSY_WAIT` | `90` | seconds a tool waits when another tool holds the engine. The REST API uses 5, because a queued HTTP request would hit a proxy timeout; over stdio there is none |
+| `YTMEER_MAX_JOBS` | `50` | finished jobs kept in memory. Files are never touched |
+
+### Notes
+
+- **One answer-tool at a time.** They share the engine's module globals, so a
+  second call waits for the first. Every call resets every global it can set,
+  so nothing leaks between them.
+- **Each editor gets its own process**, so the job table is not shared between
+  them and is empty after a restart. The files on disk are shared, and
+  `yt_job_files` still finds them.
+- **PATH is widened at startup** (`/opt/homebrew/bin` and friends), because a
+  GUI editor starts its servers from a login-less environment where
+  `shutil.which("yt-dlp")` would otherwise find nothing. `yt_health` reports
+  what was actually found.
+- **Jobs are stopped when the process exits**, so no download is left running
+  unseen into a folder the next server thinks is free.
+
+### Remote, if you ever need it
+
+`python3 mcp_server.py --http` serves the same tools over streamable HTTP on
+`127.0.0.1:8765/mcp`, for a client that cannot launch a local process -
+claude.ai in a browser, for instance. That needs a public HTTPS URL in front of
+it, so read this first: a tunnel turns a tool that shells out to yt-dlp, reads
+your `cookies.txt` (a live YouTube session) and serves files off disk into
+something reachable from the internet. Before exposing it, add a bearer-token
+check inside the server, and IP-allowlist the client at the tunnel edge
+(Anthropic's outbound range is `160.79.104.0/23`). Local stdio needs none of
+this, which is why it is the default.
 
 ## Google Colab
 
@@ -1109,9 +1249,21 @@ quietly invalidates the exported copy.
 python3 test_downloader.py    # the engine, through both the macOS and Windows code paths
 python3 test_api.py           # the API's logic - standard library only
 python3 test_api_routes.py    # the API over HTTP against a stand-in downloader (fastapi + httpx)
+python3 -m pytest test_mcp_server.py -q         # the MCP server (needs mcp>=2.3)
 ```
 
 No network and no downloads.
+
+`test_mcp_server.py` covers what that layer is responsible for rather than the
+engine: every tool registers with a schema and a read-only hint that matches
+what it does, nothing but JSON-RPC reaches the wire, SIGTERM leaves promptly
+with a call in flight, a record carries every file key even for a video that
+failed, and `yt_download` refuses a flag that means nothing without a search.
+Its three tests that talk to YouTube are skipped unless you ask for them:
+
+```bash
+python3 -m pytest test_mcp_server.py -q -m network
+```
 
 ## Notes
 

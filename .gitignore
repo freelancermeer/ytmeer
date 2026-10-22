@@ -30,3 +30,7 @@ api.log
 
 # Gradio writes this when api.py --share runs from the repo folder
 .gradio/
+
+# The per-folder run locks (downloader.py hold_folder): advisory, and they die
+# with the process, so there is never anything to commit or clean up.
+.ytmeer-*.lock

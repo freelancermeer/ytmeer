@@ -3829,10 +3829,12 @@ class PlatformCase:
         documented = set(re.findall(r"(--[a-z][a-z-]+)", text))
         missing = sorted(real - documented)
         self.assertEqual(missing, [], f"AGENTS.md documents no: {missing}")
-        # The manual also shows api.py's own flags and a curl invocation, so
-        # those are not downloader flags it invented.
+        # The manual also shows api.py's own flags, a curl invocation and the
+        # pip command that installs the MCP server's one dependency, so those
+        # are not downloader flags it invented.
         elsewhere = {"--new-key", "--share", "--port", "--outdir",
-                     "--data-urlencode"}
+                     "--data-urlencode",
+                     "--user", "--break-system-packages"}
         invented = sorted(documented - real - elsewhere)
         self.assertEqual(invented, [],
                          f"AGENTS.md documents flags the downloader does not have:"
@@ -4690,6 +4692,113 @@ class TestMacOS(PlatformCase, unittest.TestCase):
 
 class TestWindows(PlatformCase, unittest.TestCase):
     WINDOWS = True
+
+
+class TestFolderLock(unittest.TestCase):
+    """Two runs of the same kind in one folder used to truncate each other.
+
+    Each truncates its own three logs at startup and then appends, so both
+    runs' records interleave and neither summary describes one run. The lock
+    lives in the writer - downloader.main() - because api.start_job's clash
+    check only sees its own process's jobs, so a second server, or a plain CLI
+    run beside a server's job, walked straight into it.
+    """
+
+    HOLDER = """
+import os, sys, time
+sys.path.insert(0, %r)
+import downloader
+print("HELD" if not downloader.hold_folder(sys.argv[1], sys.argv[2]) else "BUSY", flush=True)
+time.sleep(90)
+"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def holder(self, stem="download"):
+        """Another process holding the lock, so the race is deterministic."""
+        code = self.HOLDER % os.path.dirname(os.path.abspath(d.__file__))
+        proc = subprocess.Popen([sys.executable, "-c", code, self.dir, stem],
+                                stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "HELD")
+        return proc
+
+    def test_a_free_folder_is_not_busy(self):
+        self.assertFalse(d.folder_busy(self.dir))
+
+    def test_a_folder_that_does_not_exist_is_not_busy(self):
+        # Nothing can be running in it, and the run's own "directory not found"
+        # is the error worth reporting.
+        self.assertFalse(d.folder_busy(os.path.join(self.dir, "nope")))
+
+    def test_asking_does_not_take_the_lock(self):
+        for _ in range(3):
+            self.assertFalse(d.folder_busy(self.dir))
+        self.assertEqual(d.hold_folder(self.dir), "")
+
+    def test_a_second_run_of_the_same_kind_is_refused(self):
+        self.holder("download")
+        self.assertTrue(d.folder_busy(self.dir))
+        message = d.hold_folder(self.dir, "download")
+        self.assertIn("already working in", message)
+        self.assertIn(self.dir, message)
+
+    def test_a_report_and_a_download_do_not_collide(self):
+        """By design: a report writes only its own report_* logs, so the two
+        are deliberately allowed to run together."""
+        self.holder("download")
+        self.assertFalse(d.folder_busy(self.dir, "report"))
+        self.assertEqual(d.hold_folder(self.dir, "report"), "")
+
+    def test_two_reports_do_collide(self):
+        self.holder("report")
+        self.assertTrue(d.folder_busy(self.dir, "report"))
+
+    def test_the_lock_dies_with_its_process(self):
+        proc = self.holder("download")
+        self.assertTrue(d.folder_busy(self.dir))
+        proc.kill()
+        proc.wait()
+        # An advisory lock on a descriptor, not a pidfile: a crashed or killed
+        # run leaves nothing stale to clean up.
+        self.assertFalse(d.folder_busy(self.dir))
+
+    def test_the_lock_is_named_after_the_kind_of_run(self):
+        self.assertTrue(d.folder_lock_path(self.dir, "download")
+                        .endswith(".ytmeer-download.lock"))
+        self.assertNotEqual(d.folder_lock_path(self.dir, "download"),
+                            d.folder_lock_path(self.dir, "report"))
+
+    def test_a_folder_it_cannot_lock_still_runs(self):
+        """The lock guards a rare collision; it must not become a new way to
+        fail. A folder that cannot be written is not reported as busy."""
+        locked = os.path.join(self.dir, "readonly")
+        os.mkdir(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        self.assertFalse(d.folder_busy(locked))
+        self.assertEqual(d.hold_folder(locked), "")
+
+    def test_the_cli_refuses_with_a_retryable_exit_code(self):
+        self.holder("download")
+        with open(os.path.join(self.dir, "links.txt"), "w") as f:
+            f.write("dQw4w9WgXcQ\n")
+        sentinel = os.path.join(self.dir, "download_log.txt")
+        with open(sentinel, "w") as f:
+            f.write("SENTINEL\n")
+        done = subprocess.run(
+            [sys.executable, d.__file__, self.dir, "--yes", "--dry-run"],
+            capture_output=True, text=True, timeout=120)
+        # 75 is EX_TEMPFAIL: the run was never attempted, so it is worth a
+        # retry - unlike 1, which means something was tried and failed.
+        self.assertEqual(done.returncode, d.BUSY_EXIT)
+        self.assertIn("already working in", done.stdout + done.stderr)
+        # The whole point: it stopped before truncating anything.
+        with open(sentinel) as f:
+            self.assertEqual(f.read().strip(), "SENTINEL")
 
 
 if __name__ == "__main__":

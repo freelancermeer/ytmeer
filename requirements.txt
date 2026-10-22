@@ -22,3 +22,12 @@ curl_cffi>=0.10,<0.16
 #   fastapi
 #   uvicorn
 #   gradio>=6,<7          # only for `api.py --share`, the public link (brings the two above)
+
+# Optional - only for the MCP server (mcp_server.py), which puts the toolkit in
+# Claude Code, Antigravity, Cursor, VS Code and the rest. Commented for the same
+# reason: a terminal-only install needs none of it. See "MCP" in README.md.
+#   mcp>=2.3              # NOTE: 2.x only. FastMCP was removed; the class is MCPServer
+#
+# On a Homebrew Python this needs both flags, because the interpreter is marked
+# externally managed (PEP 668) and plain --user is refused as well:
+#   python3 -m pip install --user --break-system-packages mcp

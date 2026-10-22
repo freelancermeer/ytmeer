@@ -6,6 +6,7 @@ written to be sufficient on its own. `README.md` is the human version.
 ```
 downloader.py   the command line — one folder per run
 api.py          a local REST API over the same engine
+mcp_server.py   the same engine as MCP tools, for an AI code editor — §11
 ```
 
 ---
@@ -552,13 +553,18 @@ seeing the plan, or when running unattended.
 The CLI exits **0** only when the run did what was asked. **1** when any link
 failed, any link was refused, or the worklist was empty (an empty `links.txt`,
 a search that matched nothing, a report with nothing to report). **130** when
-it was stopped with Ctrl+C. A `--dry-run` that finds nothing new is still 0.
+it was stopped with Ctrl+C. **75** when another run of the same kind already
+holds the folder (§12) — the only code that means *nothing was attempted*, so
+it is the only one worth simply retrying. A `--dry-run` that finds nothing new is still 0.
 `download_log.json` / `report_log.json` carries the same facts as `failed`,
 `refused_links` and `stopped_early`.
 
 ## 10. Limits — know these before promising anything
 
 - **Long videos only** (§0). Short-form is excluded from every number.
+- **One download per folder, across every process** (§12). A second one exits
+  75 rather than mixing its logs into the first's. A report may still run
+  alongside a download; two reports may not.
 - **One in-process API request at a time** (§4.1).
 - **`--channel-videos` returns no publish dates** at all (§5.3).
 - **`published` is `null`** on a search unless dates were fetched (§5.3).
@@ -572,3 +578,75 @@ it was stopped with Ctrl+C. A `--dry-run` that finds nothing new is still 0.
 - **Public data only.** There is no access to anyone's private analytics,
   revenue, retention or demographics. Revenue and RPM are not estimated here at
   all — if a number like that is wanted, this tool does not have it.
+
+## 11. MCP — the same toolkit inside an editor
+
+`mcp_server.py` exposes this engine as **17 MCP tools** over stdio. It is not a
+server to host: the editor launches it as a child process and talks over
+stdin/stdout. Needs `mcp>=2.3` (`pip install --user --break-system-packages mcp`).
+
+```bash
+claude mcp add -s user -t stdio ytmeer -- python3 "$PWD/mcp_server.py"
+```
+
+The same split as the REST API — an answer comes back, a file is a job:
+
+| Tools | Maps to |
+|---|---|
+| `yt_health` | `GET /api/health` |
+| `yt_search` | `GET /api/search` |
+| `yt_video`, `yt_transcript`, `yt_comments`, `yt_resolve` | the video lookups |
+| `yt_channel`, `yt_channel_videos`, `yt_channel_playlists`, `yt_similar`, `yt_preview` | the channel lookups |
+| `yt_download`, `yt_job_status`, `yt_job_files`, `yt_job_stop`, `yt_jobs`, `yt_job_forget` | `/api/jobs*` |
+
+Three things differ from the REST API, deliberately:
+
+- **Absolute paths, not URLs.** The editor is on this machine, so
+  `yt_job_status` hands over `/Users/…/Title.mp4` rather than
+  `/jobs/{id}/files/…`. There is no file-download tool; the editor opens the path.
+- **A busy engine waits, it does not fail.** `YTMEER_BUSY_WAIT` (default 90s)
+  replaces the API's 5s, which existed because a queued HTTP request would hit a
+  proxy timeout. Over stdio there is no proxy, and an agent comparing two
+  channels fires both calls at once.
+- **§0, §5.1, §5.2 and §5.3 are written into the tool descriptions**, so a model
+  in another editor follows them without having read this file.
+
+Everything else is unchanged: the long-form floor, one in-process request at a
+time, the cost table in §5.4, and the limits in §10 all apply exactly as they do
+over HTTP.
+
+## 12. One run per folder
+
+Two runs of the same kind in one folder would each truncate that kind's three
+logs at startup and then append to them, so both runs' records interleave and
+neither summary describes one run. So a run takes an exclusive lock on
+`<folder>/.ytmeer-<kind>.lock` before it touches a single log, and exits **75**
+if it cannot (§9).
+
+**One lock per KIND of run, not per folder.** A report writes only its own
+`report_*` logs (§1), so it collides with nothing a download writes:
+
+| | second run | |
+|---|---|---|
+| download | download | **refused**, exit 75 |
+| report | report | **refused**, exit 75 |
+| download | report | allowed, deliberately |
+
+`--dry-run` takes the lock too, because it writes the plan into
+`download_log.json`. A report's lookups over the REST API take nothing: they
+write no files at all (§1).
+
+The lock is advisory and lives on an open descriptor, so it **dies with the
+process** — a crashed or `SIGKILL`ed run leaves nothing stale to clean up, and
+there is no lock file to delete by hand. A folder that cannot be written is not
+reported as busy: the lock guards a rare collision and must never become a new
+way to fail.
+
+**Over the REST API and MCP.** `POST /api/jobs` and `yt_download` ask before
+starting, so a folder another process holds is refused up front — a `409`, the
+same answer as a clash with one of that server's own jobs, rather than a job
+that starts and immediately errors. Their in-memory job tables are per process
+and cannot see each other, which is exactly the hole this closes: two editors
+each running `mcp_server.py`, or a plain CLI run beside a server's job. If the
+lock is lost in the race between asking and starting, the job ends `error` with
+`another download run holds <folder>, so this job wrote nothing`.

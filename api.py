@@ -777,7 +777,13 @@ def _pump(job):
             last = [line for line in job["log"] if line.strip()][-3:]
         # A stop that lands while the downloader is still starting up exits non-zero
         # too; that is the stop, not a crash.
-        if proc.returncode != 0 and not job["stop_requested"]:
+        if proc.returncode == downloader.BUSY_EXIT and not job["stop_requested"]:
+            # It refused the folder before touching anything, so this is not a
+            # crash and the job wrote nothing - say that rather than report an
+            # exit code the caller would have to look up.
+            error = (f"another download run holds {job['outdir']}, so this job "
+                     f"wrote nothing. Wait for it, or use another folder")
+        elif proc.returncode != 0 and not job["stop_requested"]:
             error = (f"the downloader exited with code {proc.returncode}"
                      + (": " + " | ".join(l.strip() for l in last) if last else ""))
     except Exception as e:                # never leave a job "running" for ever
@@ -807,6 +813,16 @@ def start_job(opts):
         if clash:
             raise RuntimeError(f"job {clash['job_id']} is already running in "
                                f"{outdir}; use another folder or stop it first")
+        # And a run this server cannot see: another server's job, or a plain
+        # CLI run in the same folder. JOBS is per process, so the check above
+        # is blind to those - and both runs would truncate the same three logs
+        # and then append to them. The downloader takes the real lock as it
+        # starts; asking here only turns it into a refusal now rather than a
+        # job that starts and immediately ends in error.
+        if downloader.folder_busy(outdir):
+            raise RuntimeError(f"another download run is already working in "
+                               f"{outdir} - not one of this server's. Wait for "
+                               f"it, or start this job in another folder")
         links_file = write_inputs(outdir, opts["links"], opts["skip"])
         job_id = "job_" + secrets.token_hex(4)
         try:

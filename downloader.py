@@ -5786,6 +5786,81 @@ def use_utf8_output():
             pass
 
 
+BUSY_EXIT = 75             # EX_TEMPFAIL: the run was never attempted, so retry
+FOLDER_LOCK = [None]       # the held descriptor; closing it would release the lock
+
+
+def folder_lock_path(folder, stem="download"):
+    """The lock file for one KIND of run in a folder.
+
+    One lock per kind, not one per folder. A report writes only its own
+    report_* logs (see the stem in main()), so it collides with nothing a
+    download writes and the two are deliberately allowed to run together -
+    that separation is the whole point of the two names. Two downloads, or two
+    reports, DO collide: each truncates its own three logs at startup and then
+    appends, so the records interleave and neither summary describes one run.
+    """
+    return os.path.join(folder, f".ytmeer-{stem}.lock")
+
+
+def _lock_descriptor(folder, stem):
+    """(fd, taken) for the folder's lock, without blocking.
+
+    fd is None when locking is not available here at all - a folder that
+    cannot be written, or a platform with neither fcntl nor msvcrt. taken is
+    False when another run of this kind holds it.
+
+    An advisory lock on an open descriptor, not a pidfile: it dies with the
+    process, so a crashed or SIGKILLed run leaves nothing stale to clean up.
+    """
+    try:
+        fd = os.open(folder_lock_path(folder, stem), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None, True                 # cannot make one; better to run than refuse
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:                   # no locking on this platform
+        os.close(fd)
+        return None, True
+    except OSError:                       # someone else holds it
+        os.close(fd)
+        return fd, False
+    return fd, True
+
+
+def folder_busy(folder, stem="download"):
+    """Whether another run of this kind holds the folder. Never keeps the lock.
+
+    For a caller that wants to refuse up front - api.start_job - rather than
+    start a run that immediately exits. The held lock in the run itself is the
+    authority; this only answers sooner.
+    """
+    fd, taken = _lock_descriptor(folder, stem)
+    if fd is not None and taken:
+        os.close(fd)                      # release at once: this was only a question
+    return not taken
+
+
+def hold_folder(folder, stem="download"):
+    """Hold the folder for this run. "" when held, else why it could not be.
+
+    The descriptor is kept open in FOLDER_LOCK for the life of the process.
+    """
+    fd, taken = _lock_descriptor(folder, stem)
+    if not taken:
+        return (f"another {stem} run is already working in {folder}\n"
+                f"       Wait for it, or use a different folder. "
+                f"(Its lock: {os.path.basename(folder_lock_path(folder, stem))})")
+    if fd is not None:
+        FOLDER_LOCK[0] = fd
+    return ""
+
+
 def stop_on_sigterm(signum, frame):
     """A plain kill ends the run like an exit, so the private cookie copy is removed.
 
@@ -5930,6 +6005,15 @@ def main():
     # whatever download last ran in the folder, which the manual promises it
     # never touches.
     stem = "report" if REPORT else "download"
+    # Before a single log is truncated: two runs of the same kind in one folder
+    # each truncate these three files and then append, so both runs' records
+    # interleave and neither summary describes one run. api.start_job's clash
+    # check sees only its own process's jobs, so a second server - or a plain
+    # CLI run beside a server job - used to walk straight into this.
+    busy = hold_folder(DOWNLOAD_DIR, stem)
+    if busy:
+        print(f"\nERROR: {busy}")
+        sys.exit(BUSY_EXIT)
     LOG_FILE[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_log.txt")
     LOG_JSON[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_log.json")
     LOG_JSONL[0] = os.path.join(DOWNLOAD_DIR, f"{stem}_log.jsonl")

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="YTmeer">
+  <title>YTmeer</title>
+  <rect x="6.1" y="27" width="7" height="14" rx="1.6" fill="#8B949E"/>
+  <rect x="15.7" y="24" width="7" height="17" rx="1.6" fill="#8B949E"/>
+  <path d="M25.3 14.2 L28.8 9.4 L32.3 14.2 L32.3 39.4 A1.6 1.6 0 0 1 30.7 41 L26.9 41 A1.6 1.6 0 0 1 25.3 39.4 Z" fill="#F25C2A"/>
+  <rect x="34.9" y="29" width="7" height="12" rx="1.6" fill="#8B949E"/>
+  <path d="M4 22 H44" stroke="#8B949E" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 3.4"/>
+</svg>

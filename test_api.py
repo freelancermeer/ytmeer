@@ -6,6 +6,9 @@
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -870,6 +873,61 @@ class TestJobRecords(unittest.TestCase):
             self.assertEqual(api.job_records(job)[1], [{"url": "x", "status": "ok"}])
         finally:
             api.read_stream = saved
+
+
+class TestCrossProcessFolderLock(unittest.TestCase):
+    """start_job's own clash check is blind to other processes.
+
+    JOBS is per process, so a second server - or a plain CLI run in the same
+    folder - used to start beside a live job and truncate the same three logs.
+    The downloader takes the real lock as it starts; asking here turns that
+    into a refusal now (a 409) rather than a job that starts and ends in error.
+    """
+
+    HOLDER = """
+import os, sys, time
+sys.path.insert(0, %r)
+import downloader
+print("HELD" if not downloader.hold_folder(sys.argv[1], "download") else "BUSY", flush=True)
+time.sleep(90)
+"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.saved_out, api.DEFAULT_OUT = api.DEFAULT_OUT, self.dir
+        self.addCleanup(setattr, api, "DEFAULT_OUT", self.saved_out)
+
+    def hold(self):
+        import downloader
+        code = self.HOLDER % os.path.dirname(os.path.abspath(downloader.__file__))
+        proc = subprocess.Popen([sys.executable, "-c", code, self.dir],
+                                stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "HELD")
+
+    def test_a_folder_another_process_holds_is_refused(self):
+        self.hold()
+        opts = api.normalize_request({"links": "dQw4w9WgXcQ"})
+        with self.assertRaises(RuntimeError) as caught:
+            api.start_job(opts)
+        self.assertIn("not one of this server's", str(caught.exception))
+
+    def test_it_refuses_before_writing_anything(self):
+        """The refusal must leave no links file and no job behind."""
+        self.hold()
+        before = set(os.listdir(self.dir))
+        jobs_before = set(api.JOBS)
+        with self.assertRaises(RuntimeError):
+            api.start_job(api.normalize_request({"links": "dQw4w9WgXcQ"}))
+        self.assertEqual(set(os.listdir(self.dir)), before)
+        self.assertEqual(set(api.JOBS), jobs_before)
+
+    def test_a_free_folder_still_passes_the_check(self):
+        # The guard must not refuse the ordinary case.
+        self.assertFalse(api.downloader.folder_busy(self.dir))
 
 
 if __name__ == "__main__":
