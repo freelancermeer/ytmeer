@@ -107,6 +107,10 @@ class PlatformCase:
         d.SEARCH_FOUND[0] = 0
         d.REFUSED_LINKS[0] = 0
         d.EXIT_CODE[0] = 0
+        # A 429 one test provokes must not pause the caption fetches of the next.
+        d.RATE_LIMITED.clear()
+        d.RATE_LIMITED_LINE[0] = ""
+        d.RATE_LIMITED_AT[0] = 0.0
 
     def tearDown(self):
         (d.IS_WINDOWS, d.NAME_LIMIT, d.TRANSCRIPT_WRAP,
@@ -1337,6 +1341,40 @@ class PlatformCase:
             d.po_token_first[0] = saved
         self.assertEqual(len(runs), 2)
         self.assertIn("youtube:player_client=mweb,default", runs[1])
+
+    def test_a_429_on_a_caption_stops_the_asking(self):
+        # 2026-11-08: YouTube answered every caption of a batch with HTTP 429.
+        # Each video still asked every track, route and attempt again (~16
+        # yt-dlp runs a video), and every ask makes such a block last longer.
+        runs = []
+
+        class Refused:
+            returncode = 1
+            stdout = ""
+            stderr = ("ERROR: Unable to download video subtitles for 'en': "
+                      "HTTP Error 429: Too Many Requests\n")
+
+        real, candidates = d.subprocess.run, d.caption_candidates
+        d.subprocess.run = lambda cmd, *a, **k: runs.append(cmd) or Refused()
+        d.caption_candidates = lambda url, info: iter(
+            [("en", "auto", []), ("en-orig", "auto", []), ("en", "manual", [])])
+        self.addCleanup(lambda: setattr(d.subprocess, "run", real))
+        self.addCleanup(lambda: setattr(d, "caption_candidates", candidates))
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(d.best_caption_entries(folder, "u1", {}), [])
+            self.assertEqual(len(runs), 1, "one 429 is enough: no other track, route or attempt")
+            self.assertEqual(d.best_caption_entries(folder, "u2", {}), [])
+            self.assertEqual(len(runs), 1, "the next video does not ask either")
+        for url in ("u1", "u2"):
+            said = d.required_caption_error(url)
+            self.assertIn("HTTP Error 429: Too Many Requests", said)
+            self.assertIn("Wait an hour or two, then run again", said)
+        self.assertEqual(d.required_caption_error("u3"), "Could not download required 'en' captions")
+        # The pause ends on its own: a long-running API server asks again later.
+        d.RATE_LIMITED_AT[0] -= d.RATE_LIMIT_PAUSE + 1
+        with tempfile.TemporaryDirectory() as folder:
+            d.best_caption_entries(folder, "u3", {})
+        self.assertEqual(len(runs), 2)
 
     def test_a_caller_that_knows_the_client_is_trusted(self):
         runs = self._record_runs()

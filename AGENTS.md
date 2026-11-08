@@ -465,6 +465,14 @@ Transcript: `text` is the grouped form with `[hh:mm:ss]` stamps, `words` is one
 word per line with milliseconds. `words` is `null` with the reason in `note`
 when YouTube has no auto-generated track.
 
+An error starting `YouTube refused the 'en' captions (HTTP Error 429 ...)` means
+YouTube rate-limited this computer's captions. The first 429 stops every caption
+ask for 30 minutes (`RATE_LIMIT_PAUSE`), because each ask makes the block last
+longer. **Do not retry it, and do not reach for another route or client: only
+time lifts it.** Wait an hour or two. Video pages and downloads still work
+meanwhile; only captions are refused. The trace shows `caption_skipped` for each
+ask the pause held back.
+
 Comments: `total_on_video` vs `fetched` shows what the limit left behind.
 `threads` is nested — each top-level comment carries `author`, `likes`,
 `published` (PKT), `text`, and its `replies`.

@@ -673,6 +673,17 @@ the media is kept but the video remains retryable; the next run tries the
 caption routes again. Use `--no-subs` only when captions are intentionally not
 needed.
 
+**The first 429 stops the asking.** For 30 minutes no other track, route or
+video asks YouTube for a caption, because every ask makes such a block last
+longer. Each video that was touched says:
+
+`YouTube refused the 'en' captions (HTTP Error 429: Too Many Requests): this computer asked YouTube too often. Wait an hour or two, then run again`
+
+Another route or client does not lift the block, because YouTube refuses this
+computer's captions, not one route. On 2026-11-08 these all got the same 429:
+web, android and ios, IPv4, and a newer yt-dlp. The transcript panel answered
+400. Video pages and downloads still worked. Time is the only fix.
+
 **Backfill:** if a video is already downloaded but has no `trans_*.txt`, re-running builds the transcripts for it without re-downloading the video.
 
 ### When there is no words_ file
@@ -821,7 +832,8 @@ The startup banner shows whether the script was found.
 
 HTTP 429 is a YouTube subtitle rate limit, not the PO-token 403 gate. The code
 requests only the selected language, uses the subtitle PO-token route first, and
-keeps the mweb/default routes as fallbacks.
+keeps the mweb/default routes as fallbacks. On a 429 it tries no other route:
+it stops asking (see [Transcripts](#transcripts)).
 
 > Avoid the browser-based providers (e.g. `yt-dlp-getpot-wpc`) — they open a
 > Chrome window for every video that needs a token, and cannot run headless.

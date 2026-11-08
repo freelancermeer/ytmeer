@@ -2037,6 +2037,31 @@ def choose_caption(url, info):
     return lang, source, []
 
 
+# YouTube's "HTTP Error 429: Too Many Requests" on a caption means this computer
+# (its internet address) asked YouTube too often. On 2026-11-08 every video of a
+# batch got it, and each video still asked every track, route and attempt again:
+# about 16 more yt-dlp runs a video, and every one makes such a block last
+# longer. So the first 429 stops the asking: no caption is asked of YouTube for
+# RATE_LIMIT_PAUSE seconds, and each video it touched says why it has no
+# transcript (RATE_LIMITED: {url: YouTube's words}). The pause ends on its own,
+# so a long-running API server asks again later instead of refusing for good.
+RATE_LIMITED = {}
+RATE_LIMITED_LINE = [""]       # YouTube's last 429 line
+RATE_LIMITED_AT = [0.0]        # time.monotonic() of it
+RATE_LIMIT_PAUSE = 1800
+
+
+def caption_429(error_text):
+    """YouTube's 429 line in a caption fetch's error output, "" when there is none."""
+    return next((line.replace("ERROR:", "").strip() for line in (error_text or "").splitlines()
+                 if "HTTP Error 429" in line), "")
+
+
+def caption_paused():
+    """True while a 429 from YouTube is less than RATE_LIMIT_PAUSE seconds old."""
+    return bool(RATE_LIMITED_LINE[0]) and time.monotonic() - RATE_LIMITED_AT[0] < RATE_LIMIT_PAUSE
+
+
 def fetch_caption(folder, url, lang, source, client=()):
     """Download one caption track into the folder. True if a json3 arrived.
 
@@ -2045,6 +2070,11 @@ def fetch_caption(folder, url, lang, source, client=()):
     to the PO-token client. A caller that already knows which client can see the
     track passes it, and that one is used as given.
     """
+    if caption_paused():
+        RATE_LIMITED[url] = RATE_LIMITED_LINE[0]
+        log_debug("caption_skipped", stage="caption", url=url, folder=rel(folder),
+                  language=lang, source=source, rate_limited=RATE_LIMITED_LINE[0])
+        return False
     flags = sub_flags(lang, source)
     if not flags:
         return False
@@ -2088,6 +2118,13 @@ def fetch_caption(folder, url, lang, source, client=()):
                 log_debug("caption_finish", stage="caption", url=url, folder=rel(folder),
                           success=True, language=lang, source=source)
                 return True
+            said = caption_429(out.stderr)
+            if said:
+                RATE_LIMITED[url] = RATE_LIMITED_LINE[0] = said
+                RATE_LIMITED_AT[0] = time.monotonic()
+                log_debug("caption_finish", stage="caption", url=url, folder=rel(folder),
+                          success=False, language=lang, source=source, rate_limited=said)
+                return False
             if not drop_rejected_cookies(out.stderr):
                 break
     log_debug("caption_finish", stage="caption", url=url, folder=rel(folder),
@@ -2150,8 +2187,13 @@ def build_transcripts(folder, url, info):
         clear_captions(folder)
 
 
-def required_caption_error():
-    """Error used when a required transcript could not be produced."""
+def required_caption_error(url=None):
+    """Error used when a required transcript could not be produced: YouTube's
+    429 and what to do about it when that is why."""
+    refused = RATE_LIMITED.get(url) if url else None
+    if refused:
+        return (f"YouTube refused the '{SUB_LANG}' captions ({refused}): this computer asked "
+                "YouTube too often. Wait an hour or two, then run again")
     return f"Could not download required '{SUB_LANG}' captions"
 
 
@@ -2177,6 +2219,7 @@ def best_caption_entries(folder, url, info):
     leaves no caption file behind, but produces no trans_/words_ files either -
     so a caller that wants the text itself rather than the files can use it.
     """
+    RATE_LIMITED.pop(url, None)             # an earlier ask's 429 is not this one's reason
     entries = take_caption(folder)          # whatever came down with the video
     if is_word_level(entries):
         return entries
@@ -2730,7 +2773,8 @@ def skip_finished(folder, url, bar=None):
             note(f"      + {os.path.basename(trans)} + "
                  f"{os.path.basename(words) if words else 'words_*.txt'}")
         else:
-            note("      (no transcript available)")
+            note(f"      (no transcript: {required_caption_error(url)})" if url in RATE_LIMITED
+                 else "      (no transcript available)")
 
     fields = read_info(folder)
     wants_thumb = SAVE_THUMBNAIL and not find_thumbnail(folder)
@@ -3017,7 +3061,7 @@ def download_one(url, index, total):
     if DOWNLOAD_SUBS:
         trans, words = build_transcripts(folder, url, info)
         if not trans:
-            err = required_caption_error()
+            err = required_caption_error(url)
             note(f"    ! {err}")
             bar.done(f"FAIL  {err}")
             write_info(folder, title, url, quality, "ERROR", error=err, info=info)
@@ -3098,7 +3142,7 @@ def transcript_only(folder, url, vid, title, info, bar):
     vfile = find_video_file(folder)
 
     if not trans:
-        err = required_caption_error()
+        err = required_caption_error(url)
         note(f"    ! {err}")
         bar.done(f"FAIL  {err}")
         if vfile:
@@ -4760,7 +4804,7 @@ def video_transcript(url):
     with scratch_dir() as folder:
         entries = best_caption_entries(folder, url, info)
     if not entries:
-        return None, required_caption_error()
+        return None, required_caption_error(url)
     word_level = is_word_level(entries)
     return {
         "id": info.get("id"),
