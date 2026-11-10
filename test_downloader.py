@@ -898,6 +898,41 @@ class PlatformCase:
                               "en-uYU": self._track("English - CC1")}}
         self.assertEqual(d.resolve_sub_lang(info), ("en", "auto"))
 
+    _TL = [{"ext": "json3", "name": "English",
+            "url": "https://www.youtube.com/api/timedtext?lang=de&tlang=en&fmt=json3"}]
+
+    def test_a_video_made_in_another_language_gets_its_own_track(self):
+        # 2026-11-10: translated "en" 429'd on 5 of 5 non-English videos; the
+        # video's own "<x>-orig" came down every time. No language is listed.
+        for lang in ("de", "ko", "es"):
+            info = {"language": lang, "automatic_captions": {
+                "en": self._TL, f"{lang}-orig": self._track("Original"), "fr": self._TL}}
+            self.assertEqual(d.resolve_sub_lang(info), (f"{lang}-orig", "auto"))
+
+    def test_spoken_language_found_without_the_language_field(self):
+        info = {"automatic_captions": {"en": self._TL, "ko-orig": self._track("Korean (Original)")}}
+        self.assertEqual(d.resolve_sub_lang(info), ("ko-orig", "auto"))
+
+    def test_a_dub_s_english_still_wins_over_the_default_audio(self):
+        info = {"language": "es-US", "automatic_captions": {
+            "es-orig": self._track("Spanish (Original)"), "en-orig": self._track("English (Original)"),
+            "pt-orig": self._track("Portuguese (Original)")}}
+        self.assertEqual(d.resolve_sub_lang(info), ("en-orig", "auto"))
+        self.assertEqual(d.ranked_tracks(info["automatic_captions"], "es-US"),
+                         ["en-orig", "es-orig", "pt-orig"], "the default audio before other dubs")
+
+    def test_spoken_manual_english_beats_another_language(self):
+        info = {"language": "de", "automatic_captions": {"de-orig": self._track("German (Original)")},
+                "subtitles": {"en": self._track("English")}}
+        self.assertEqual(d.resolve_sub_lang(info), ("en", "manual"))
+
+    def test_spoken_track_beats_a_translation_whatever_its_kind(self):
+        info = {"language": "de", "automatic_captions": {"en": self._TL},
+                "subtitles": {"de": self._track("German")}}
+        self.assertEqual(d.resolve_sub_lang(info), ("de", "manual"))
+        got = [(c, src) for c, src, _ in d.caption_candidates("u", info)]
+        self.assertEqual(got[-1], ("en", "auto"), "the translation is the last thing tried")
+
     def test_manual_captions_used_only_when_nothing_else(self):
         self.assertEqual(d.resolve_sub_lang({"subtitles": {"en": self._track("English")}}),
                          ("en", "manual"))

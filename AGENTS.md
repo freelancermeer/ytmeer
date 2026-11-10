@@ -469,8 +469,9 @@ An error starting `YouTube refused the 'en' captions (HTTP Error 429 ...)` means
 YouTube rate-limited this computer's captions. The first 429 stops every caption
 ask for 30 minutes (`RATE_LIMIT_PAUSE`), because each ask makes the block last
 longer. **Do not retry it, and do not reach for another route or client.**
-Tracks are tried `en-orig` first and machine translations (`tlang=` in the
-URL) last, because on 2026-11-10 every 429 of a 52-video batch was a
+One spoken track is picked: `en-orig`/`en` when English was spoken, else the
+video's own language (`de-orig`, `ko-orig` — read `language` to see which),
+and a machine translation (`tlang=` in the URL) only when nothing spoken exists, because on 2026-11-10 every 429 of a 52-video batch was a
 translated `en` track on a dubbed video while `en-orig` downloaded at once — so
 a 429 that still arrives is a real block. Wait an hour or two. Video pages and downloads still work
 meanwhile; only captions are refused. The trace shows `caption_skipped` for each

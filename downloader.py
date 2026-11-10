@@ -1851,7 +1851,7 @@ def offers_json3(entries):
     return not exts or "json3" in exts
 
 
-def best_track_in(tracks):
+def best_track_in(tracks, spoken=None):
     """The closest match to SUB_LANG among one set of caption tracks.
 
     Videos do not all publish English as plain "en" — it can be "en-orig", a
@@ -1860,7 +1860,7 @@ def best_track_in(tracks):
     track too: dozens of downloads, and YouTube answers with HTTP 429. So one
     explicit code is chosen instead.
     """
-    ranked = ranked_tracks(tracks)
+    ranked = ranked_tracks(tracks, spoken)
     return ranked[0] if ranked else None
 
 
@@ -1875,27 +1875,45 @@ def is_translated(entries):
     return any("tlang=" in (e.get("url") or "") for e in entries or [])
 
 
-def ranked_tracks(tracks):
-    """This language's caption codes in one set of tracks, best first.
+def ranked_tracks(tracks, spoken=None):
+    """The caption codes worth trying in one set of tracks, best first.
 
-    "<lang>-orig" is the speech itself and never a translation, so it leads;
-    then the plain code, then regional / closed-caption variants. Anything that
-    is a machine translation ("English from French", or a `tlang=` URL) goes
-    last: it is the track YouTube rate-limits first, and the words were never
-    spoken in this language.
+    1. "<SUB_LANG>-orig": the speech itself, in the wanted language.
+    2. The plain SUB_LANG code, then its regional / closed-caption variants.
+    3. The video's OWN language - its "<x>-orig" track, or a native track in
+       `spoken` (the video's `language`) - when it was not made in SUB_LANG.
+       A German video's script is German; no language is listed here, any
+       spoken track qualifies.
+    4. Machine translations into SUB_LANG ("English from French", a `tlang=`
+       URL), last: on 2026-11-10 YouTube answered every one of them with
+       HTTP 429 (5 of 5 non-English videos, web and default clients), while
+       every spoken track came down at once.
     """
-    tracks = {code: entries for code, entries in (tracks or {}).items()
-              if (code == SUB_LANG or code.startswith(f"{SUB_LANG}-")) and offers_json3(entries)}
+    tracks = tracks or {}
+    keep = [code for code, entries in tracks.items()
+            if track_tier(tracks, code, spoken) is not None and offers_json3(entries)]
+    return sorted(keep, key=lambda c: (track_tier(tracks, c, spoken), not c.endswith("-orig"), c))
 
-    def track_name(code):
-        entries = tracks.get(code) or []
-        return (entries[0].get("name", "") if entries else "").lower()
 
-    def rank(code):
-        translated = is_translated(tracks[code]) or " from " in track_name(code)
-        return (translated, code != f"{SUB_LANG}-orig", code != SUB_LANG, code)
+# track_tier's answers, by name
+TIER_WANTED, TIER_SPOKEN, TIER_TRANSLATED = 2, 4, 5
 
-    return sorted(tracks, key=rank)
+
+def track_tier(tracks, code, spoken=None):
+    """Where one caption code ranks (see ranked_tracks); None = not worth trying.
+    0-2 the wanted language as spoken, 3-4 the video's own language, 5 a translation."""
+    spoken = (spoken or "").split("-")[0].lower()
+    entries = tracks.get(code) or []
+    name = (entries[0].get("name", "") if entries else "").lower()
+    translated = is_translated(entries) or " from " in name
+    wanted = code == SUB_LANG or code.startswith(f"{SUB_LANG}-")
+    own = code.endswith("-orig") or bool(spoken and code.split("-")[0].lower() == spoken)
+    if wanted and not translated:
+        return 0 if code == f"{SUB_LANG}-orig" else 1 if code == SUB_LANG else 2
+    if own and not translated:
+        # the default audio's track before a dub's
+        return 3 if code.split("-")[0].lower() == spoken else 4
+    return TIER_TRANSLATED if wanted else None
 
 
 def resolve_sub_lang(info):
@@ -1909,11 +1927,16 @@ def resolve_sub_lang(info):
     """
     auto = (info or {}).get("automatic_captions") or {}
     manual = (info or {}).get("subtitles") or {}
-    pick = best_track_in(auto)
-    if pick:
-        return pick, "auto"
-    pick = best_track_in(manual)
-    return (pick, "manual") if pick else (None, None)
+    # The wanted language as spoken (auto, then manual), then the video's own
+    # language, then a translation: a spoken track of either kind beats a
+    # translation, which YouTube 429s and whose words nobody said.
+    spoken = (info or {}).get("language")
+    for ceiling in (TIER_WANTED, TIER_SPOKEN, TIER_TRANSLATED):
+        for tracks, source in ((auto, "auto"), (manual, "manual")):
+            pick = best_track_in(tracks, spoken)
+            if pick and track_tier(tracks, pick, spoken) <= ceiling:
+                return pick, source
+    return None, None
 
 
 def sub_flags(lang, source):
@@ -1978,12 +2001,18 @@ def find_transcript_file(folder):
     return None
 
 
+CAPTION_LANG = [None]          # the track the last take_caption read
+
+
 def take_caption(folder):
     """Read whatever json3 caption is sitting in the folder, and remove it.
     The caption file is only ever a means to the transcript files."""
     found = find_json3(folder)
     best = pick_best_json3(found)
     entries = parse_json3_words(best) if best else []
+    if best:
+        # "Title.de-orig.json3" -> "de-orig": which language the text is in
+        CAPTION_LANG[0] = os.path.basename(best)[:-len(".json3")].rsplit(".", 1)[-1]
     for j in found:
         try:
             os.remove(j)
@@ -2163,7 +2192,7 @@ THUMBNAIL_TIMEOUT = 120
 
 
 def caption_candidates(url, info):
-    """Every English caption track worth trying, best first.
+    """Every caption track worth trying, best first (see ranked_tracks).
 
     Auto-captions come first because they are the ones timed per word. If the
     metadata shows none, the PO-token client is asked for a second opinion — it
@@ -2178,13 +2207,20 @@ def caption_candidates(url, info):
         if richer:
             sources.append((richer, tuple(PO_TOKEN_FLAGS)))
 
-    for kind, source in (("automatic_captions", "auto"), ("subtitles", "manual")):
-        for meta, client in sources:
-            for code in ranked_tracks((meta or {}).get(kind)):
-                if (code, source) in seen:
-                    continue
-                seen.add((code, source))
-                yield code, source, list(client)
+    # Band by band - the wanted language as spoken, the video's own language,
+    # then translations - and within a band auto before manual: a spoken track
+    # of either kind is tried before any translation.
+    bands = ((0, TIER_WANTED), (TIER_WANTED + 1, TIER_SPOKEN), (TIER_TRANSLATED, TIER_TRANSLATED))
+    for low, high in bands:
+        for kind, source in (("automatic_captions", "auto"), ("subtitles", "manual")):
+            for meta, client in sources:
+                tracks = (meta or {}).get(kind) or {}
+                spoken = (meta or {}).get("language")
+                for code in ranked_tracks(tracks, spoken):
+                    if (code, source) in seen or not low <= track_tier(tracks, code, spoken) <= high:
+                        continue
+                    seen.add((code, source))
+                    yield code, source, list(client)
 
 
 def build_transcripts(folder, url, info):
@@ -2237,6 +2273,7 @@ def best_caption_entries(folder, url, info):
     so a caller that wants the text itself rather than the files can use it.
     """
     RATE_LIMITED.pop(url, None)             # an earlier ask's 429 is not this one's reason
+    CAPTION_LANG[0] = None
     entries = take_caption(folder)          # whatever came down with the video
     if is_word_level(entries):
         return entries
@@ -4828,7 +4865,7 @@ def video_transcript(url):
         "link": info.get("webpage_url"),
         "title": info.get("title"),
         "channel": info.get("channel") or info.get("uploader"),
-        "language": SUB_LANG,
+        "language": CAPTION_LANG[0] or SUB_LANG,
         "word_level": word_level,
         "segments": len(entries),
         "duration": info.get("duration"),

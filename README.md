@@ -684,9 +684,19 @@ longer. Each video that was touched says:
 (`lang=uk&tlang=en` in the caption URL): on a dubbed, multi-audio video the web
 client offers `en` as a translation of the default audio, and YouTube
 rate-limits translations first. `en-orig` — the English actually spoken — came
-down at once, word timings included. So tracks are tried in this order:
-`en-orig`, `en`, other `en-*` variants, and any translation (`tlang=` URL or an
-"English from …" name) last. Only a 429 on a track that is *not* a translation
+down at once, word timings included. The same held for videos *made* in
+another language: translated `en` got 429 on 5 of 5 (German, Korean, Spanish),
+their own `<x>-orig` track never did. So **one track is picked, the one that
+was spoken**:
+
+1. `en-orig`, then `en`, then other `en-*` — English, if the video has it spoken.
+2. Otherwise the video's own language (`de-orig`, `ko-orig`, …) — the script as
+   it was said. No language is listed; any spoken track qualifies.
+3. A machine translation (`tlang=` URL, "English from …") only when nothing
+   spoken exists.
+
+`--transcript` needs no new flag for this. Over the API, `language` in
+`/api/transcript` says which track the text is in (`de-orig`, not `en`). Only a 429 on a track that is *not* a translation
 means this computer is rate-limited; then time is the fix.
 
 Two things on this machine also broke silently and are worth checking first
