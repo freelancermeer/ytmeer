@@ -566,6 +566,41 @@ A lookup answers `422` for something that is not a video link, `502` when
 YouTube will not answer for it (private, removed, bot-gated), and `503` when
 another in-process request is already running - see the lock note below.
 
+### Channel mode: video links sorted into channel folders
+
+Put any video links in `links.txt` - watch links, `youtu.be` share links
+(`?si=` is dropped), bare ids, from any number of channels - and each video
+lands in a folder named after its own channel:
+
+```
+<folder>/
+  CROWN UNCOVERED/<Video Title>/trans_<Video Title>.txt
+  Royal Magazine/<Video Title>/trans_<Video Title>.txt
+```
+
+| Where | Parameter | Default |
+|---|---|---|
+| CLI | `--channel` | **off** (flat: `<folder>/<Video Title>/`) |
+| REST `POST /api/jobs` | `"channel": true` | **on** |
+| MCP `yt_download` | `channel=true` | **on** (the API's default) |
+
+It works with every download mode, `--transcript` included:
+
+```bash
+python3 downloader.py "<folder>" --channel --transcript --yes
+```
+
+```bash
+curl -X POST "$B/api/jobs" -H 'content-type: application/json' -H "$K" -d '{
+  "links": ["https://youtu.be/KYuhGxisrwU", "DqzqAA6SySg"],
+  "channel": true, "transcript": true }'
+```
+
+The folder name is the channel's display name, made safe for the file system
+(`/`, `:`, `?` and the like become `_`). The run summary's `layout` field says
+`"channel"` or `"flat"`. A channel link in `links.txt` also goes into its own
+folder in this mode; without `--channel` its videos sit side by side.
+
 ### Jobs: when the files are the point
 
 `api.py` exposes every flag the downloader takes. Request fields mirror the

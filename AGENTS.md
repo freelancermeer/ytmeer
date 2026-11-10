@@ -273,6 +273,41 @@ the **lookup** routes name their scan depth `count` rather than `search_count`. 
 both is refused. `this_month`, `match`, `search_count` and `dates` mean nothing
 without `search` and are refused without it.
 
+### 4.3 Channel mode: video links sorted into channel folders
+
+Put any video links in `links.txt` - watch links, `youtu.be` share links
+(`?si=` is dropped), bare ids, from any number of channels - and each video
+lands in a folder named after its own channel:
+
+```
+<folder>/
+  CROWN UNCOVERED/<Video Title>/trans_<Video Title>.txt
+  Royal Magazine/<Video Title>/trans_<Video Title>.txt
+```
+
+| Where | Parameter | Default |
+|---|---|---|
+| CLI | `--channel` | **off** (flat: `<folder>/<Video Title>/`) |
+| REST `POST /api/jobs` | `"channel": true` | **on** |
+| MCP `yt_download` | `channel=true` | **on** (the API's default) |
+
+It works with every download mode, `--transcript` included:
+
+```bash
+python3 downloader.py "<folder>" --channel --transcript --yes
+```
+
+```bash
+curl -X POST "$B/api/jobs" -H 'content-type: application/json' -H "$K" -d '{
+  "links": ["https://youtu.be/KYuhGxisrwU", "DqzqAA6SySg"],
+  "channel": true, "transcript": true }'
+```
+
+The folder name is the channel's display name, made safe for the file system
+(`/`, `:`, `?` and the like become `_`). The run summary's `layout` field says
+`"channel"` or `"flat"`. A channel link in `links.txt` also goes into its own
+folder in this mode; without `--channel` its videos sit side by side.
+
 ## 5. The four things an agent gets wrong
 
 ### 5.1 `--match related` vs `exact` is not a sort
