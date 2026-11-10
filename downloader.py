@@ -1860,21 +1860,42 @@ def best_track_in(tracks):
     track too: dozens of downloads, and YouTube answers with HTTP 429. So one
     explicit code is chosen instead.
     """
-    tracks = {code: entries for code, entries in tracks.items() if offers_json3(entries)}
-    if SUB_LANG in tracks:
-        return SUB_LANG
-    if f"{SUB_LANG}-orig" in tracks:
-        return f"{SUB_LANG}-orig"
+    ranked = ranked_tracks(tracks)
+    return ranked[0] if ranked else None
+
+
+def is_translated(entries):
+    """True when a caption track is YouTube's machine translation of another one.
+
+    Its URL carries `tlang=`. On 2026-11-10 every HTTP 429 of a 52-video batch
+    was such a track: on a dubbed (multi-audio) video the web client offers
+    "en" as a translation of the default audio track (`lang=uk&tlang=en`),
+    while "en-orig" - the real English speech - downloaded at once.
+    """
+    return any("tlang=" in (e.get("url") or "") for e in entries or [])
+
+
+def ranked_tracks(tracks):
+    """This language's caption codes in one set of tracks, best first.
+
+    "<lang>-orig" is the speech itself and never a translation, so it leads;
+    then the plain code, then regional / closed-caption variants. Anything that
+    is a machine translation ("English from French", or a `tlang=` URL) goes
+    last: it is the track YouTube rate-limits first, and the words were never
+    spoken in this language.
+    """
+    tracks = {code: entries for code, entries in (tracks or {}).items()
+              if (code == SUB_LANG or code.startswith(f"{SUB_LANG}-")) and offers_json3(entries)}
 
     def track_name(code):
         entries = tracks.get(code) or []
         return (entries[0].get("name", "") if entries else "").lower()
 
-    variants = sorted(c for c in tracks if c.startswith(f"{SUB_LANG}-"))
-    # "X from Y" entries are machine translations of another language; a plain
-    # name means this is the video's own English track.
-    native = [c for c in variants if " from " not in track_name(c)]
-    return (native or variants or [None])[0]
+    def rank(code):
+        translated = is_translated(tracks[code]) or " from " in track_name(code)
+        return (translated, code != f"{SUB_LANG}-orig", code != SUB_LANG, code)
+
+    return sorted(tracks, key=rank)
 
 
 def resolve_sub_lang(info):
@@ -2159,12 +2180,8 @@ def caption_candidates(url, info):
 
     for kind, source in (("automatic_captions", "auto"), ("subtitles", "manual")):
         for meta, client in sources:
-            tracks = (meta or {}).get(kind) or {}
-            ordered = sorted(tracks, key=lambda c: (c != SUB_LANG, c))
-            for code in ordered:
-                if not (code == SUB_LANG or code.startswith(f"{SUB_LANG}-")):
-                    continue
-                if (code, source) in seen or not offers_json3(tracks[code]):
+            for code in ranked_tracks((meta or {}).get(kind)):
+                if (code, source) in seen:
                     continue
                 seen.add((code, source))
                 yield code, source, list(client)

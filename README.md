@@ -679,10 +679,21 @@ longer. Each video that was touched says:
 
 `YouTube refused the 'en' captions (HTTP Error 429: Too Many Requests): this computer asked YouTube too often. Wait an hour or two, then run again`
 
-Another route or client does not lift the block, because YouTube refuses this
-computer's captions, not one route. On 2026-11-08 these all got the same 429:
-web, android and ios, IPv4, and a newer yt-dlp. The transcript panel answered
-400. Video pages and downloads still worked. Time is the only fix.
+**Most 429s were never the computer — they were a translated track.** On
+2026-11-10 every 429 of a 52-video batch was YouTube's *machine translation*
+(`lang=uk&tlang=en` in the caption URL): on a dubbed, multi-audio video the web
+client offers `en` as a translation of the default audio, and YouTube
+rate-limits translations first. `en-orig` — the English actually spoken — came
+down at once, word timings included. So tracks are tried in this order:
+`en-orig`, `en`, other `en-*` variants, and any translation (`tlang=` URL or an
+"English from …" name) last. Only a 429 on a track that is *not* a translation
+means this computer is rate-limited; then time is the fix.
+
+Two things on this machine also broke silently and are worth checking first
+(`yt-dlp -v ... 2>&1 | grep -E "PO Token Providers|impersonat"`): a Homebrew
+upgrade moved yt-dlp to a new Python, leaving the bgutil plugin and curl_cffi
+behind (`PO Token Providers: none`, `no impersonate target is available`).
+Reinstall both into the Python that runs `yt-dlp` (see its first line).
 
 **Backfill:** if a video is already downloaded but has no `trans_*.txt`, re-running builds the transcripts for it without re-downloading the video.
 

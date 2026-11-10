@@ -858,10 +858,28 @@ class PlatformCase:
     def _track(name):
         return [{"ext": "json3", "name": name}]
 
-    def test_exact_language_preferred(self):
+    def test_original_speech_track_preferred(self):
+        # "en-orig" is the spoken English; "en" can be a translation of a
+        # dubbed video's default audio, which is what YouTube 429s first.
         info = {"automatic_captions": {"en": self._track("English"),
                                        "en-orig": self._track("English (Original)")}}
+        self.assertEqual(d.resolve_sub_lang(info), ("en-orig", "auto"))
+
+    def test_exact_language_beats_other_variants(self):
+        info = {"automatic_captions": {"en": self._track("English"),
+                                       "en-US": self._track("English (US)")}}
         self.assertEqual(d.resolve_sub_lang(info), ("en", "auto"))
+
+    def test_a_tlang_translation_is_tried_last(self):
+        # 2026-11-10: `lang=uk&tlang=en` 429'd; the native track did not.
+        translated = [{"ext": "json3", "name": "English",
+                       "url": "https://www.youtube.com/api/timedtext?lang=uk&tlang=en&fmt=json3"}]
+        info = {"automatic_captions": {"en": translated, "en-GB": self._track("English (UK)")}}
+        self.assertTrue(d.is_translated(translated))
+        self.assertFalse(d.is_translated(self._track("English")))
+        self.assertEqual(d.resolve_sub_lang(info), ("en-GB", "auto"))
+        self.assertEqual(d.resolve_sub_lang({"automatic_captions": {"en": translated}}),
+                         ("en", "auto"), "a translation still beats having nothing")
 
     def test_variant_used_when_plain_code_absent(self):
         info = {"automatic_captions": {"en-orig": self._track("English (Original)")}}
@@ -909,7 +927,7 @@ class PlatformCase:
                 "subtitles": {"en-uYU": self._track("English - CC1")},
                 "_dummy": None}
         got = [(code, source) for code, source, _c in d.caption_candidates("u", info)]
-        self.assertEqual(got, [("en", "auto"), ("en-orig", "auto"), ("en-uYU", "manual")])
+        self.assertEqual(got, [("en-orig", "auto"), ("en", "auto"), ("en-uYU", "manual")])
 
     def test_a_vtt_only_auto_track_gives_way_to_the_manual_track(self):
         # "Me at the zoo": auto "en" is offered as vtt only, manual "en" as json3.
@@ -1095,10 +1113,10 @@ class PlatformCase:
     def test_keeps_looking_past_a_phrase_timed_track(self):
         info = {"automatic_captions": {"en": self._track("English"),
                                        "en-orig": self._track("English (Original)")}}
-        store = {"en":      [(0.0, None, "A WHOLE PHRASE HERE NOW")],
-                 "en-orig": [(0.0, None, "one"), (0.4, None, "word"), (0.8, None, "each")]}
+        store = {"en-orig": [(0.0, None, "A WHOLE PHRASE HERE NOW")],
+                 "en":      [(0.0, None, "one"), (0.4, None, "word"), (0.8, None, "each")]}
         log, words = self._with_stub(store, info)
-        self.assertEqual(log, ["en", "en-orig"], "it must try the next track")
+        self.assertEqual(log, ["en-orig", "en"], "it must try the next track")
         self.assertTrue(words.startswith("words_") and "not_found" not in words,
                         "the word-timed track was available and should have won")
 
