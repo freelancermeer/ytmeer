@@ -1087,8 +1087,13 @@ def is_transient(error_text):
 # YouTube gates requests it thinks are automated, which is what a datacenter IP
 # looks like from its side. The apostrophe in "you're not a bot" comes back as a
 # curly U+2019 as often as a plain one, so the marker avoids it entirely.
-BOT_GATE_ERRORS = ("not a bot", "this helps protect our community",
-                   "the page needs to be reloaded")
+#
+# The first two are YouTube's "Sign in to confirm you're not a bot" page, which
+# refuses this machine's IP for EVERY video; the third refuses cookies.txt. The
+# in-process engine (api.py) pauses all its lookups on the first kind only,
+# because asking again from the same IP is what makes that block last longer.
+IP_GATE_ERRORS = ("not a bot", "this helps protect our community")
+BOT_GATE_ERRORS = IP_GATE_ERRORS + ("the page needs to be reloaded",)
 
 # What YouTube answers a signed-in request it no longer accepts - cookies that were
 # rotated after export, or used from elsewhere. The same request without them may
@@ -1103,6 +1108,14 @@ def is_bot_gated(error_text):
     """True when the failure is YouTube refusing the IP, not refusing the video."""
     low = (error_text or "").lower()
     return any(hint in low for hint in BOT_GATE_ERRORS)
+
+
+def is_ip_gated(error_text):
+    """True only for the bot-check page itself - a refusal of this IP that the
+    next request from it will meet too. Not for a rejected cookies.txt, which
+    the same request without the jar may well get past."""
+    low = (error_text or "").lower()
+    return any(hint in low for hint in IP_GATE_ERRORS)
 
 
 PERMANENT_ERRORS = ("private video", "incomplete youtube id", "video is unavailable", "video unavailable",
@@ -1601,6 +1614,13 @@ def find_comments_file(folder):
     return None
 
 
+# What take_comments last read beside the comments: the video's own id, link,
+# title, channel and comment count, from the same .info.json.
+COMMENT_INFO_FIELDS = ("id", "webpage_url", "title", "channel", "uploader",
+                       "comment_count")
+COMMENTS_INFO = [None]
+
+
 def take_comments(folder):
     """Lift the comments out of the .info.json this run wrote, then delete it.
 
@@ -1624,7 +1644,12 @@ def take_comments(folder):
     for path in found:
         try:
             with open(path, "r", encoding="utf-8") as f:
-                comments = (json.load(f).get("comments") or []) or comments
+                data = json.load(f)
+            comments = (data.get("comments") or []) or comments
+            # The few fields a comments answer opens with. Kept here because
+            # this file is about to go, and it already has them - see
+            # video_comments, which no longer pays a second lookup for them.
+            COMMENTS_INFO[0] = {key: data.get(key) for key in COMMENT_INFO_FIELDS}
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
     for path in found:
@@ -4897,15 +4922,24 @@ def video_comments(url):
     without the comment it answers is usually meaningless. COMMENT_LIMIT,
     COMMENT_SORT and COMMENT_REPLIES decide what is fetched, exactly as they do
     for a download.
+
+    One yt-dlp run, not two. The .info.json that --write-comments leaves behind
+    already carries the title, channel and comment count, so the metadata
+    lookup this used to open with fetched the same video twice - measured at
+    4.8s + 4.85s for 20 comments. Only a fetch that left no info.json behind
+    falls back to that lookup, so the answer never loses its header.
     """
-    info, err = fetch_info(url)
-    if not info:
-        return None, err or "Could not read this video"
+    COMMENTS_INFO[0] = None
     with scratch_dir() as folder:
         comments, fetch_err = fetch_comments(folder, url)
     if fetch_err:
         # A 502 over the API, not a 200 with fetched: 0.
         return None, fetch_err
+    info = COMMENTS_INFO[0]
+    if not info or not info.get("id"):
+        info, err = fetch_info(url)
+        if not info:
+            return None, err or "Could not read this video"
     threads = thread_comments(comments)
     return {
         "id": info.get("id"),

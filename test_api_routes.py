@@ -464,12 +464,16 @@ class TestRoutes(unittest.TestCase):
             r = self.c.get(f"/api/preview?channel=https://www.youtube.com/@X&{q}", headers=self.h)
             self.assertEqual(r.status_code, 422, q)
 
-    def test_a_second_preview_meanwhile_gets_503(self):
+    def test_a_preview_past_every_slot_gets_503(self):
+        # One slot, so the first preview takes every slot there is - and with
+        # it the stubbed module, slot 0, rather than a real copy.
         d = api.downloader
-        saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT)
+        saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url,
+                 api.PREVIEW_WAIT, api.ENGINE)
         d.is_channel_url, d.channel_videos_url = (lambda url: True), (lambda url: url)
         d.list_channel_videos = lambda url, deadline=None: (time.sleep(2), ([], "Ch", None))[1]
         api.PREVIEW_WAIT = 0.3
+        api.ENGINE = api.EnginePool(1)
         try:
             import threading as _t
             first = _t.Thread(target=lambda: TestClient(self.app).get("/api/preview?channel=x", headers=self.h))
@@ -481,7 +485,8 @@ class TestRoutes(unittest.TestCase):
             first.join()
             self.assertEqual(self.c.get("/api/preview?channel=z", headers=self.h).status_code, 200)
         finally:
-            d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT = saved
+            (d.is_channel_url, d.list_channel_videos, d.channel_videos_url,
+             api.PREVIEW_WAIT, api.ENGINE) = saved
 
     # ------------------------------------------------- lookups, not jobs
     def _stub(self, **functions):

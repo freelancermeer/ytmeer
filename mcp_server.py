@@ -31,23 +31,41 @@ Environment, all optional:
     YTDL_OUTDIR        where downloads go, and where cookies.txt is looked for.
                        Read by api.py at import, so set it in the editor's
                        "env" block. Defaults to ./downloads beside this file.
-    YTMEER_BUSY_WAIT   seconds a tool waits for the engine when another tool
-                       holds it (default 90). The REST API uses 5, because a
+    YTMEER_ENGINE_SLOTS  answer-tools that may talk to YouTube at once
+                       (default 4, at most 16). Subagents share their parent's
+                       server process, so this is the whole fleet's limit.
+                       More is more requests from one IP at once, which is
+                       what YouTube's bot check reacts to.
+    YTMEER_BUSY_WAIT   seconds a tool waits for a free slot when every slot is
+                       taken (default 90). The REST API uses 5, because a
                        queued HTTP request would hit a proxy timeout anyway;
                        over stdio there is no proxy, and an agent comparing two
                        channels fires both calls at once.
+    YTMEER_CACHE_TTL   seconds an answer is kept and handed to the next caller
+                       asking the same thing (default 900; 0 turns it off).
+    YTMEER_CACHE_SIZE  answers kept at most (default 256, oldest out first).
+    YTMEER_BOT_PAUSE   seconds every lookup pauses after YouTube's bot check
+                       (default 60, doubling while it keeps coming back, at
+                       most 900; 0 never pauses).
     YTMEER_MAX_JOBS    finished jobs kept in memory (default 50). Nothing else
                        evicts them in a long-lived process. Files are untouched.
+
+The four engine settings are read by api.py at import, so set them in the
+editor's "env" block, as YTDL_OUTDIR is.
 """
 
 import argparse
 import asyncio
 import atexit
+import concurrent.futures
 import contextlib
+import contextvars
+import functools
 import os
 import secrets
 import signal
 import sys
+import textwrap
 import threading
 from typing import Annotated, Any, AsyncIterator
 
@@ -142,6 +160,40 @@ def _http_auth(token):
             AuthSettings(issuer_url="https://localhost/ytmeer-no-oauth",
                          resource_server_url=None))
 
+
+def _engine_note():
+    """The paragraph of INSTRUCTIONS about speed: slots, cache, pause, costs.
+
+    Built from the live settings, so a model is never told about a cache that
+    YTMEER_CACHE_TTL=0 turned off, or a slot count the editor's env changed.
+    """
+    lines = [
+        f"Up to {api.ENGINE.size} answer-tools run at once. Subagents share this one "
+        f"server, so that is the whole fleet's limit; a call past it waits up to "
+        f"{BUSY_WAIT}s for a slot. Fire independent calls in parallel rather than "
+        f"one by one."]
+    if api.CACHE_SECONDS:
+        lines.append(
+            f"The same question asked again within {max(1, api.CACHE_SECONDS // 60)} "
+            f"min is answered from memory at once, marked cached=true with its "
+            f"cache_age_seconds, and identical calls that overlap share one fetch. "
+            f"Re-asking costs nothing, but a cached answer's views are as old as "
+            f"cache_age_seconds says.")
+    if api.BOT_PAUSE_FIRST:
+        lines.append(
+            f"If YouTube bot-checks this machine, every lookup pauses (from "
+            f"{api.BOT_PAUSE_FIRST}s, doubling while it recurs) and fails at once "
+            f"with \"paused, not tried\". Do not retry in a loop: wait the time it "
+            f"names. Cached answers are still served meanwhile.")
+    lines.append(
+        "Costs worth budgeting (measured, uncontended): video details ~5-8s, 20 "
+        "comments ~5s, a search ~12s to scan 150 results plus ~3s per publish "
+        "date, channel details ~23s, a transcript ~9s.")
+    return "\n\n".join(textwrap.fill(line, 78) for line in lines)
+
+
+_ENGINE_NOTE = _engine_note()
+
 INSTRUCTIONS = f"""\
 YTmeer researches YouTube with yt-dlp and downloads videos, on this machine.
 
@@ -158,9 +210,7 @@ yt_channel_playlists, yt_similar, yt_resolve, yt_transcript, yt_comments,
 yt_preview) return data and write nothing. Downloading is a job: yt_download
 answers at once with a job_id, then poll yt_job_status.
 
-One answer-tool runs at a time; a second waits up to {BUSY_WAIT}s for the engine.
-Costs worth budgeting: a publish date is ~2.1s per video, video details ~3s,
-channel details ~23s, a transcript ~9s, 100 comments ~7s.
+{_ENGINE_NOTE}
 
 Downloads go to {api.DEFAULT_OUT} - outdir names a folder inside it.
 """
@@ -204,13 +254,17 @@ mcp = MCPServer(SERVER_NAME, title="YTmeer", version=VERSION,
 FILE_KEYS = ("video", "transcript", "words", "thumbnail", "description",
              "comments", "info")
 
-# One engine-bound tool at a time, queued ON THE EVENT LOOP rather than in the
-# thread pool. api.py's own lock would do the excluding, but every tool reaches
-# it through asyncio.to_thread, which shares one ThreadPoolExecutor with at
-# most min(32, cpu+4) workers: a burst of searches would park that many threads
-# each waiting BUSY_WAIT seconds for the engine, and yt_download or yt_job_stop
-# - which never touch the engine - would then wait behind them for a thread.
-_ENGINE = asyncio.Semaphore(1)
+# api.ENGINE.size engine-bound tools at a time, queued ON THE EVENT LOOP rather
+# than in a thread pool. api.py's slot pool would do the excluding by itself,
+# but a burst of searches would then park a thread each while it waited for a
+# slot. They run in a pool of their own, too: asyncio.to_thread's default pool
+# is shared with yt_download, yt_job_status and yt_job_stop, which never touch
+# the engine and must never wait behind it for a thread. The pool is twice the
+# slots because a call the client gave up on keeps its thread until its own
+# walls end it, and the next call should not have to wait for that thread.
+_ENGINE = asyncio.Semaphore(api.ENGINE.size)
+_ENGINE_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2 * api.ENGINE.size, thread_name_prefix="ytmeer-engine")
 
 READS = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 READS_LOCAL = ToolAnnotations(read_only_hint=True, open_world_hint=False)
@@ -221,29 +275,48 @@ EDITS = ToolAnnotations(read_only_hint=False, destructive_hint=False,
 
 
 async def _call(fn, *args, **kwargs):
-    """Run one blocking api.py call off the event loop, with its output
-    contained and its exceptions turned into tool errors.
+    """Run one blocking api.py call off the event loop, with its exceptions
+    turned into tool errors.
 
-    Off the loop because a channel listing can take minutes - channel_page's
-    own subprocess timeout is 300s - and blocking the loop would freeze the
-    whole editor connection. redirect_stdout is belt to the lifespan's braces:
-    it is safe because the transport does not use sys.stdout.
+    A cached answer comes straight back, without a slot. Otherwise the call
+    waits on the loop for one of the engine slots - BUSY_WAIT at most - and
+    runs in the engine's own thread pool. Off the loop because a channel
+    listing can take minutes - channel_page's own subprocess timeout is 300s -
+    and blocking the loop would freeze the whole editor connection.
+
+    Stray print()s need no guard here: the lifespan points sys.stdout at
+    stderr, and the stdio transport already serves the wire from its own copy
+    of fd 1. The contextlib.redirect_stdout this used to wrap each call in
+    swaps a process-wide sys.stdout, so with calls overlapping one call's exit
+    put back what another had swapped in.
     """
-    def work():
-        with contextlib.redirect_stdout(sys.stderr):
-            return fn(*args, **kwargs)
-
+    peek = getattr(fn, "peek", None)
+    if peek is not None:
+        hit = peek(*args, **kwargs)
+        if hit is not None:
+            return hit
     try:
-        async with _ENGINE:                   # queue on the loop, not in the pool
-            return await asyncio.to_thread(work)
+        await asyncio.wait_for(_ENGINE.acquire(), BUSY_WAIT)
+    except TimeoutError:
+        raise ToolError(f"the engine is busy: all {api.ENGINE.size} slots stayed "
+                        f"taken for {BUSY_WAIT}s; try again shortly, or ask for "
+                        f"less at once") from None
+    try:
+        loop = asyncio.get_running_loop()
+        work = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+        return await loop.run_in_executor(_ENGINE_POOL, work)
     except api.PreviewBusy as e:
         raise ToolError(f"the engine is busy: {e}") from None
+    except api.BackingOff as e:               # before LookupFailed: it is one
+        raise ToolError(f"paused, not tried: {e}") from None
     except api.LookupFailed as e:
         raise ToolError(f"YouTube would not answer: {e}") from None
     except api.BadField as e:                 # a ValueError that names its field
         raise ToolError(f"{e.field}: {e}") from None
     except ValueError as e:
         raise ToolError(str(e)) from None
+    finally:
+        _ENGINE.release()
 
 
 def _find_job(job_id: str) -> dict:
@@ -338,7 +411,9 @@ async def yt_health() -> dict[str, Any]:
     makes downloads about 4x faster; node or deno is needed for YouTube's "n"
     challenge. Anything in missing_required is a `brew install` away.
     """
-    tools = await _call(api.tools_present)
+    # Not through _call: it asks the PATH, not YouTube, and must answer while
+    # every engine slot is taken - that is when someone asks it why.
+    tools = await asyncio.to_thread(api.tools_present)
     with api.LOCK:
         states: dict[str, int] = {}
         for job in api.JOBS.values():
@@ -357,6 +432,7 @@ async def yt_health() -> dict[str, Any]:
         "api_version": api.VERSION,
         "server_version": VERSION,
         "busy_wait_seconds": BUSY_WAIT,
+        "engine": api.engine_status(),
     }
 
 
