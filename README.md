@@ -440,10 +440,19 @@ the run took 101s instead of 17s.
 ### Publish dates, without giving up the breadth
 
 The cheap route returns no upload dates — YouTube's flat listing has none — so
-they are fetched afterwards, in one yt-dlp pass over the results that **survived
-the filters**, measured at about **2.1s per video** (20 in 42.6s). Dating the 20
-results of a search therefore costs 42s where dating the 150 it looked at would
-cost five minutes. `--no-dates` skips it.
+they are fetched afterwards, for the results that **survived the filters** only.
+Each date is a full extraction, about **2.1s per video** in one yt-dlp pass (20
+in 42.6s), so dating the 150 a search looked at would cost five minutes. The
+survivors are split over up to three yt-dlp runs at once (`YTMEER_DATE_WORKERS`,
+default 3), interleaved so the top of the list is dated first:
+
+| One `limit=10` search, 16 Nov 2026 | Scan | 10 dates | Total |
+|---|---|---|---|
+| Dates in one run | 13.3s | 35.7s | 49.0s |
+| Dates in three runs at once | 17.2s | **20.2s** | **37.4s** |
+
+Five or fewer stay one run, because each run spends a few seconds starting
+before its first date. `--no-dates` skips it.
 
 A **date window** is applied here too, not by YouTube, and that is the whole
 point: dates are fetched a block at a time *down the list already in the order
@@ -676,6 +685,14 @@ subprocess timeout.
 | 3 different `yt_video` at once | ~14.2s, one after another | **4.7s** |
 | The same 3 asked again | 14.2s again | **0.003s** (cache) |
 | `yt_comments`, 20 comments | 9.7s (two yt-dlp runs) | **5.2s** (one) |
+| `yt_search`, `limit=10`, with dates | 49.0s (dates in one run: 35.7s) | **37.4s** (three runs: 20.2s) |
+
+**Dates three at a time, bounded for the whole process.** A search's publish
+dates are split over up to three yt-dlp runs. Every run beyond a search's own
+is borrowed from one pool all the slots share, `YTMEER_DATE_WORKERS - 1` big,
+and only if it is free when the dating starts. So four slots dating at once run
+six extractions, never twelve, and a search that finds the pool empty dates in
+one run, as before, rather than waiting for a lane.
 
 Starting yt-dlp is not the cost: it is about 0.4s of a 7.7s lookup. The rest is
 YouTube - the watch page, two player API calls, its ~2 MB player script (fetched
@@ -1280,6 +1297,7 @@ can open beats a URL it cannot.
 | `YTMEER_CACHE_TTL` | `900` | seconds an answer is kept for the next caller asking the same thing; `0` turns the cache off |
 | `YTMEER_CACHE_SIZE` | `256` | answers kept at most, oldest out first |
 | `YTMEER_BOT_PAUSE` | `60` | seconds every lookup pauses after a bot check, doubling while it recurs, at most 900; `0` never pauses |
+| `YTMEER_DATE_WORKERS` | `3` | yt-dlp runs one search's publish dates are split across, 1-8; five videos or fewer stay one run. The runs past a call's first come from one pool of `N - 1` that every slot shares, taken only when free, so four slots dating at once run at most six. `1` turns the split off. Read by the command line too |
 | `YTMEER_MAX_JOBS` | `50` | finished jobs kept in memory. Files are never touched |
 
 ### Notes

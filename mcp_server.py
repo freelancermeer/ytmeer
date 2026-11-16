@@ -185,10 +185,14 @@ def _engine_note():
             f"{api.BOT_PAUSE_FIRST}s, doubling while it recurs) and fails at once "
             f"with \"paused, not tried\". Do not retry in a loop: wait the time it "
             f"names. Cached answers are still served meanwhile.")
+    split = api.downloader.DATE_WORKERS
     lines.append(
         "Costs worth budgeting (measured, uncontended): video details ~5-8s, 20 "
-        "comments ~5s, a search ~12s to scan 150 results plus ~3s per publish "
-        "date, channel details ~23s, a transcript ~9s.")
+        "comments ~5s, a search ~13-17s to scan 150 results plus its publish "
+        + (f"dates, fetched up to {split} yt-dlp runs at once (10 dates took "
+           f"20s where one run took 36s), " if split > 1 else
+           "dates at ~3.6s each, ")
+        + "channel details ~23s, a transcript ~9s.")
     return "\n\n".join(textwrap.fill(line, 78) for line in lines)
 
 
@@ -443,7 +447,7 @@ async def yt_search(
     count: Annotated[int, Field(description="Results to scan before filtering. 0 follows the route: 150 normally, 40 when sort is date or oldest, because that scan costs about thirty times more per result.", ge=0, le=10000)] = 0,
     match: Annotated[str, Field(description="How wide a net: 'related' (YouTube's own results page, so near-matches come too) or 'exact' (the far narrower ytsearch route). Ignored with in_channel.")] = "related",
     sort: Annotated[str, Field(description="relevance, views, popularity or least-viewed order what came back, locally - the same request goes to YouTube either way. date and oldest are NOT that: they force YouTube's dated route, which scans only 40 results instead of 150, so a date sort cannot see further back than that depth. Raise count to scan deeper there, at about 2s per result.")] = "relevance",
-    dates: Annotated[bool, Field(description="Fetch each surviving result's publish date. About 2.1s per video, at most 20 per call. Leave it true whenever days or this_month is set: with a window, dates=false does not merely skip the dates, it hands the window to YouTube's own date search, which scans 40 deep instead of 150 and asks a much narrower question - and that answer carries no date_capped warning.")] = True,
+    dates: Annotated[bool, Field(description=f"Fetch each surviving result's publish date, at most 20 per call. They are fetched in up to {api.downloader.DATE_WORKERS} yt-dlp runs at once: a limit=10 search's 10 dates took 20s, where one run took 36s. Leave it true whenever days or this_month is set: with a window, dates=false does not merely skip the dates, it hands the window to YouTube's own date search, which scans 40 deep instead of 150 and asks a much narrower question - and that answer carries no date_capped warning.")] = True,
     shorts: Annotated[bool, Field(description="Include short-form video. Off by default; overrides min_duration.")] = False,
     min_duration: Annotated[int, Field(description="Shortest video to keep, in seconds. 0 = any length.", ge=0, le=86400)] = 180,
     days: Annotated[int, Field(description="Only videos from the last N days. 0 = any time.", ge=0, le=100000)] = 0,
@@ -467,6 +471,12 @@ async def yt_search(
     over dates fetched for the results that survived the filters - which keeps
     the breadth YouTube's own date search throws away. On one title this found
     20 videos for the month where YouTube's date search returned 3.
+
+    Cost: scanning 150 results takes ~13-17s, then the publish dates, which
+    are a full extraction per video, split over up to three yt-dlp runs at
+    once. Measured on 16 Nov 2026: a limit=10 search took 37s in all, its 10
+    dates 20s (49s and 36s when the dates ran in one run). Under load the
+    split gives way, so a search never dates slower than one run would.
 
     READ THIS BEFORE REPORTING AN EMPTY RESULT: found=0 with date_capped=true
     means "did not look far enough", NOT "nothing was published". The 20-date
@@ -579,7 +589,7 @@ async def yt_similar(
     limit: Annotated[int, Field(description="How many to keep. 0 = every match, but keep it at 20 or fewer while dates is true: past 20 survivors no publish date is fetched at all and date_capped comes back true.", ge=0, le=1000000)] = 0,
     shorts: Annotated[bool, Field(description="Include short-form video.")] = False,
     min_duration: Annotated[int, Field(description="Shortest video to keep, in seconds.", ge=0, le=86400)] = 180,
-    dates: Annotated[bool, Field(description="Fetch publish dates, ~2.1s each. All or nothing: 20 survivors or fewer are all dated, more than 20 and NONE are.")] = True,
+    dates: Annotated[bool, Field(description=f"Fetch publish dates, in up to {api.downloader.DATE_WORKERS} yt-dlp runs at once: 10 took ~20s. All or nothing: 20 survivors or fewer are all dated, more than 20 and NONE are.")] = True,
     skip: Annotated[str, Field(description="Links or ids to leave out.")] = "",
 ) -> dict[str, Any]:
     """Long videos like this one - who else tried this angle, and how it went.
@@ -587,8 +597,9 @@ async def yt_similar(
     YouTube's related feed is not reachable through yt-dlp, so this searches
     for the video's OWN TITLE and leaves the video itself out. That is why it
     needs a video link and refuses a channel one. filtered_out gives per-reason
-    counts, so a thin result explains itself. About 24s without dates, 65s with
-    them for 20 kept.
+    counts, so a thin result explains itself. About 24s without dates. Dates
+    add ~20s for 10 kept, fetched up to three yt-dlp runs at once; 20 kept
+    took 65s in all when they ran in one.
     """
     return await _call(api.similar_to, url, limit, shorts, min_duration, dates, skip)
 

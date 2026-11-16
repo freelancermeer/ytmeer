@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -4850,6 +4851,433 @@ class TestMacOS(PlatformCase, unittest.TestCase):
 
 class TestWindows(PlatformCase, unittest.TestCase):
     WINDOWS = True
+
+
+BOT_CHECK = "ERROR: [youtube] x: Sign in to confirm you're not a bot"
+
+
+def until(test, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if test():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+class TestDatesInChunks(unittest.TestCase):
+    """resolve_dates split into yt-dlp runs side by side.
+
+    Against a scripted yt-dlp that dates whatever ids it is handed. Not run per
+    platform: nothing here touches a path or a name, and the threads would
+    only double the file's wall time.
+    """
+
+    def setUp(self):
+        self.saved = (d.subprocess.run, d.po_token_first[0], d.DATE_WORKERS,
+                      d.DATE_CHUNK_MIN, d.DATE_LANES, d.DATE_TIMEOUT,
+                      d.COOKIES_FILE, d.use_cookies[0], dict(d.COOKIE_COPIES),
+                      d.LOG_DEBUG[0])
+        d.po_token_first[0] = True            # one route, for a clear test
+        d.DATE_WORKERS, d.DATE_CHUNK_MIN, d.DATE_TIMEOUT = 3, 3, 300
+        # A pool of this test's own, so a lane another test failed to give back
+        # cannot change how this one splits.
+        d.DATE_LANES = threading.BoundedSemaphore(2)
+        # No jar unless a test brings one: a cookies.txt in the folder the
+        # suite runs from must not change a single command line here.
+        d.COOKIES_FILE = os.path.join(tempfile.gettempdir(), "ytmeer-none", "cookies.txt")
+        d.use_cookies[0] = True
+        d.LOG_DEBUG[0] = None
+        self.lock = threading.Lock()
+        self.commands = []
+
+    def tearDown(self):
+        (d.subprocess.run, d.po_token_first[0], d.DATE_WORKERS,
+         d.DATE_CHUNK_MIN, d.DATE_LANES, d.DATE_TIMEOUT,
+         d.COOKIES_FILE, d.use_cookies[0], copies, d.LOG_DEBUG[0]) = self.saved
+        d.COOKIE_COPIES.clear()
+        d.COOKIE_COPIES.update(copies)
+
+    # ------------------------------------------------------------ helpers
+    @staticmethod
+    def videos(count):
+        return [{"id": f"v{n:010d}", "url": d.watch_url(f"v{n:010d}"), "epoch": None}
+                for n in range(count)]
+
+    @staticmethod
+    def asked(cmd):
+        """The ids a run was asked to date: everything after the "--"."""
+        return [d.video_id_from_url(url) for url in cmd[cmd.index("--") + 1:]]
+
+    @staticmethod
+    def epoch_of(vid):
+        return 1700000000 + int(vid[1:])
+
+    def answer(self, cmd, **_kw):
+        """yt-dlp dating every video it was given."""
+        with self.lock:
+            self.commands.append(cmd)
+        printed = "".join(f"{v}\t{self.epoch_of(v)}\n" for v in self.asked(cmd))
+        return subprocess.CompletedProcess(cmd, 0, printed, "")
+
+    def dates(self, items, run=None, deadline=None):
+        d.subprocess.run = run or self.answer
+        with contextlib.redirect_stdout(io.StringIO()):
+            return d.resolve_dates(items, deadline=deadline)
+
+    def free_lanes(self):
+        got = 0
+        while d.DATE_LANES.acquire(blocking=False):
+            got += 1
+        for _ in range(got):
+            d.DATE_LANES.release()
+        return got
+
+    def with_cookies(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "cookies.txt")
+        with open(path, "w") as f:
+            f.write("# Netscape HTTP Cookie File\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n")
+        d.COOKIES_FILE = path
+        d.COOKIE_COPIES.clear()
+        return path
+
+    # ------------------------------------------------------------ the split
+    def test_five_or_fewer_stay_one_run_with_the_command_they_always_had(self):
+        items = self.videos(5)
+        self.assertEqual(self.dates(items), (5, None))
+        self.assertEqual(self.commands, [
+            d.base_cmd() + list(d.PO_TOKEN_FLAGS)
+            + ["--no-warnings", "--ignore-errors", "--skip-download",
+               "--print", "%(id)s\t%(timestamp)s", "--"]
+            + [i["url"] for i in items]])
+        self.assertEqual(self.free_lanes(), 2, "a single run borrows nothing")
+
+    def test_a_batch_is_dated_in_interleaved_chunks(self):
+        # Interleaved, so the top of a ranked list is spread over every chunk
+        # and dated first by each of them.
+        items = self.videos(9)
+        self.assertEqual(self.dates(items), (9, None))
+        ids = [i["id"] for i in items]
+        self.assertEqual(sorted(self.asked(c) for c in self.commands),
+                         [ids[0::3], ids[1::3], ids[2::3]])
+        self.assertEqual([i["epoch"] for i in items],
+                         [self.epoch_of(v) for v in ids])
+        self.assertEqual(self.free_lanes(), 2, "every lane is given back")
+
+    def test_never_a_chunk_under_the_floor_nor_more_than_the_workers(self):
+        for count, workers, runs in ((6, 3, 2), (8, 3, 2), (9, 3, 3), (30, 3, 3),
+                                     (30, 2, 2), (30, 1, 1)):
+            with self.subTest(count=count, workers=workers):
+                self.commands.clear()
+                d.DATE_WORKERS = workers
+                self.assertEqual(self.dates(self.videos(count)), (count, None))
+                self.assertEqual(len(self.commands), runs)
+                self.assertEqual(d.date_runs_for(count), runs)
+
+    def test_the_chunks_really_run_at_the_same_time(self):
+        meet = threading.Barrier(3, timeout=5)
+
+        def run(cmd, **kw):
+            meet.wait()        # broken - and raised - unless all three are in flight
+            return self.answer(cmd)
+
+        self.assertEqual(self.dates(self.videos(9), run), (9, None))
+
+    def test_every_copy_of_one_video_is_dated_by_one_run(self):
+        # The same id twice must not land in two threads, each writing it.
+        items = self.videos(9)
+        twin = dict(items[4])
+        items.append(twin)
+        self.assertEqual(self.dates(items), (9, None))
+        holders = [c for c in self.commands if twin["id"] in self.asked(c)]
+        self.assertEqual(len(holders), 1)
+        self.assertEqual(twin["epoch"], self.epoch_of(twin["id"]))
+        self.assertEqual(items[4]["epoch"], twin["epoch"])
+
+    def test_a_video_already_dated_is_not_asked_for(self):
+        items = self.videos(9)
+        items[0]["epoch"] = 5
+        self.assertEqual(self.dates(items), (8, None))
+        self.assertNotIn(items[0]["id"], [v for c in self.commands for v in self.asked(c)])
+        self.assertEqual(items[0]["epoch"], 5)
+        self.assertEqual(len(self.commands), 2, "eight undated make two chunks")
+
+    def test_the_estimate_is_the_longest_chunk(self):
+        # A run's start-up plus its own videos: the runs overlap, so a batch
+        # takes as long as its biggest chunk, not the sum.
+        self.assertEqual(d.date_seconds(2), 9)          # one run: 5 + 2 x 2.1
+        self.assertEqual(d.date_seconds(9), 11)         # three runs of 3
+        self.assertEqual(d.date_seconds(10), 13)        # 4, 3 and 3
+        d.DATE_WORKERS = 1
+        self.assertEqual(d.date_seconds(10), 26)
+
+    # ------------------------------------------------------ what it answers
+    def test_a_chunk_that_failed_beside_dated_ones_is_no_error(self):
+        # The answer one run gives when YouTube bot-checks it half way: what
+        # came back, no error, and the rest undated.
+        items = self.videos(9)
+
+        def run(cmd, **kw):
+            if items[1]["id"] in self.asked(cmd):
+                return subprocess.CompletedProcess(cmd, 1, "", BOT_CHECK)
+            return self.answer(cmd)
+
+        self.assertEqual(self.dates(items, run), (6, None))
+        self.assertEqual([i["epoch"] is None for i in items],
+                         [n % 3 == 1 for n in range(9)])
+
+    def test_every_chunk_failing_is_the_error_one_run_gives(self):
+        dated, error = self.dates(self.videos(9), lambda cmd, **kw:
+                                  subprocess.CompletedProcess(cmd, 1, "", BOT_CHECK))
+        self.assertEqual(dated, 0)
+        self.assertIn("not a bot", error)
+
+    def test_a_failure_beside_chunks_that_found_no_date_is_still_an_error(self):
+        # Nothing came back at all, and one run of the lot would have exited
+        # non-zero: that is a failed fetch, not "these have no date".
+        items = self.videos(9)
+
+        def run(cmd, **kw):
+            code = 1 if items[2]["id"] in self.asked(cmd) else 0
+            return subprocess.CompletedProcess(cmd, code, "", BOT_CHECK if code else "")
+
+        dated, error = self.dates(items, run)
+        self.assertEqual(dated, 0)
+        self.assertIn("not a bot", error)
+
+    def test_chunks_that_exit_cleanly_with_nothing_are_no_error(self):
+        self.assertEqual(self.dates(self.videos(9), lambda cmd, **kw:
+                                    subprocess.CompletedProcess(cmd, 0, "", "")),
+                         (0, None))
+
+    def test_a_chunk_that_times_out_keeps_what_it_printed(self):
+        items = self.videos(9)
+
+        def run(cmd, **kw):
+            asked = self.asked(cmd)
+            if items[0]["id"] in asked:
+                late = subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+                late.stdout = f"{asked[0]}\t{self.epoch_of(asked[0])}\n".encode()
+                raise late
+            return self.answer(cmd)
+
+        self.assertEqual(self.dates(items, run), (7, None))
+        self.assertIsNotNone(items[0]["epoch"])
+        self.assertIsNone(items[3]["epoch"], "cut off before it was dated")
+
+    def test_a_chunk_that_raises_raises_once_the_others_are_done(self):
+        items, finished = self.videos(9), []
+
+        def run(cmd, **kw):
+            if items[0]["id"] in self.asked(cmd):
+                raise RuntimeError("a bug, not a failed fetch")
+            time.sleep(0.2)
+            answer = self.answer(cmd)
+            with self.lock:
+                finished.append(cmd)
+            return answer
+
+        with self.assertRaises(RuntimeError):
+            self.dates(items, run)
+        self.assertEqual(len(finished), 2, "no thread may still be writing items")
+        self.assertEqual(self.free_lanes(), 2, "the lanes must be given back")
+
+    # ------------------------------------------------------- the deadline
+    def test_every_chunk_runs_against_the_one_deadline(self):
+        timeouts = []
+
+        def run(cmd, **kw):
+            with self.lock:
+                timeouts.append(kw["timeout"])
+            return self.answer(cmd)
+
+        self.dates(self.videos(9), run, deadline=time.monotonic() + 40)
+        self.assertEqual(len(timeouts), 3)
+        self.assertTrue(all(38 <= t <= 40 for t in timeouts), timeouts)
+        timeouts.clear()
+        self.dates(self.videos(9), run)                   # no wall: the batch's own
+        self.assertEqual(timeouts, [d.DATE_TIMEOUT] * 3)
+
+    def test_no_chunk_escalates_past_the_deadline(self):
+        # A route that fails after the wall is not followed by the next route
+        # in any chunk: the deadline is the whole call's, not each run's.
+        d.po_token_first[0] = False                      # plain, then PO token
+        runs = []
+
+        def run(cmd, **kw):
+            with self.lock:
+                runs.append(cmd)
+            time.sleep(0.4)
+            return subprocess.CompletedProcess(cmd, 1, "", BOT_CHECK)
+
+        dated, error = self.dates(self.videos(9), run, deadline=time.monotonic() + 0.2)
+        self.assertEqual((dated, len(runs)), (0, 3), "one route per chunk, no more")
+        self.assertIn("not a bot", error)
+
+    # ------------------------------------------------------- the cookie jar
+    def test_the_cookie_copy_is_made_once_before_any_thread_starts(self):
+        self.with_cookies()
+        events, real = [], d.tempfile.mkstemp
+
+        def mkstemp(*args, **kwargs):
+            with self.lock:
+                events.append(("copy", threading.current_thread() is threading.main_thread()))
+            return real(*args, **kwargs)
+
+        d.tempfile.mkstemp = mkstemp
+        self.addCleanup(setattr, d.tempfile, "mkstemp", real)
+        jars = []
+
+        def run(cmd, **kw):
+            with self.lock:
+                events.append(("run", None))
+                jars.append(cmd[cmd.index("--cookies") + 1])
+            return self.answer(cmd)
+
+        self.assertEqual(self.dates(self.videos(9), run), (9, None))
+        self.assertEqual(events[0], ("copy", True), "made first, by the caller")
+        self.assertEqual(sum(1 for e in events if e[0] == "copy"), 1, "and only once")
+        self.assertEqual(len(jars), 3)
+        self.assertEqual(len(set(jars)), 1, "every chunk uses the one copy")
+        self.assertTrue(os.path.exists(jars[0]))
+
+    def test_a_jar_one_chunk_dropped_is_retried_without_by_the_others(self):
+        # All three are rejected at once; drop_rejected_cookies says yes to the
+        # first and no to the rest, which found the jar already gone. Each must
+        # still ask again without it, as one run would have.
+        self.with_cookies()
+        meet = threading.Barrier(3, timeout=5)
+
+        def run(cmd, **kw):
+            if "--cookies" in cmd:
+                meet.wait()
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "ERROR: [youtube] x: The page needs to be reloaded.")
+            return self.answer(cmd)
+
+        self.assertEqual(self.dates(self.videos(9), run), (9, None))
+        self.assertFalse(d.use_cookies[0])
+        self.assertEqual(len(self.commands), 3, "each chunk asked again, without")
+
+    # ------------------------------------------------- the process-wide bound
+    def test_a_call_splits_only_as_far_as_lanes_are_free(self):
+        d.DATE_LANES.acquire()                           # another slot holds one
+        try:
+            self.assertEqual(self.dates(self.videos(9)), (9, None))
+            self.assertEqual(len(self.commands), 2)
+            self.commands.clear()
+            d.DATE_LANES.acquire()                       # ...and now both
+            try:
+                items = self.videos(9)
+                self.assertEqual(self.dates(items), (9, None))
+                self.assertEqual([self.asked(c) for c in self.commands],
+                                 [[i["id"] for i in items]],
+                                 "no lane free: one run, as it always was")
+            finally:
+                d.DATE_LANES.release()
+        finally:
+            d.DATE_LANES.release()
+        self.assertEqual(self.free_lanes(), 2)
+
+    def test_calls_at_once_borrow_from_one_pool(self):
+        # Each call has its own run; the extras come from the pool's two. Two
+        # calls that could each split three ways run four at once, not six.
+        gate, live, peak = threading.Event(), [0], [0]
+
+        def run(cmd, **kw):
+            with self.lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            gate.wait(5)
+            with self.lock:
+                live[0] -= 1
+            return self.answer(cmd)
+
+        d.subprocess.run = run
+        answers = []
+        calls = [threading.Thread(target=lambda: answers.append(
+            d.resolve_dates(self.videos(9)))) for _ in range(2)]
+        for call in calls:
+            call.start()
+        try:
+            self.assertTrue(until(lambda: live[0] == 4), "four runs should start")
+            time.sleep(0.3)                              # time for a fifth to sneak in
+            self.assertEqual(live[0], 4, "a call borrowed a lane the pool did not have")
+        finally:
+            gate.set()
+            for call in calls:
+                call.join(10)
+        self.assertEqual(peak[0], 4)
+        self.assertEqual(answers, [(9, None), (9, None)])
+        self.assertEqual(self.free_lanes(), 2)
+
+    def test_the_pool_is_one_less_than_the_workers(self):
+        os.environ["YTMEER_DATE_WORKERS"] = "5"
+        try:
+            self.assertEqual(d.env_int("YTMEER_DATE_WORKERS", 3, 1, 8), 5)
+            os.environ["YTMEER_DATE_WORKERS"] = "lots"
+            self.assertEqual(d.env_int("YTMEER_DATE_WORKERS", 3, 1, 8), 3)
+            os.environ["YTMEER_DATE_WORKERS"] = "0"
+            self.assertEqual(d.env_int("YTMEER_DATE_WORKERS", 3, 1, 8), 1)
+            os.environ["YTMEER_DATE_WORKERS"] = "99"
+            self.assertEqual(d.env_int("YTMEER_DATE_WORKERS", 3, 1, 8), 8)
+        finally:
+            del os.environ["YTMEER_DATE_WORKERS"]
+        # As the module ships: a pool of DATE_WORKERS - 1 extra runs.
+        pool, extra = self.saved[4], 0
+        while pool.acquire(blocking=False):
+            extra += 1
+        for _ in range(extra):
+            pool.release()
+        self.assertEqual(extra, self.saved[2] - 1)
+
+    # ------------------------------------------------------------ the trace
+    def test_the_trace_says_how_the_batch_was_split(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        d.LOG_DEBUG[0] = os.path.join(folder, "trace.jsonl")
+        self.dates(self.videos(9))
+        with open(d.LOG_DEBUG[0], encoding="utf-8") as f:
+            events = [json.loads(line) for line in f]
+        split = [e for e in events if e["event"] == "dates_split"]
+        joined = [e for e in events if e["event"] == "dates_joined"]
+        runs = [e for e in events if e["event"] == "search_dates"]
+        self.assertEqual((split[0]["chunks"], split[0]["sizes"]), (3, [3, 3, 3]))
+        self.assertEqual((joined[0]["dated"], joined[0]["failed_chunks"]), (9, 0))
+        self.assertEqual(sorted(e["chunk"] for e in runs), [1, 2, 3])
+
+    def test_a_search_with_limit_ten_dates_in_three_runs(self):
+        # The route the brief was about, end to end through search_items.
+        saved = (d.search_flat, d.RESOLVE_DATES, d.LIMIT, d.MIN_DURATION, d.SKIP_IDS,
+                 d.SEARCH_QUERY, d.SORT_BY, d.DAYS, d.THIS_MONTH, d.SEARCH_MATCH,
+                 d.IN_CHANNEL, d.SEARCH_COUNT, d.MIN_VIEWS, d.INCLUDE_SHORTS,
+                 d.DATE_RESOLVE_MAX, d.SEARCH_DEADLINE)
+        pool = [{"id": f"v{n:010d}", "title": str(n), "view_count": 100 + n,
+                 "duration": 900} for n in range(30)]
+        d.search_flat = lambda query, count: (list(pool), None)
+        d.RESOLVE_DATES, d.LIMIT, d.MIN_DURATION, d.SKIP_IDS = True, 10, 180, set()
+        d.SEARCH_QUERY, d.SORT_BY, d.DAYS, d.THIS_MONTH = "cats", "relevance", 0, False
+        d.SEARCH_MATCH, d.IN_CHANNEL, d.SEARCH_COUNT = "related", None, None
+        d.MIN_VIEWS, d.INCLUDE_SHORTS = 0, False
+        d.DATE_RESOLVE_MAX, d.SEARCH_DEADLINE = 20, time.monotonic() + 120  # as the API runs it
+        try:
+            d.subprocess.run = self.answer
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                kept, err = d.search_items("cats")
+        finally:
+            (d.search_flat, d.RESOLVE_DATES, d.LIMIT, d.MIN_DURATION, d.SKIP_IDS,
+             d.SEARCH_QUERY, d.SORT_BY, d.DAYS, d.THIS_MONTH, d.SEARCH_MATCH,
+             d.IN_CHANNEL, d.SEARCH_COUNT, d.MIN_VIEWS, d.INCLUDE_SHORTS,
+             d.DATE_RESOLVE_MAX, d.SEARCH_DEADLINE) = saved
+        self.assertIsNone(err)
+        self.assertEqual(len(kept), 10)
+        self.assertTrue(all(i["epoch"] for i in kept))
+        self.assertEqual(sorted(len(self.asked(c)) for c in self.commands), [3, 3, 4])
+        self.assertEqual(d.SEARCH_COUNTS[0]["dated"], 10)
+        self.assertIn("in 3 runs at once", out.getvalue())
 
 
 class TestFolderLock(unittest.TestCase):

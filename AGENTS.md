@@ -245,6 +245,9 @@ reach another. Every request resets every global it can set, so nothing leaks
 between requests either. Past the last slot a request waits up to 5s and then
 gets `503` — retry, do not queue. More slots is more requests from one IP at
 once, which is what YouTube's bot check reacts to; that is why it is four.
+A search's publish dates run up to three yt-dlp extractions at once (§5.3);
+the two beyond its own come from one pool the whole process shares, and only
+when free, so four slots dating at once run six extractions, never twelve.
 
 **A repeat comes from memory.** The same question asked again within
 `YTMEER_CACHE_TTL` (default 900s; `0` turns it off) is answered at once, without
@@ -358,7 +361,7 @@ own average, not twice anything global. The average is always taken over **every
 long video **before** `--limit`, so the ratio compares a video with its channel
 rather than with the others on the page.
 
-### 5.3 Publish dates cost ~2.1s per video
+### 5.3 Publish dates cost ~2.1s per video, three runs at once
 
 A flat YouTube listing carries views, duration and channel but **no upload
 date**. So:
@@ -366,8 +369,13 @@ date**. So:
 - `--channel-videos` returns **no dates at all** — dating 276 videos would be
   ten minutes. Use `--details` on the channel for first/last upload, which dates
   exactly two videos.
-- A search fetches dates for the results that **survived the filters**, in one
-  call: 20 in 42.6s.
+- A search fetches dates for the results that **survived the filters**, split
+  over up to three yt-dlp runs at once (`YTMEER_DATE_WORKERS`, default 3): one
+  `limit=10` search's 10 dates took **20.2s** where one run took **35.7s**
+  (16 Nov 2026). Five or fewer stay one run, because each run spends a few
+  seconds starting. The runs beyond a search's own come from one pool the whole
+  process shares and are taken only when free (§4.1), so under load a search
+  dates in one run, as before — never slower.
 - A date **window** (`--days`, `--this-month`) is applied **locally**: the full
   relevance list is fetched, sorted, then dated *down the list in order*,
   stopping as soon as `--limit` is filled. On one title this found **20** videos
@@ -394,16 +402,17 @@ the slot count (§4.1); a repeat within the cache's 15 minutes costs nothing.
 
 | Operation | Measured |
 |---|---|
-| Flat search scan | ~0.07s per result (150 in ~12s) |
+| Flat search scan | ~0.1s per result (150 in 12-17s) |
 | Dated search scan | ~2s per result |
-| Publish date, per video | ~2.1s (~3s each for a batch of 3) |
+| Publish dates, 10 survivors | ~20s, three runs at once (35.7s in one run) |
+| Search, `limit=10`, with dates | ~37s (49s with its dates in one run) |
 | Video details | ~5-8s (4.7s and 7.7s on 16 Nov 2026) |
 | The same question again | ~0s (cache, §4.1) |
 | Channel details (278 videos) | ~23s |
 | Channel videos (278 listed) | ~11s |
 | Playlists (5, with counts) | ~8s |
 | Similar videos (no dates) | ~24s |
-| Similar videos (with dates, 20 kept) | ~65s |
+| Similar videos (with dates, 20 kept) | ~65s with its dates in one run; now split three ways, not re-measured |
 | Transcript | ~9s |
 | 20 comments | ~5s (one yt-dlp run; it was two, 9.7s) |
 | 100 comments | ~7s (~19s with replies) |
@@ -568,7 +577,10 @@ to guess how a run was invoked. Then one event per stage: `sources_start`,
 `channel_videos`, `channel_playlists`, `about_page`, `similar_videos`,
 `channel_start` / `channel_finish` (with the full per-reason tally),
 `search_start` / `search_finish`, `window_block` / `window_finish`,
-`search_dates`, `video_start` / `video_finish`, `caption_*`, `comments_*`,
+`search_dates` (one per date run, with its `chunk` number when the batch was
+split), `dates_split` / `dates_joined` (a batch dated in several runs at once:
+the chunk sizes, then what came back and how many chunks failed),
+`video_start` / `video_finish`, `caption_*`, `comments_*`,
 `extras_*`, `stale_stub_removed` (the final sweep succeeded, so the failed
 attempt's `video_<id>` folder went — `stale_stub_kept` says when one could not
 be), and `command_start` / `command_finish` / `command_timeout` for

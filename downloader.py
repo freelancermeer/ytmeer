@@ -109,9 +109,26 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import wait as wait_for_all
 from urllib.parse import quote, urlsplit, urlunsplit
+
+
+def env_int(name, default, low, high):
+    """A whole-number setting from the environment, clamped to [low, high].
+
+    Anything that is not a number is the default rather than a crash: this is
+    read at import, and a typo in an editor's "env" block must not take the
+    MCP server down with it.
+    """
+    try:
+        value = int(str(os.environ.get(name, "")).strip() or default)
+    except ValueError:
+        return default
+    return max(low, min(high, value))
+
 
 # These are filled in from command-line arguments in main().
 LINKS_FILE     = "links.txt"
@@ -173,7 +190,8 @@ SEARCH_DEPTH_DATED = 40
 # none - so they are fetched afterwards, for the videos that SURVIVED the
 # filters and the limit rather than for everything scanned. Measured at about
 # 2.1s per video (20 in 42.6s, one yt-dlp call), so dating the 20 results of a
-# search costs 42s where dating the 150 it looked at would cost five minutes.
+# search cost 42s in one run - less now that it is split, see DATE_WORKERS -
+# where dating the 150 it looked at would cost five minutes.
 #
 # The cap is what stops an unlimited search from quietly spending those five
 # minutes: past it the dates are left out and the run says so, naming --limit.
@@ -190,6 +208,25 @@ SEARCH_DEADLINE  = None
 # over three minutes. The REST API lowers it for itself, because a request
 # cannot hold the downloader's globals for that long (see ROUTE_GLOBALS).
 DATE_RESOLVE_MAX = 100
+# One yt-dlp run dates its videos one full extraction after another - 3 took
+# 9.3s, 20 took 42.6s - so resolve_dates splits a batch into up to this many
+# interleaved chunks and runs them side by side, one yt-dlp each: one search's
+# 10 dates took 20.2s in three runs where one run took 35.7s (16 Nov 2026).
+# A chunk is never smaller than DATE_CHUNK_MIN videos: every run pays a few
+# seconds to start (the watch page, the ~2 MB player script) before its first
+# date, so a batch of five or fewer stays one run, exactly as it always was.
+DATE_WORKERS     = env_int("YTMEER_DATE_WORKERS", 3, 1, 8)
+DATE_CHUNK_MIN   = 3
+# The chunks after a call's first are borrowed from this pool, without waiting:
+# a call takes the lanes that are free when it starts and dates in that many
+# chunks - in one run, as before, when none is free. So dating is never slower
+# than it was, and never waits on anything new. The pool belongs to the
+# process, not to a module: api.py's engine slots are copies of this module and
+# all draw on this one (EnginePool.SHARED). Four slots dating at once therefore
+# run at most four runs plus DATE_WORKERS - 1 extra, not four times
+# DATE_WORKERS - and how much one IP asks for at once is what YouTube's bot
+# check reacts to.
+DATE_LANES       = threading.BoundedSemaphore(DATE_WORKERS - 1)
 SEARCH_COUNT   = None      # --search-count N; None = pick by route
 SORT_BY        = "relevance"   # relevance | views | date | oldest
 THIS_MONTH     = False     # --this-month: since the 1st of the current month
@@ -669,6 +706,7 @@ def settings_snapshot():
         "search_depth": search_depth(needs_dated_route()) if SEARCH_QUERY else None,
         "sort_by": SORT_BY, "dated_route": needs_dated_route(),
         "resolve_dates": RESOLVE_DATES, "date_resolve_max": DATE_RESOLVE_MAX,
+        "date_workers": DATE_WORKERS,
         "channel_video_cap": CHANNEL_VIDEO_CAP,
         "verbose": VERBOSE, "search_deadline": SEARCH_DEADLINE is not None,
     }
@@ -3525,10 +3563,112 @@ def resolve_dates(items, deadline=None):
     Gets the route escalation and cookie-rejection retry every other lone fetch
     here does, because asking for one field of many videos meets the same bot
     check the rest of them do.
+
+    A batch of DATE_CHUNK_MIN videos per lane or more is dated in up to
+    DATE_WORKERS chunks at once, as many as DATE_LANES has free; anything
+    smaller, or a call that finds no lane free, is one run as before. The
+    answer means the same either way - see date_in_chunks.
+    """
+    groups = {}
+    for item in items:
+        if item.get("epoch") is None and item.get("id"):
+            groups.setdefault(item["id"], []).append(item)
+    lanes = 1 + borrow_date_lanes(date_runs_for(len(groups)) - 1)
+    if lanes == 1:
+        return _resolve_dates_serial(items, deadline)
+    try:
+        return date_in_chunks(list(groups.values()), lanes, deadline)
+    finally:
+        for _ in range(lanes - 1):
+            DATE_LANES.release()
+
+
+def date_runs_for(count):
+    """How many yt-dlp runs at once resolve_dates dates count videos in, when
+    every lane is free: never a chunk under DATE_CHUNK_MIN, never more than
+    DATE_WORKERS. What the run's own estimates are printed from, too."""
+    return max(1, min(DATE_WORKERS, count // max(1, DATE_CHUNK_MIN)))
+
+
+def date_seconds(count):
+    """About how long dating count videos takes. Each run spends ~5s starting
+    (the watch page, the player script) and ~2.1s a video after that, and the
+    runs go side by side - so it is the longest chunk that counts. Measured on
+    16 Nov 2026, one search's 10 dates: 35.7s in one run, 20.2s in three."""
+    return round(5 + 2.1 * -(-count // date_runs_for(count)))
+
+
+def borrow_date_lanes(wanted):
+    """Take up to wanted lanes from DATE_LANES without waiting; how many it got.
+
+    Never a wait: a lane that is not free now is simply not used, and the batch
+    is cut into fewer chunks. Waiting would make a search slower than the one
+    run it replaced whenever other slots were busy dating.
+    """
+    got = 0
+    while got < wanted and DATE_LANES.acquire(blocking=False):
+        got += 1
+    return got
+
+
+def date_in_chunks(groups, lanes, deadline):
+    """Date these videos in `lanes` yt-dlp runs at once. Returns (dated, error).
+
+    groups holds the undated items by video id, in the caller's order; every
+    copy of one id goes in the same chunk, so no two threads ever write the
+    same item. The chunks are interleaved - videos 1, 4, 7 / 2, 5, 8 / 3, 6, 9
+    - so the top of a ranked list is spread over every chunk and dated first
+    by each: a deadline that cuts the batch short leaves the videos furthest
+    down undated, as one run would have.
+
+    Every chunk keeps the one deadline the caller gave. The answer means what
+    one run's does: an error only when no chunk dated anything. A chunk that
+    failed beside one that did leaves its own videos undated, which the caller
+    already reports as could-not-be-dated - one run that is bot-checked half
+    way through says exactly that too.
+    """
+    chunks = [[item for group in groups[n::lanes] for item in group]
+              for n in range(lanes)]
+    # The private cookies.txt copy is made here, once, before any thread runs:
+    # every chunk's own base_cmd() then finds it, where several threads would
+    # each write a copy and replace one another's (cookie_flags).
+    base_cmd()
+    log_debug("dates_split", stage="search", asked=len(groups), chunks=lanes,
+              sizes=[len(chunk) for chunk in chunks])
+    pool = ThreadPoolExecutor(max_workers=lanes, thread_name_prefix="ytmeer-dates")
+    try:
+        futures = [pool.submit(_resolve_dates_serial, chunk, deadline, number)
+                   for number, chunk in enumerate(chunks, 1)]
+        wait_for_all(futures)
+    except KeyboardInterrupt:
+        # As in expand_sources: do not sit out the other chunks on Ctrl+C. Each
+        # is bounded by its own subprocess timeout either way.
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    # After every chunk has finished, so a chunk that raised raises here just
+    # as one run would - and no thread is still writing an item when it does.
+    results = [future.result() for future in futures]
+    dated = sum(got for got, _error in results)
+    errors = [error for _got, error in results if error]
+    log_debug("dates_joined", stage="search", chunks=lanes, dated=dated,
+              failed_chunks=len(errors), error=errors[0] if errors else None)
+    if dated:
+        return dated, None
+    return 0, errors[0] if errors else None
+
+
+def _resolve_dates_serial(items, deadline=None, chunk=None):
+    """resolve_dates as one yt-dlp batch over every undated item it is given -
+    retried and escalated as one, and what resolve_dates always did.
+
+    chunk is this batch's number when date_in_chunks split the call, so the
+    trace can tell its runs apart; it changes nothing else.
     """
     urls = [i["url"] for i in items if i.get("epoch") is None and i.get("id")]
     if not urls:
         return 0, None
+    which = {"chunk": chunk} if chunk else {}
     budget = DATE_TIMEOUT
     if deadline is not None:
         budget = min(budget, max(1, int(deadline - time.monotonic())))
@@ -3556,7 +3696,7 @@ def resolve_dates(items, deadline=None):
                 # for it twice; a slow last video must not cost the batch.
                 dates = parse_dates(flushed_lines(e.stdout))
                 log_debug("search_dates", stage="search", timed_out=True,
-                          asked=len(urls), got=len(dates), route=route_no)
+                          asked=len(urls), got=len(dates), route=route_no, **which)
                 if dates:
                     return store(dates), None
                 return 0, "Timed out while fetching publish dates"
@@ -3565,12 +3705,15 @@ def resolve_dates(items, deadline=None):
             dates = parse_dates(printed)
             log_debug("search_dates", stage="search", route=route_no,
                       attempt=attempt, returncode=code, asked=len(urls),
-                      got=len(dates), stderr_tail=stderr)
+                      got=len(dates), stderr_tail=stderr, **which)
             if dates:
                 return store(dates), None
             # Nothing parsed. A rejected cookies.txt earns the same route one
-            # more try without the jar, exactly as fetch_comments does.
-            if attempt == 1 and drop_rejected_cookies(stderr):
+            # more try without the jar, exactly as fetch_comments does. So does
+            # a run whose jar a chunk beside it dropped while both were in
+            # flight: drop_rejected_cookies finds it gone already and says no.
+            if attempt == 1 and (drop_rejected_cookies(stderr)
+                                 or ("--cookies" in cmd and not use_cookies[0])):
                 continue
             if code:
                 last = stderr.strip().splitlines()
@@ -3771,8 +3914,11 @@ def search_items(query):
         # Dates fetched down the sorted list, keeping what is in the window and
         # stopping as soon as --limit is satisfied.
         wanted_text = f"{LIMIT} video(s)" if LIMIT else "every video"
+        # take_in_window's own block size, so this says what it will do.
+        runs = date_runs_for(min(max(1, LIMIT or 20), DATE_RESOLVE_MAX))
         print(f"  Dates   : walking the list for {wanted_text} {label},"
-              f" at about 2.1s per date, up to {DATE_RESOLVE_MAX}...")
+              f" at about 2.1s per date{f', {runs} at a time' if runs > 1 else ''},"
+              f" up to {DATE_RESOLVE_MAX}...")
         candidates = len(items)
         walk = take_in_window(items, since, LIMIT, deadline=SEARCH_DEADLINE)
         items = walk["kept"]
@@ -3806,8 +3952,10 @@ def search_items(query):
         # than for everything scanned - see DATE_RESOLVE_MAX.
         if RESOLVE_DATES and items and all(i.get("epoch") is None for i in items):
             if len(items) <= DATE_RESOLVE_MAX:
+                runs = date_runs_for(len(items))
                 print(f"  Dates   : fetching {len(items)} publish date(s)"
-                      f" (about {round(len(items) * 2.1)}s)...")
+                      f"{f' in {runs} runs at once' if runs > 1 else ''}"
+                      f" (about {date_seconds(len(items))}s)...")
                 dated, err = resolve_dates(items, deadline=SEARCH_DEADLINE)
                 counts["dated"] = dated
                 counts["undated"] = len(items) - dated
@@ -5837,9 +5985,10 @@ def parse_args(argv=None):
                    help="Search window: since the 1st of the current month.")
     p.add_argument("--no-dates", action="store_true", dest="no_dates",
                    help=f"Do not fetch publish dates for search results. They "
-                        f"cost about 2.1s per video and are fetched only for "
-                        f"the results that survive the filters, up to "
-                        f"{DATE_RESOLVE_MAX} of them. NOTE: with --days or "
+                        f"cost about 2.1s per video, up to {DATE_WORKERS} "
+                        f"yt-dlp runs at once (YTMEER_DATE_WORKERS), and are "
+                        f"fetched only for the results that survive the "
+                        f"filters, up to {DATE_RESOLVE_MAX} of them. NOTE: with --days or "
                         f"--this-month this also hands the window back to "
                         f"YouTube, which answers it from a much narrower "
                         f"search - faster, but fewer results.")
