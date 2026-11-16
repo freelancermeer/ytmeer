@@ -33,9 +33,8 @@ def pytest_collection_modifyitems(config, items):
 
 def _fresh_engine_state():
     api = sys.modules.get("api")
-    if api is not None and hasattr(api, "CACHE"):
-        api.CACHE.clear()
-        api.reset_bot_pause()
+    if api is not None and hasattr(api, "reset_engine_state"):
+        api.reset_engine_state()
 
 
 @pytest.fixture(autouse=True)

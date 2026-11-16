@@ -659,6 +659,9 @@ class TestJobFile(unittest.TestCase):
 
 
 class TestPreview(unittest.TestCase):
+    def setUp(self):
+        api.reset_engine_state()          # a kept preview would answer the next test
+
     def test_a_preview_past_every_slot_is_turned_away_rather_than_queued(self):
         # A request a proxy abandons keeps its listing running; waiting behind it
         # would make every later preview time out as well. So once every slot

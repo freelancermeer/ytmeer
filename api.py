@@ -39,6 +39,12 @@ the first while the rest are still downloading. Pass back the "next" it returns.
 A video that failed can come back later as "ok", because a run retries its
 failures once at the end: act on "ok" and "skipped".
 
+Lookups run side by side, YTMEER_ENGINE_SLOTS (default 4) at a time, each on
+its own copy of downloader.py's module globals (EnginePool). A repeat within
+YTMEER_CACHE_TTL (900s) is answered from memory and says cached: true; a bot
+check pauses every lookup for YTMEER_BOT_PAUSE (60s, doubling). /api/health
+reports all three under "engine".
+
 Only build_app() and main() import fastapi; the rest is stdlib, so it imports -
 and tests - without it.
 """
@@ -1338,6 +1344,13 @@ def _lookup(fn):
     return wrapper
 
 
+def reset_engine_state():
+    """Forget every kept answer and any bot-check pause - for a test, which
+    stubs the engine and would otherwise be handed the last test's answer."""
+    CACHE.clear()
+    reset_bot_pause()
+
+
 def engine_status():
     """What /api/health and yt_health say about the engine."""
     left, reason = bot_pause_left()
@@ -1800,6 +1813,8 @@ def build_app():
             return preview_channel(channel, views, limit, skip, shorts, min_duration)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
+        except LookupFailed as e:             # BackingOff: paused after a bot check
+            raise HTTPException(502, str(e))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
 
@@ -1868,6 +1883,8 @@ def build_app():
                                     match, shorts, min_duration, dates)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "query"))
+        except LookupFailed as e:             # BackingOff: paused after a bot check
+            raise HTTPException(502, str(e))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
         if answer.get("error") and not answer.get("results"):

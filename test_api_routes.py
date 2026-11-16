@@ -99,6 +99,9 @@ class TestRoutes(unittest.TestCase):
         api.DOWNLOADER = fake
         api.DEFAULT_OUT = os.path.join(self.tmp.name, "out")
         api.JOBS.clear()
+        # Kept answers and a bot-check pause are process-wide: without this a
+        # stubbed answer from one test is the next test's cache hit.
+        api.reset_engine_state()
         api.configure_key("k", persist=False)
         os.environ["FAKE_N"], os.environ["FAKE_DELAY"] = "3", "0.3"
         os.environ.pop("FAKE_MODE", None)
@@ -487,6 +490,24 @@ class TestRoutes(unittest.TestCase):
         finally:
             (d.is_channel_url, d.list_channel_videos, d.channel_videos_url,
              api.PREVIEW_WAIT, api.ENGINE) = saved
+
+    def test_a_lookup_paused_by_a_bot_check_is_a_502_on_every_route(self):
+        # BackingOff is a LookupFailed: the two routes that did not catch one
+        # (search, preview) answered it with a bare 500.
+        self._stub(is_channel_url=lambda url: True)
+        api._note_outcome("ERROR: Sign in to confirm you're not a bot")
+        for path in ("/api/search?query=x", "/api/preview?channel=https://www.youtube.com/@X",
+                     "/api/video?url=aaaaaaaaaaa", "/api/comments?url=aaaaaaaaaaa",
+                     "/api/transcript?url=aaaaaaaaaaa",
+                     "/api/channel?channel=https://www.youtube.com/@X",
+                     "/api/channel/videos?channel=https://www.youtube.com/@X",
+                     "/api/channel/playlists?channel=https://www.youtube.com/@X",
+                     "/api/similar?url=aaaaaaaaaaa", "/api/resolve?url=aaaaaaaaaaa"):
+            r = self.c.get(path, headers=self.h)
+            self.assertEqual(r.status_code, 502, path)
+            self.assertIn("paused", r.json()["detail"], path)
+        health = self.c.get("/api/health", headers=self.h).json()
+        self.assertTrue(health["engine"]["bot_pause_seconds_left"])
 
     # ------------------------------------------------- lookups, not jobs
     def _stub(self, **functions):
