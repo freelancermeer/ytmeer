@@ -536,6 +536,23 @@ class PlatformCase:
             self.assertEqual([c["id"] for c in got], ["a"])
             self.assertEqual([n for n in os.listdir(folder) if n.endswith(".info.json")], [])
 
+    def test_taking_comments_keeps_the_videos_own_fields(self):
+        # So video_comments can answer from this one yt-dlp run instead of
+        # paying a second lookup for the title and the comment count.
+        with tempfile.TemporaryDirectory() as base:
+            folder = os.path.join(base, "clip")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "clip.info.json"), "w") as f:
+                json.dump({"comments": [self._comment("a")], "formats": [1, 2],
+                           "id": "a" * 11, "title": "Clip", "channel": "Ch",
+                           "comment_count": 4321,
+                           "webpage_url": d.watch_url("a" * 11)}, f)
+            d.COMMENTS_INFO[0] = None
+            d.take_comments(folder)
+        self.assertEqual(d.COMMENTS_INFO[0]["title"], "Clip")
+        self.assertEqual(d.COMMENTS_INFO[0]["comment_count"], 4321)
+        self.assertNotIn("formats", d.COMMENTS_INFO[0], "only the few fields, not 1 MB")
+
     def test_taking_comments_survives_a_broken_info_json(self):
         with tempfile.TemporaryDirectory() as base:
             folder = os.path.join(base, "clip")
@@ -1611,6 +1628,18 @@ class PlatformCase:
         self.assertEqual(d.failure_status("ERROR: Private video"), "unavailable")
         self.assertEqual(d.failure_status("HTTP Error 403: Forbidden"), "failed")
 
+    def test_only_the_bot_check_page_is_a_refusal_of_the_ip(self):
+        # api.py pauses every lookup on this one, so it must not fire for a
+        # rejected cookies.txt, which the same request without the jar passes.
+        for said in ("Sign in to confirm you\u2019re not a bot",
+                     "Sign in to confirm you're not a bot. This helps protect our community."):
+            self.assertTrue(d.is_ip_gated(said), said)
+            self.assertTrue(d.is_bot_gated(said), said)
+        self.assertFalse(d.is_ip_gated("ERROR: the page needs to be reloaded"))
+        self.assertTrue(d.is_bot_gated("ERROR: the page needs to be reloaded"))
+        for said in (None, "", "ERROR: Private video", "HTTP Error 429: Too Many Requests"):
+            self.assertFalse(d.is_ip_gated(said), said)
+
     def test_a_bot_gated_download_is_recorded_as_blocked(self):
         result, record = self._download_one_failing("ERROR: [youtube] x: Sign in to confirm you're not a bot.")
         self.assertEqual((result, record["status"]), ("gone", "blocked"))
@@ -2570,6 +2599,43 @@ class PlatformCase:
         self.assertEqual([t["text"] for t in got["threads"]], ["top", "other"])
         self.assertEqual([r["text"] for r in got["threads"][0]["replies"]], ["reply"])
         self.assertEqual([f for f in made if os.path.exists(f)], [])
+
+    def test_video_comments_is_one_yt_dlp_run(self):
+        # It used to open with a metadata lookup for the title and the count,
+        # then fetch the comments - the same video extracted twice, measured
+        # 4.8s + 4.85s. The comments run's own .info.json carries both.
+        flat = [self._comment("1", parent="root", text="top")]
+        saved = (d.fetch_info, d.fetch_comments)
+        d.fetch_info = lambda *a, **k: self.fail("a second lookup for the same video")
+
+        def comments_for(folder, url):
+            name = os.path.basename(folder.rstrip("/\\"))
+            with open(os.path.join(folder, f"{name}.info.json"), "w") as f:
+                json.dump({"comments": flat, "id": "a" * 11, "title": "Clip",
+                           "channel": "Ch", "comment_count": 77,
+                           "webpage_url": d.watch_url("a" * 11)}, f)
+            return d.take_comments(folder), None
+
+        d.fetch_comments = comments_for
+        try:
+            got, err = d.video_comments("https://youtu.be/aaaaaaaaaaa")
+        finally:
+            d.fetch_info, d.fetch_comments = saved
+        self.assertIsNone(err)
+        self.assertEqual((got["id"], got["title"], got["channel"]), ("a" * 11, "Clip", "Ch"))
+        self.assertEqual((got["total_on_video"], got["fetched"]), (77, 1))
+        self.assertEqual(got["link"], d.watch_url("a" * 11))
+
+    def test_a_failed_comment_fetch_is_the_answer_without_a_lookup(self):
+        saved = (d.fetch_info, d.fetch_comments)
+        d.fetch_info = lambda *a, **k: self.fail("the fetch already said why")
+        d.fetch_comments = lambda folder, url: ([], "ERROR: Video unavailable")
+        try:
+            got, err = d.video_comments("https://youtu.be/aaaaaaaaaaa")
+        finally:
+            d.fetch_info, d.fetch_comments = saved
+        self.assertIsNone(got)
+        self.assertEqual(err, "ERROR: Video unavailable")
 
     def test_comment_data_keeps_a_comments_own_paragraphs(self):
         got = d.comment_data(self._comment("1", text="one\n\ntwo\x07three"))

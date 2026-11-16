@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 import api
@@ -658,18 +659,28 @@ class TestJobFile(unittest.TestCase):
 
 
 class TestPreview(unittest.TestCase):
-    def test_a_second_preview_is_turned_away_rather_than_queued(self):
+    def setUp(self):
+        api.reset_engine_state()          # a kept preview would answer the next test
+
+    def test_a_preview_past_every_slot_is_turned_away_rather_than_queued(self):
         # A request a proxy abandons keeps its listing running; waiting behind it
-        # would make every later preview time out as well.
+        # would make every later preview time out as well. So once every slot
+        # is taken, the next caller is told after PREVIEW_WAIT, not parked.
         d = api.downloader
         saved = (d.is_channel_url, api.PREVIEW_WAIT)
         d.is_channel_url, api.PREVIEW_WAIT = (lambda url: True), 0.2
-        api.PREVIEW_LOCK.acquire()
+        held = [api.ENGINE.acquire(0) for _ in range(api.ENGINE.size)]
         try:
-            with self.assertRaises(api.PreviewBusy):
+            self.assertNotIn(None, held)
+            began = time.monotonic()
+            with self.assertRaises(api.PreviewBusy) as caught:
                 api.preview_channel("https://www.youtube.com/@X", limit=1)
+            self.assertLess(time.monotonic() - began, 2)
+            self.assertIn("still running", str(caught.exception))
         finally:
-            api.PREVIEW_LOCK.release()
+            for index in held:
+                if index is not None:
+                    api.ENGINE.release(index)
             d.is_channel_url, api.PREVIEW_WAIT = saved
 
     def test_a_preview_scans_with_a_deadline(self):
@@ -693,10 +704,405 @@ class TestPreview(unittest.TestCase):
         try:
             with self.assertRaises(RuntimeError):
                 api.preview_channel("https://www.youtube.com/@X", limit=1)
-            self.assertTrue(api.PREVIEW_LOCK.acquire(timeout=0.1))
-            api.PREVIEW_LOCK.release()
+            self.assertEqual(api.ENGINE.in_use(), 0, "the slot must be given back")
         finally:
             d.is_channel_url, d.list_channel_videos = saved
+
+
+BOT_CHECK = ("ERROR: [youtube] aaaaaaaaaaa: Sign in to confirm you’re not a bot. "
+             "This helps protect our community.")
+
+
+class EngineCase(unittest.TestCase):
+    """A private engine pool per test, and the stubs to drive it offline."""
+
+    def setUp(self):
+        self.saved = (api.ENGINE, api.CACHE, api.PREVIEW_WAIT, api.BOT_PAUSE_FIRST)
+        self.stubbed = []
+        api.CACHE = api.AnswerCache(900, 64)
+        api.reset_bot_pause()
+
+    def tearDown(self):
+        for module, name, value in reversed(self.stubbed):
+            setattr(module, name, value)
+        api.ENGINE, api.CACHE, api.PREVIEW_WAIT, api.BOT_PAUSE_FIRST = self.saved
+        api.reset_bot_pause()
+
+    def pool(self, size):
+        api.ENGINE = api.EnginePool(size)
+        for index in range(size):
+            api.ENGINE.module(index)          # every copy made up front
+        return api.ENGINE
+
+    def stub(self, module, **functions):
+        for name, fn in functions.items():
+            self.stubbed.append((module, name, getattr(module, name)))
+            setattr(module, name, fn)
+
+    def stub_all(self, **functions):
+        for module in api.ENGINE.modules():
+            self.stub(module, **functions)
+
+    @staticmethod
+    def until(test, seconds=3.0):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if test():
+                return True
+            time.sleep(0.01)
+        return False
+
+
+class TestEngineSlots(EngineCase):
+    """Lookups overlap now, each on a private copy of downloader's globals."""
+
+    def test_no_more_than_the_slots_run_at_once(self):
+        self.pool(3)
+        api.PREVIEW_WAIT = 10
+        gate, lock, live, peak = threading.Event(), threading.Lock(), [0], [0]
+
+        def details(url):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            gate.wait(5)
+            with lock:
+                live[0] -= 1
+            return {"id": url[-11:]}, None
+
+        self.stub_all(video_details=details)
+        threads = [threading.Thread(target=api.video_info, args=(c * 11,))
+                   for c in "abcdefg"]
+        for t in threads:
+            t.start()
+        try:
+            self.assertTrue(self.until(lambda: live[0] == 3), "three should start")
+            time.sleep(0.3)                   # time for a fourth to sneak in
+            self.assertEqual(live[0], 3, "a fourth lookup ran past three slots")
+            self.assertEqual(api.ENGINE.in_use(), 3)
+        finally:
+            gate.set()
+            for t in threads:
+                t.join(10)
+        self.assertEqual(peak[0], 3)
+        self.assertEqual(api.ENGINE.in_use(), 0)
+
+    def test_overlapping_lookups_finish_together_not_in_turn(self):
+        self.pool(4)
+        self.stub_all(video_details=lambda url: (time.sleep(0.4), ({"id": url[-11:]}, None))[1])
+        began = time.monotonic()
+        threads = [threading.Thread(target=api.video_info, args=(c * 11,))
+                   for c in "abcd"]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        # One at a time this was 1.6s; four slots make it one lookup's time.
+        self.assertLess(time.monotonic() - began, 1.2)
+
+    def test_a_caller_past_every_slot_is_told_after_the_wait(self):
+        pool = self.pool(2)
+        api.PREVIEW_WAIT = 0.2
+        held = [pool.acquire(0), pool.acquire(0)]
+        try:
+            with self.assertRaises(api.PreviewBusy) as caught:
+                api.video_info("a" * 11)
+            self.assertIn("still running", str(caught.exception))
+        finally:
+            for index in held:
+                pool.release(index)
+
+    def test_a_waiting_caller_gets_the_first_slot_to_come_free(self):
+        pool = self.pool(1)
+        api.PREVIEW_WAIT = 5
+        self.stub_all(video_details=lambda url: ({"id": url[-11:]}, None))
+        index = pool.acquire(0)
+        got = {}
+        waiter = threading.Thread(
+            target=lambda: got.update(answer=api.video_info("a" * 11)))
+        waiter.start()
+        time.sleep(0.3)
+        self.assertNotIn("answer", got, "it ran without a slot")
+        pool.release(index)
+        waiter.join(5)
+        self.assertEqual(got["answer"]["id"], "a" * 11)
+
+    def test_overlapping_requests_never_see_each_others_settings(self):
+        self.pool(2)
+        meet = threading.Barrier(2, timeout=5)
+        seen = {}
+
+        def items(query, module):
+            meet.wait()                       # both requests are in flight here
+            seen[query] = (module.__name__, module.MIN_DURATION, module.SEARCH_QUERY,
+                           module.LIMIT)
+            module.SEARCH_FOUND[0] = len(query)
+            return [], None
+
+        for module in api.ENGINE.modules():
+            self.stub(module, search_items=lambda q, m=module: items(q, m))
+        answers = {}
+        threads = [threading.Thread(target=lambda q=q, floor=floor, limit=limit:
+                                    answers.update({q: api.search_youtube(
+                                        q, min_duration=floor, limit=limit,
+                                        dates=False)}))
+                   for q, floor, limit in (("one", 0, 5), ("second", 600, 9))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertNotEqual(seen["one"][0], seen["second"][0], "one module for both")
+        self.assertEqual(seen["one"][1:], (0, "one", 5))
+        self.assertEqual(seen["second"][1:], (600, "second", 9))
+        # Each answer reports its own counter, not the other request's.
+        self.assertEqual(answers["one"]["scanned"], 3)
+        self.assertEqual(answers["second"]["scanned"], 6)
+
+    def test_a_lone_caller_gets_the_imported_module(self):
+        # Slot 0 is api.downloader itself, handed out first, so a stub on it -
+        # which every older test relies on - is what a lone lookup runs.
+        pool = self.pool(3)
+        self.assertIs(pool.module(0), api.downloader)
+        self.assertEqual([pool.acquire(0), pool.acquire(0)], [0, 1])
+        pool.release(0)
+        self.assertEqual(pool.acquire(0), 0)
+
+    def test_facts_about_the_process_are_shared_by_every_slot(self):
+        pool = self.pool(3)
+        for module in pool.modules()[1:]:
+            self.assertIsNot(module, api.downloader)
+            for name in api.EnginePool.SHARED:
+                self.assertIs(getattr(module, name), getattr(api.downloader, name), name)
+        # ...while a setting stays its own module's.
+        first, second = pool.modules()[1:]
+        first.MIN_DURATION = 7
+        self.assertNotEqual(second.MIN_DURATION, 7)
+        self.assertNotEqual(api.downloader.MIN_DURATION, 7)
+
+    def test_a_bad_setting_in_the_environment_is_the_default(self):
+        os.environ["YTMEER_TEST_INT"] = "four"
+        try:
+            self.assertEqual(api._env_int("YTMEER_TEST_INT", 4, 1, 16), 4)
+            os.environ["YTMEER_TEST_INT"] = "99"
+            self.assertEqual(api._env_int("YTMEER_TEST_INT", 4, 1, 16), 16)
+            os.environ["YTMEER_TEST_INT"] = "0"
+            self.assertEqual(api._env_int("YTMEER_TEST_INT", 4, 1, 16), 1)
+        finally:
+            del os.environ["YTMEER_TEST_INT"]
+
+
+class TestAnswerCache(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.pool(2)
+        self.calls = []
+
+    def details(self, answer=None, error=None, gate=None):
+        def fn(url):
+            self.calls.append(url)
+            if gate is not None:
+                gate.wait(5)
+            return (dict(answer or {"id": url[-11:], "views": 42}), None) if error is None \
+                else (None, error)
+        self.stub_all(video_details=fn)
+
+    def test_a_repeat_is_answered_from_memory(self):
+        self.details()
+        first = api.video_info("a" * 11)
+        # The same video spelled another way is the same question.
+        again = api.video_info("https://youtu.be/aaaaaaaaaaa?t=42")
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("cached", first)
+        self.assertTrue(again["cached"])
+        self.assertGreaterEqual(again["cache_age_seconds"], 0)
+        self.assertEqual(again["views"], 42)
+
+    def test_a_cached_answer_is_a_copy(self):
+        self.details()
+        api.video_info("a" * 11)["views"] = -1
+        hit = api.video_info("a" * 11)
+        hit["views"] = -2
+        self.assertEqual(api.video_info("a" * 11)["views"], 42)
+
+    def test_an_old_answer_is_fetched_again(self):
+        self.details()
+        api.video_info("a" * 11)
+        with api.CACHE._lock:                 # age every entry past the TTL
+            for key, (stored, answer) in list(api.CACHE._store.items()):
+                api.CACHE._store[key] = (stored - 10_000, answer)
+        api.video_info("a" * 11)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_failure_is_never_kept(self):
+        self.details(error="ERROR: Video unavailable")
+        for _ in range(2):
+            with self.assertRaises(api.LookupFailed):
+                api.video_info("a" * 11)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_partial_answer_is_never_kept(self):
+        calls = []
+        self.stub_all(channel_videos=lambda url, limit=0: (
+            calls.append(url), ({"videos": [], "listing_error": "cut short"}, None))[1])
+        for _ in range(2):
+            self.assertEqual(api.channel_video_rows("https://www.youtube.com/@X")
+                             ["listing_error"], "cut short")
+        self.assertEqual(len(calls), 2, "a partial answer must be asked again")
+
+    def test_different_questions_are_different_answers(self):
+        self.details()
+        api.video_info("a" * 11)
+        api.video_info("b" * 11)
+        self.assertEqual(len(self.calls), 2)
+        # The route is part of the question, and so is every argument.
+        self.assertNotEqual(api.video_info.cache_key("a" * 11),
+                            api.video_transcript.cache_key("a" * 11))
+        self.assertNotEqual(api.video_comments.cache_key("a" * 11, 100),
+                            api.video_comments.cache_key("a" * 11, 20))
+        self.assertEqual(api.search_youtube.cache_key("q", skip="aaaaaaaaaaa bbbbbbbbbbb"),
+                         api.search_youtube.cache_key("q", skip="https://youtu.be/bbbbbbbbbbb aaaaaaaaaaa"))
+
+    def test_overlapping_identical_asks_share_one_fetch(self):
+        gate = threading.Event()
+        self.details(gate=gate)
+        got = []
+        threads = [threading.Thread(target=lambda: got.append(api.video_info("a" * 11)))
+                   for _ in range(3)]
+        for t in threads:
+            t.start()
+        self.assertTrue(self.until(lambda: len(self.calls) == 1))
+        self.assertTrue(self.until(lambda: api.CACHE.shared == 2))
+        # A fetch in flight is not an answer yet; a peek never waits for it.
+        self.assertIsNone(api.video_info.peek("a" * 11))
+        gate.set()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(self.calls), 1, "three asks, one fetch")
+        self.assertEqual([a["views"] for a in got], [42, 42, 42])
+        self.assertEqual(api.ENGINE.in_use(), 0)
+
+    def test_a_shared_failure_reaches_every_caller(self):
+        gate = threading.Event()
+        self.details(error="ERROR: Video unavailable", gate=gate)
+        errors = []
+
+        def ask():
+            try:
+                api.video_info("a" * 11)
+            except api.LookupFailed as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=ask) for _ in range(3)]
+        for t in threads:
+            t.start()
+        self.assertTrue(self.until(lambda: api.CACHE.shared == 2))
+        gate.set()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(errors), 3)
+        self.assertEqual(len({id(e) for e in errors}), 3, "one exception per caller")
+
+    def test_a_bad_field_is_shared_with_its_field(self):
+        self.assertEqual(api._clone_error(api.BadField("sort", "no")).field, "sort")
+
+    def test_the_cache_can_be_turned_off(self):
+        api.CACHE = api.AnswerCache(0, 64)
+        self.details()
+        api.video_info("a" * 11)
+        self.assertNotIn("cached", api.video_info("a" * 11))
+        self.assertEqual(len(self.calls), 2)
+
+    def test_the_oldest_answer_goes_first_when_full(self):
+        api.CACHE = api.AnswerCache(900, 2)
+        self.details()
+        for c in "abc":
+            api.video_info(c * 11)
+        self.assertEqual(len(api.CACHE), 2)
+        api.video_info("a" * 11)              # pushed out, so fetched again
+        self.assertEqual(len(self.calls), 4)
+
+
+class TestBotPause(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.pool(2)
+        api.BOT_PAUSE_FIRST = 60
+        self.calls = []
+
+    def answers(self, outcome):
+        """video_details answering ok, or with the error text outcome[url]."""
+        def fn(url):
+            self.calls.append(url)
+            error = outcome.get(url[-11:])
+            return (None, error) if error else ({"id": url[-11:]}, None)
+        self.stub_all(video_details=fn)
+
+    def test_a_bot_check_pauses_every_lookup(self):
+        self.answers({"a" * 11: BOT_CHECK})
+        with self.assertRaises(api.LookupFailed) as caught:
+            api.video_info("a" * 11)
+        self.assertNotIsInstance(caught.exception, api.BackingOff, "that one was asked")
+        with self.assertRaises(api.BackingOff) as caught:
+            api.video_info("b" * 11)      # another video: still this IP
+        self.assertEqual(len(self.calls), 1, "a paused lookup must not ask YouTube")
+        self.assertIn("paused", str(caught.exception))
+        left, reason = api.bot_pause_left()
+        self.assertTrue(50 < left <= 61)
+        self.assertIn("not a bot", reason)
+
+    def test_answers_already_kept_are_served_during_a_pause(self):
+        self.answers({"b" * 11: BOT_CHECK})
+        api.video_info("a" * 11)
+        with self.assertRaises(api.LookupFailed):
+            api.video_info("b" * 11)
+        self.assertTrue(api.video_info("a" * 11)["cached"])
+
+    def test_a_pause_doubles_while_the_check_keeps_coming_back(self):
+        api._note_outcome(BOT_CHECK)
+        self.assertEqual(api.BOT_PAUSE["seconds"], 60)
+        api._note_outcome(BOT_CHECK)          # one already in flight: no change
+        self.assertEqual(api.BOT_PAUSE["seconds"], 60)
+        for expected in (120, 240, 480, 900, 900):
+            api.BOT_PAUSE["until"] = 0.0      # the pause ran out...
+            api._note_outcome(BOT_CHECK)      # ...and the first ask met it again
+            self.assertEqual(api.BOT_PAUSE["seconds"], expected)
+        api.BOT_PAUSE["until"] = 0.0
+        api._note_outcome(None)               # an answer got through
+        self.assertEqual(api.BOT_PAUSE["streak"], 0)
+        api._note_outcome(BOT_CHECK)
+        self.assertEqual(api.BOT_PAUSE["seconds"], 60)
+
+    def test_other_failures_do_not_pause(self):
+        for said in ("ERROR: Video unavailable", "ERROR: Private video",
+                     "ERROR: the page needs to be reloaded",   # cookies.txt, not the IP
+                     "YouTube refused the 'en' captions (HTTP Error 429)"):
+            api._note_outcome(said)
+            self.assertEqual(api.bot_pause_left(), (0, None), said)
+
+    def test_a_search_that_met_the_check_pauses_too(self):
+        self.stub_all(search_items=lambda query: ([], BOT_CHECK))
+        answer = api.search_youtube("anything", dates=False)
+        self.assertIn("not a bot", answer["error"])
+        self.assertTrue(api.bot_pause_left()[0])
+        with self.assertRaises(api.BackingOff):
+            api.search_youtube("something else", dates=False)
+
+    def test_the_pause_can_be_turned_off(self):
+        api.BOT_PAUSE_FIRST = 0
+        self.answers({"a" * 11: BOT_CHECK})
+        for _ in range(2):
+            with self.assertRaises(api.LookupFailed) as caught:
+                api.video_info("a" * 11)
+            self.assertNotIsInstance(caught.exception, api.BackingOff)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_the_engine_reports_itself(self):
+        status = api.engine_status()
+        self.assertEqual(status["slots"], 2)
+        self.assertEqual(status["bot_pause_seconds_left"], 0)
+        api._note_outcome(BOT_CHECK)
+        self.assertTrue(api.engine_status()["bot_pause_seconds_left"])
 
 
 class TestDefaultFolder(unittest.TestCase):

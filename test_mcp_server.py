@@ -189,6 +189,134 @@ def test_jobs_are_evicted_oldest_finished_first():
             api.JOBS.clear()
 
 
+# ------------------------------------------------------------- the engine
+# Several agents share one server process, so these are the behaviours that
+# decide how long each of them waits. All offline: the engine is stubbed.
+
+class _Engine:
+    """A private api.ENGINE / api.CACHE / mcp_server._ENGINE for one test."""
+
+    def __init__(self, monkeypatch, slots=4, busy_wait=None):
+        api = mcp_server.api
+        monkeypatch.setattr(api, "ENGINE", api.EnginePool(slots))
+        monkeypatch.setattr(api, "CACHE", api.AnswerCache(900, 64))
+        if busy_wait is not None:
+            monkeypatch.setattr(mcp_server, "BUSY_WAIT", busy_wait)
+        self.monkeypatch, self.api, self.slots = monkeypatch, api, slots
+        self.calls = []
+        for index in range(slots):
+            api.ENGINE.module(index)
+
+    def semaphore(self):
+        """A fresh loop-side semaphore, made inside the running loop."""
+        self.monkeypatch.setattr(mcp_server, "_ENGINE", asyncio.Semaphore(self.slots))
+        return mcp_server._ENGINE
+
+    def details(self, seconds=0.0, error=None):
+        def fn(url):
+            self.calls.append(url)
+            time.sleep(seconds)
+            return (None, error) if error else ({"id": url[-11:], "views": 7}, None)
+        for module in self.api.ENGINE.modules():
+            self.monkeypatch.setattr(module, "video_details", fn)
+
+
+def test_the_loop_side_limit_matches_the_engine_slots():
+    assert mcp_server._ENGINE._value == mcp_server.api.ENGINE.size
+    # Twice the slots, so a call a client gave up on cannot cost the next one
+    # its thread - and a pool apart from asyncio.to_thread's, which the job
+    # tools use.
+    assert mcp_server._ENGINE_POOL._max_workers == 2 * mcp_server.api.ENGINE.size
+    assert f"Up to {mcp_server.api.ENGINE.size} answer-tools" in mcp_server.INSTRUCTIONS
+
+
+def test_overlapping_calls_run_side_by_side(monkeypatch):
+    engine = _Engine(monkeypatch, slots=4)
+    engine.details(seconds=0.4)
+
+    async def go():
+        engine.semaphore()
+        began = time.monotonic()
+        answers = await asyncio.gather(*(
+            mcp_server._call(engine.api.video_info, c * 11) for c in "abcd"))
+        return answers, time.monotonic() - began
+
+    answers, took = asyncio.run(go())
+    assert [a["id"] for a in answers] == [c * 11 for c in "abcd"]
+    assert took < 1.2, f"four 0.4s calls took {took:.2f}s - they queued"
+
+
+def test_a_cached_answer_needs_no_slot(monkeypatch):
+    engine = _Engine(monkeypatch, slots=1, busy_wait=0.2)
+    engine.details()
+
+    async def go():
+        semaphore = engine.semaphore()
+        await mcp_server._call(engine.api.video_info, "a" * 11)
+        await semaphore.acquire()             # every slot taken from here on
+        try:
+            return await mcp_server._call(engine.api.video_info,
+                                          "https://youtu.be/aaaaaaaaaaa")
+        finally:
+            semaphore.release()
+
+    answer = asyncio.run(go())
+    assert answer["cached"] is True
+    assert len(engine.calls) == 1
+
+
+def test_a_full_engine_is_a_tool_error_not_a_hang(monkeypatch):
+    engine = _Engine(monkeypatch, slots=1, busy_wait=0.2)
+    engine.details()
+
+    async def go():
+        semaphore = engine.semaphore()
+        await semaphore.acquire()
+        try:
+            began = time.monotonic()
+            with pytest.raises(ToolError) as caught:
+                await mcp_server._call(engine.api.video_info, "a" * 11)
+            return caught.value, time.monotonic() - began
+        finally:
+            semaphore.release()
+
+    error, took = asyncio.run(go())
+    assert "busy" in str(error) and took < 2
+    assert engine.calls == [], "it must not have run"
+
+
+def test_a_paused_lookup_says_so_without_asking(monkeypatch):
+    engine = _Engine(monkeypatch, slots=2)
+    engine.details()
+    engine.api._note_outcome("ERROR: Sign in to confirm you're not a bot")
+
+    async def go():
+        engine.semaphore()
+        with pytest.raises(ToolError) as caught:
+            await mcp_server._call(engine.api.video_info, "a" * 11)
+        return caught.value
+
+    error = asyncio.run(go())
+    assert "paused, not tried" in str(error)
+    assert engine.calls == []
+
+
+def test_health_reports_the_engine_without_taking_a_slot(monkeypatch):
+    engine = _Engine(monkeypatch, slots=1)
+
+    async def go():
+        semaphore = engine.semaphore()
+        await semaphore.acquire()             # every slot taken...
+        try:
+            return await asyncio.wait_for(mcp_server.yt_health(), 10)
+        finally:
+            semaphore.release()
+
+    health = asyncio.run(go())                # ...and health still answers
+    assert health["engine"]["slots"] == 1
+    assert {"in_use", "cache_seconds", "bot_pause_seconds_left"} <= set(health["engine"])
+
+
 # ------------------------------------------------------------------- argv
 @pytest.mark.parametrize("argv", [["--port", "9000"], ["--host", "1.2.3.4"]])
 def test_host_and_port_need_http(argv):

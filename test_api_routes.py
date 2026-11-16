@@ -99,6 +99,9 @@ class TestRoutes(unittest.TestCase):
         api.DOWNLOADER = fake
         api.DEFAULT_OUT = os.path.join(self.tmp.name, "out")
         api.JOBS.clear()
+        # Kept answers and a bot-check pause are process-wide: without this a
+        # stubbed answer from one test is the next test's cache hit.
+        api.reset_engine_state()
         api.configure_key("k", persist=False)
         os.environ["FAKE_N"], os.environ["FAKE_DELAY"] = "3", "0.3"
         os.environ.pop("FAKE_MODE", None)
@@ -464,12 +467,16 @@ class TestRoutes(unittest.TestCase):
             r = self.c.get(f"/api/preview?channel=https://www.youtube.com/@X&{q}", headers=self.h)
             self.assertEqual(r.status_code, 422, q)
 
-    def test_a_second_preview_meanwhile_gets_503(self):
+    def test_a_preview_past_every_slot_gets_503(self):
+        # One slot, so the first preview takes every slot there is - and with
+        # it the stubbed module, slot 0, rather than a real copy.
         d = api.downloader
-        saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT)
+        saved = (d.is_channel_url, d.list_channel_videos, d.channel_videos_url,
+                 api.PREVIEW_WAIT, api.ENGINE)
         d.is_channel_url, d.channel_videos_url = (lambda url: True), (lambda url: url)
         d.list_channel_videos = lambda url, deadline=None: (time.sleep(2), ([], "Ch", None))[1]
         api.PREVIEW_WAIT = 0.3
+        api.ENGINE = api.EnginePool(1)
         try:
             import threading as _t
             first = _t.Thread(target=lambda: TestClient(self.app).get("/api/preview?channel=x", headers=self.h))
@@ -481,7 +488,26 @@ class TestRoutes(unittest.TestCase):
             first.join()
             self.assertEqual(self.c.get("/api/preview?channel=z", headers=self.h).status_code, 200)
         finally:
-            d.is_channel_url, d.list_channel_videos, d.channel_videos_url, api.PREVIEW_WAIT = saved
+            (d.is_channel_url, d.list_channel_videos, d.channel_videos_url,
+             api.PREVIEW_WAIT, api.ENGINE) = saved
+
+    def test_a_lookup_paused_by_a_bot_check_is_a_502_on_every_route(self):
+        # BackingOff is a LookupFailed: the two routes that did not catch one
+        # (search, preview) answered it with a bare 500.
+        self._stub(is_channel_url=lambda url: True)
+        api._note_outcome("ERROR: Sign in to confirm you're not a bot")
+        for path in ("/api/search?query=x", "/api/preview?channel=https://www.youtube.com/@X",
+                     "/api/video?url=aaaaaaaaaaa", "/api/comments?url=aaaaaaaaaaa",
+                     "/api/transcript?url=aaaaaaaaaaa",
+                     "/api/channel?channel=https://www.youtube.com/@X",
+                     "/api/channel/videos?channel=https://www.youtube.com/@X",
+                     "/api/channel/playlists?channel=https://www.youtube.com/@X",
+                     "/api/similar?url=aaaaaaaaaaa", "/api/resolve?url=aaaaaaaaaaa"):
+            r = self.c.get(path, headers=self.h)
+            self.assertEqual(r.status_code, 502, path)
+            self.assertIn("paused", r.json()["detail"], path)
+        health = self.c.get("/api/health", headers=self.h).json()
+        self.assertTrue(health["engine"]["bot_pause_seconds_left"])
 
     # ------------------------------------------------- lookups, not jobs
     def _stub(self, **functions):

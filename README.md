@@ -560,11 +560,13 @@ rather than leaving you to guess.
 ```
 
 `total_on_video` against `fetched` shows what the limit left behind. 100
-top-level comments take about 7s, and about 19s with their replies.
+top-level comments take about 7s, and about 19s with their replies - one yt-dlp
+run, whose own info file supplies the title and the count.
 
 A lookup answers `422` for something that is not a video link, `502` when
-YouTube will not answer for it (private, removed, bot-gated), and `503` when
-another in-process request is already running - see the lock note below.
+YouTube will not answer for it (private, removed, bot-gated - or paused after a
+bot check), and `503` when every engine slot stayed taken - see the engine note
+below.
 
 ### Channel mode: video links sorted into channel folders
 
@@ -656,12 +658,45 @@ window often finds only a handful, so raise `count` to scan further down.
 it used: a preview that filtered differently from the job it previews would be
 answering a different question.
 
-**One at a time.** Every lookup and the channel preview reach into the
-downloader's module globals in-process, so they share one lock: a second request
-gets `503` rather than queueing behind a slow one. Each request resets every
-global it can set first, so a `days=30` search cannot leak into the next
-preview. A route gives up after 120s rather than holding the lock for the
-downloader's own subprocess timeout.
+**Four at once.** Every lookup and the channel preview reach into the
+downloader's module globals in-process. Those used to be one set behind one
+lock, so a second request had to wait for the first - and five to eight agents
+sharing one MCP server queued that deep: on 16 Nov 2026 `yt_video` took a median
+40.6s (max 122.6s) for a call that takes about 7s alone. Now each request gets
+one of `YTMEER_ENGINE_SLOTS` engine slots (default 4, at most 16), and each slot
+runs on its own copy of `downloader.py`, so what one request sets can never
+reach another. Past the last slot a request waits up to 5s and then gets `503`
+rather than queueing behind a slow one. Each request still resets every global
+it can set first, so a `days=30` search cannot leak into the next preview. A
+route gives up after 120s rather than holding its slot for the downloader's own
+subprocess timeout.
+
+| Measured on 16 Nov 2026 | Before | After |
+|---|---|---|
+| 3 different `yt_video` at once | ~14.2s, one after another | **4.7s** |
+| The same 3 asked again | 14.2s again | **0.003s** (cache) |
+| `yt_comments`, 20 comments | 9.7s (two yt-dlp runs) | **5.2s** (one) |
+
+Starting yt-dlp is not the cost: it is about 0.4s of a 7.7s lookup. The rest is
+YouTube - the watch page, two player API calls, its ~2 MB player script (fetched
+again by every run) and the n-challenge.
+
+**Repeats come from memory.** The same question within `YTMEER_CACHE_TTL`
+(default 900s, `0` turns it off) is answered at once, without YouTube or a slot,
+and marked `cached: true` with its `cache_age_seconds`. A bare id and a
+`youtu.be` link to the same video are one question, and identical requests
+that overlap share one fetch. A failure or a partial answer (an `error`,
+`date_error`, `listing_error`, `count_failures` or `out_of_time`) is never
+kept, so asking again can do better.
+
+**A bot check pauses everything.** "Sign in to confirm you're not a bot" is
+about this IP, not one video, and asking again makes it last longer. So the
+first one pauses every lookup for `YTMEER_BOT_PAUSE` seconds (default 60),
+doubling each time it comes back after a pause, up to 900; any answer that gets
+through resets it. A paused lookup is a `502` that says how long is left, with
+nothing asked of YouTube; cached answers are still served. A rejected
+`cookies.txt` and a caption `429` pause nothing. `/api/health` reports it all
+under `engine`.
 
 A date window or a date sort costs about 2s per result scanned; without one a
 search is about 0.15s per result.
@@ -1131,7 +1166,8 @@ skip.txt left nothing), and so does a stop while a channel was being read.
 
 `/api/preview` lists up to `limit` matching videos (default 20, at most 500), stops
 scanning after about 45 seconds so it always answers on the public link (the result
-then says how far it got), and runs one at a time - a second one meanwhile gets 503.
+then says how far it got), and shares the engine's slots with the lookups - past
+the last one a request gets 503.
 
 A `cookies.txt` in the download folder is used by every job and preview, and is
 never downloadable. Each job looks for it as it starts, so one added later is used
@@ -1239,17 +1275,25 @@ can open beats a URL it cannot.
 | Variable | Default | What it does |
 |---|---|---|
 | `YTDL_OUTDIR` | `./downloads` | where downloads go, and where `cookies.txt` is looked for. Read at import, so set it in the editor's `env` block |
-| `YTMEER_BUSY_WAIT` | `90` | seconds a tool waits when another tool holds the engine. The REST API uses 5, because a queued HTTP request would hit a proxy timeout; over stdio there is none |
+| `YTMEER_ENGINE_SLOTS` | `4` | answer-tools that may talk to YouTube at once, 1-16. Subagents share their parent's server, so this is the whole fleet's limit. More is more requests from one IP at once, which is what the bot check reacts to |
+| `YTMEER_BUSY_WAIT` | `90` | seconds a tool waits for a slot once all are taken. The REST API uses 5, because a queued HTTP request would hit a proxy timeout; over stdio there is none |
+| `YTMEER_CACHE_TTL` | `900` | seconds an answer is kept for the next caller asking the same thing; `0` turns the cache off |
+| `YTMEER_CACHE_SIZE` | `256` | answers kept at most, oldest out first |
+| `YTMEER_BOT_PAUSE` | `60` | seconds every lookup pauses after a bot check, doubling while it recurs, at most 900; `0` never pauses |
 | `YTMEER_MAX_JOBS` | `50` | finished jobs kept in memory. Files are never touched |
 
 ### Notes
 
-- **One answer-tool at a time.** They share the engine's module globals, so a
-  second call waits for the first. Every call resets every global it can set,
-  so nothing leaks between them.
-- **Each editor gets its own process**, so the job table is not shared between
-  them and is empty after a restart. The files on disk are shared, and
-  `yt_job_files` still finds them.
+- **Four answer-tools at once** (`YTMEER_ENGINE_SLOTS`), each on its own copy
+  of the engine's globals, so overlapping calls never see each other's
+  settings. A call past the last slot waits up to `YTMEER_BUSY_WAIT`; a cached
+  answer needs no slot, and `yt_health` never takes one.
+- **Each editor session gets its own process; its subagents do not.** They
+  call through their parent's server, so five parallel subagents are five
+  callers on one server's slots - which is why the slots, the cache and the
+  shared in-flight fetch matter. The job table is not shared between sessions
+  and is empty after a restart; the files on disk are, and `yt_job_files`
+  still finds them.
 - **PATH is widened at startup** (`/opt/homebrew/bin` and friends), because a
   GUI editor starts its servers from a login-less environment where
   `shutil.which("yt-dlp")` would otherwise find nothing. `yt_health` reports
@@ -1392,6 +1436,11 @@ engine: every tool registers with a schema and a read-only hint that matches
 what it does, nothing but JSON-RPC reaches the wire, SIGTERM leaves promptly
 with a call in flight, a record carries every file key even for a video that
 failed, and `yt_download` refuses a flag that means nothing without a search.
+It and `test_api.py` also hold the engine to its word, against a stubbed
+engine: never more lookups in flight than slots, overlapping requests never see
+each other's settings, a repeat is a cache hit that needs no slot, a failure or
+partial answer is never kept, identical overlapping asks share one fetch, and a
+bot check pauses everything else without asking YouTube.
 Its three tests that talk to YouTube are skipped unless you ask for them:
 
 ```bash

@@ -39,13 +39,23 @@ the first while the rest are still downloading. Pass back the "next" it returns.
 A video that failed can come back later as "ok", because a run retries its
 failures once at the end: act on "ok" and "skipped".
 
+Lookups run side by side, YTMEER_ENGINE_SLOTS (default 4) at a time, each on
+its own copy of downloader.py's module globals (EnginePool). A repeat within
+YTMEER_CACHE_TTL (900s) is answered from memory and says cached: true; a bot
+check pauses every lookup for YTMEER_BOT_PAUSE (60s, doubling). /api/health
+reports all three under "engine".
+
 Only build_app() and main() import fastapi; the rest is stdlib, so it imports -
 and tests - without it.
 """
 
 import collections
 import contextlib
+import copy
+import functools
 import hashlib
+import importlib.util
+import inspect
 import json
 import os
 import re
@@ -92,7 +102,7 @@ PARTIAL_RE = re.compile(r"\.(part|ytdl|aria2)$|\.part-frag\d*$", re.I)
 # final <name>.mp4 - judged against the video folder's own name, so a video titled
 # "My.temp" still has a downloadable "My.temp.mp4".
 STREAM_PART_RE = re.compile(r"\.(temp|f\d+)\.", re.I)
-PREVIEW_WAIT = 5                       # seconds a preview waits for another one to end
+PREVIEW_WAIT = 5                       # seconds a lookup waits for a free engine slot
 PREVIEW_SECONDS = 45                   # a preview stops scanning then: gradio.live cuts at 60
 # A job's own run files - never downloadable, even when a job's folder is itself a
 # video folder (the file endpoints only serve what the downloader made for a video).
@@ -129,7 +139,6 @@ API_KEY = [None]
 PUBLIC_URL = [None]                    # the Gradio share link, when served with --share
 JOBS = {}
 LOCK = threading.RLock()               # the job table and every job's fields
-PREVIEW_LOCK = threading.Lock()        # downloader's module globals, which /preview sets
 
 
 def code_version(root=HERE):
@@ -914,38 +923,442 @@ ROUTE_GLOBALS = {
     # Each route sets its own budget below; these are the downloader's own.
     "SEARCH_TIMEOUT": 900, "COMMENT_TIMEOUT": 600,
 }
-# What a route may spend before it gives up, so it cannot hold the lock for the
-# downloader's own 15-minute subprocess timeout while every other caller waits.
+# What a route may spend before it gives up, so it cannot hold an engine slot
+# for the downloader's own 15-minute subprocess timeout while others wait.
 ROUTE_SECONDS = 120
+
+
+def _env_int(name, default, low, high=None):
+    """A whole-number setting from the environment, clamped to [low, high].
+
+    A value that is not a number is the default, not a crash: these are read at
+    import, and an editor's typo in an "env" block must not take the server
+    down with it.
+    """
+    try:
+        value = int(str(os.environ.get(name, "")).strip() or default)
+    except ValueError:
+        return default
+    value = max(low, value)
+    return value if high is None else min(high, value)
+
+
+# ------------------------------------------------------------------ the engine
+# How many in-process lookups may talk to YouTube at the same time. It used to
+# be one: every lookup shares downloader.py's module globals, so a second had to
+# wait for the first. N agents sharing one MCP server therefore queued N deep -
+# measured on 16 Nov 2026 from 5-8 parallel agents, yt_video took a median 40.6s
+# (max 122.6s) for a call that takes about 7s on its own. Each slot now runs on
+# its own copy of downloader.py (EnginePool), so slots never see each other's
+# settings. More slots is more requests from this IP at once, which is what
+# YouTube's bot check reacts to - hence a small default, and the pause below.
+ENGINE_SLOTS = _env_int("YTMEER_ENGINE_SLOTS", 4, 1, 16)
+
+
+def _engine_copy(index):
+    """downloader.py executed again under a private name, for one slot.
+
+    Its functions read their own module's globals, so a copy is an engine of
+    its own: what one slot's search sets cannot reach another slot's lookup.
+    What is a fact about this process rather than about one request is shared
+    instead (EnginePool.SHARED).
+    """
+    spec = importlib.util.spec_from_file_location(f"_ytmeer_engine_{index}",
+                                                  downloader.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in EnginePool.SHARED:
+        setattr(module, name, getattr(downloader, name))
+    return module
+
+
+class EnginePool:
+    """size engine slots, each its own copy of downloader.py's module globals.
+
+    Slot 0 IS the imported downloader module, and the lowest free slot is
+    always handed out first. So a lone caller - and every test that stubs a
+    function on api.downloader - gets exactly the module it got before; the
+    copies only come into play when lookups overlap, and are made the first
+    time they are needed.
+
+    Never a queue in the sense of a backlog: a caller that cannot have a slot
+    within its wait is told so (PreviewBusy), because a request abandoned by a
+    proxy keeps its work running and anything waiting behind it would time
+    out too.
+    """
+
+    # One process, one set of these, whichever slot learns them:
+    #   RATE_LIMITED*  - the caption 429 pause. Per slot, YouTube's first 429
+    #                    would stop one slot's caption asks and let the others
+    #                    lengthen the block.
+    #   po_token_first - "this IP needs the PO-token client", learnt once.
+    SHARED = ("RATE_LIMITED", "RATE_LIMITED_LINE", "RATE_LIMITED_AT",
+              "po_token_first")
+
+    def __init__(self, size):
+        self.size = max(1, int(size))
+        self._cond = threading.Condition()
+        self._busy = [False] * self.size
+        self._modules = [downloader] + [None] * (self.size - 1)
+
+    def acquire(self, timeout):
+        """The index of a free slot, or None once timeout seconds have passed."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while True:
+                for index, busy in enumerate(self._busy):
+                    if not busy:
+                        self._busy[index] = True
+                        return index
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self._cond.wait(left)
+
+    def release(self, index):
+        with self._cond:
+            self._busy[index] = False
+            self._cond.notify()
+
+    def module(self, index):
+        """The downloader module slot index runs on. Only its holder calls this."""
+        module = self._modules[index]
+        if module is None:
+            module = self._modules[index] = _engine_copy(index)
+        return module
+
+    def modules(self):
+        """Every engine module made so far - for a test that stubs them all."""
+        return [m for m in self._modules if m is not None]
+
+    def in_use(self):
+        with self._cond:
+            return sum(self._busy)
+
+
+ENGINE = EnginePool(ENGINE_SLOTS)
 
 
 @contextlib.contextmanager
 def downloader_globals(wait=None, **overrides):
-    """Hold the downloader's module globals for one in-process request.
+    """Hold one engine slot's downloader globals for one in-process request.
 
-    Everything a route can set is put back to the downloader's own default
+    Yields the downloader module this request must use - a route reads and
+    calls through it, never through the bare `downloader`, which is only slot
+    0. Everything a route can set is put back to the downloader's own default
     first, so no request is answered using what the previous caller asked for.
-
-    One at a time, and never a queue: a request abandoned by a proxy keeps its
-    work running, and anything waiting behind it would time out too.
     """
+    pool = ENGINE
     # Read now, not bound as a default: a default argument would fix the value
     # at import and ignore a PREVIEW_WAIT set afterwards.
-    if not PREVIEW_LOCK.acquire(timeout=PREVIEW_WAIT if wait is None else wait):
-        raise PreviewBusy("another search, preview or lookup is still running; "
-                          "try again in a minute, or ask for less")
+    index = pool.acquire(PREVIEW_WAIT if wait is None else wait)
+    if index is None:
+        raise PreviewBusy(f"{pool.size} other searches, previews or lookups are "
+                          f"still running (every engine slot is taken); try "
+                          f"again in a minute, or ask for less")
     try:
+        d = pool.module(index)
         for name, value in ROUTE_GLOBALS.items():
             # A fresh copy: a route that mutated a shared set would corrupt the
             # baseline for every request after it.
-            setattr(downloader, name, value.copy() if hasattr(value, "copy") else value)
-        downloader.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")  # as a job would
-        downloader.use_cookies[0] = True      # a replaced cookies.txt gets its chance
+            setattr(d, name, value.copy() if hasattr(value, "copy") else value)
+        d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")  # as a job would
+        d.use_cookies[0] = True               # a replaced cookies.txt gets its chance
         for name, value in overrides.items():
-            setattr(downloader, name, value)
-        yield downloader
+            setattr(d, name, value)
+        yield d
     finally:
-        PREVIEW_LOCK.release()
+        pool.release(index)
+
+
+# ------------------------------------------------------------ the bot check
+# YouTube's "Sign in to confirm you're not a bot" is about this IP, not about one
+# video, and asking again straight away is what makes it last longer. So the
+# first one pauses every lookup in this process: they fail at once, saying why,
+# without asking YouTube - while answers already in the cache are still served.
+# Each bot check that comes back after a pause doubles the next one; any answer
+# that gets through resets it.
+BOT_PAUSE_FIRST = _env_int("YTMEER_BOT_PAUSE", 60, 0, 3600)    # 0 = never pause
+BOT_PAUSE_MAX = 900
+BOT_PAUSE = {"until": 0.0, "seconds": 0, "streak": 0, "reason": None}
+BOT_PAUSE_LOCK = threading.Lock()
+
+
+class BackingOff(LookupFailed):
+    """YouTube bot-checked this machine moments ago, so this lookup was not even
+    tried. A LookupFailed, so every route already answers it with a 502."""
+
+
+def bot_pause_left():
+    """(seconds left, YouTube's words) for the current pause, or (0, None)."""
+    with BOT_PAUSE_LOCK:
+        left = BOT_PAUSE["until"] - time.monotonic()
+        if left > 0:
+            return int(left) + 1, BOT_PAUSE["reason"]
+    return 0, None
+
+
+def _check_bot_pause():
+    left, reason = bot_pause_left()
+    if left:
+        raise BackingOff(
+            f"YouTube is bot-checking this machine ({reason}), so lookups are "
+            f"paused for another {left}s rather than making the block last "
+            f"longer. Wait it out, or put a cookies.txt in {DEFAULT_OUT}. "
+            f"Answers fetched in the last {max(1, CACHE_SECONDS // 60)} min are "
+            f"still served from the cache.")
+
+
+def _note_outcome(error_text):
+    """Start or lengthen the pause on a bot check; end the streak on an answer."""
+    if BOT_PAUSE_FIRST <= 0:
+        return
+    with BOT_PAUSE_LOCK:
+        now = time.monotonic()
+        if error_text and downloader.is_ip_gated(error_text):
+            if now < BOT_PAUSE["until"]:
+                return          # lookups already in flight do not escalate it
+            streak = BOT_PAUSE["streak"] + 1
+            seconds = min(BOT_PAUSE_MAX, BOT_PAUSE_FIRST * 2 ** (streak - 1))
+            BOT_PAUSE.update(until=now + seconds, seconds=seconds, streak=streak,
+                             reason=" ".join(str(error_text).split())[:160])
+        elif error_text is None:
+            BOT_PAUSE["streak"] = 0
+
+
+def reset_bot_pause():
+    with BOT_PAUSE_LOCK:
+        BOT_PAUSE.update(until=0.0, seconds=0, streak=0, reason=None)
+
+
+# ------------------------------------------------------------- the cache
+# Answers, kept a while. Agents researching one niche ask about the same
+# handful of videos, and the second ask is answered from here - no slot, no
+# YouTube. Identical asks that overlap share the one fetch in flight.
+CACHE_SECONDS = _env_int("YTMEER_CACHE_TTL", 900, 0, 86400)    # 0 = off
+CACHE_ENTRIES = _env_int("YTMEER_CACHE_SIZE", 256, 1, 100000)
+# A field on an answer that means it is not the whole answer - a fetch that
+# failed part-way, a probe YouTube refused, a wall that cut it short. Such an
+# answer is still returned, but never kept: the next ask may do better.
+PARTIAL_KEYS = ("error", "date_error", "listing_error", "count_failures",
+                "out_of_time")
+
+
+def _complete(answer):
+    return isinstance(answer, dict) and not any(answer.get(k) for k in PARTIAL_KEYS)
+
+
+def _answer_error(answer):
+    """The error text an answer carries, or None when it carries none."""
+    if not isinstance(answer, dict):
+        return None
+    said = [str(answer[k]) for k in ("error", "date_error", "listing_error")
+            if answer.get(k)]
+    return " | ".join(said) or None
+
+
+def _clone_error(error):
+    """The same failure as a new exception, for a caller that shared a fetch:
+    one exception object raised in several threads would have its traceback
+    rewritten under it."""
+    if isinstance(error, BadField):
+        return BadField(error.field, str(error))
+    try:
+        return type(error)(*error.args)
+    except Exception:
+        return error
+
+
+class _Flight:
+    __slots__ = ("done", "value", "error")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.value = None
+        self.error = None
+
+
+class AnswerCache:
+    """Answers by request, for `seconds`, at most `entries` of them (LRU).
+
+    Every answer handed out is a deep copy, so a caller that edits its answer -
+    yt_preview adds two keys - cannot change what the next caller gets. A hit
+    says it is one: cached true, and its age.
+    """
+
+    def __init__(self, seconds, entries):
+        self.seconds = max(0, int(seconds))
+        self.entries = max(1, int(entries))
+        self._lock = threading.Lock()
+        self._store = collections.OrderedDict()   # key -> (stored at, answer)
+        self._flights = {}                        # key -> _Flight, while fetching
+        self.hits = self.misses = self.shared = 0
+
+    def __len__(self):
+        with self._lock:
+            return len(self._store)
+
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+            self.hits = self.misses = self.shared = 0
+
+    def _fresh(self, key, now):
+        held = self._store.get(key)
+        if held is None:
+            return None
+        if now - held[0] >= self.seconds:
+            del self._store[key]
+            return None
+        self._store.move_to_end(key)
+        return held
+
+    @staticmethod
+    def _served(held, now):
+        answer = copy.deepcopy(held[1])
+        if isinstance(answer, dict):
+            answer["cached"] = True
+            answer["cache_age_seconds"] = int(now - held[0])
+        return answer
+
+    def peek(self, key):
+        """A fresh answer, or None. Never waits on a fetch in flight."""
+        if not self.seconds or key is None:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            held = self._fresh(key, now)
+            if held is None:
+                return None
+            self.hits += 1
+        return self._served(held, now)
+
+    def run(self, key, compute):
+        """compute()'s answer for key: from the cache, from a fetch already in
+        flight for the same key, or by calling it - in that order."""
+        if not self.seconds or key is None:
+            return compute()
+        now = time.monotonic()
+        with self._lock:
+            held = self._fresh(key, now)
+            if held is not None:
+                self.hits += 1
+            else:
+                flight = self._flights.get(key)
+                leader = flight is None
+                if leader:
+                    flight = self._flights[key] = _Flight()
+                    self.misses += 1
+                else:
+                    self.shared += 1
+        if held is not None:
+            return self._served(held, now)
+        if not leader:
+            # Bounded by the leader's own walls: ROUTE_SECONDS, and the
+            # subprocess timeouts under it.
+            flight.done.wait()
+            if flight.error is not None:
+                raise _clone_error(flight.error)
+            return copy.deepcopy(flight.value)
+        try:
+            value = compute()
+        except BaseException as e:
+            flight.error = e
+            raise
+        else:
+            # A private snapshot: the leader's own caller may edit `value`
+            # while a follower is still copying it.
+            snapshot = copy.deepcopy(value)
+            flight.value = snapshot
+            if _complete(value):
+                with self._lock:
+                    self._store[key] = (time.monotonic(), snapshot)
+                    self._store.move_to_end(key)
+                    while len(self._store) > self.entries:
+                        self._store.popitem(last=False)
+            return value
+        finally:
+            with self._lock:
+                self._flights.pop(key, None)
+            flight.done.set()
+
+
+CACHE = AnswerCache(CACHE_SECONDS, CACHE_ENTRIES)
+
+
+def _key_part(name, value):
+    """One argument as it identifies an answer: the same video spelled two ways
+    - a bare id, a youtu.be link, a watch link with &t= - is one key."""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        value = _lines(sorted(map(str, value)) if isinstance(value, (set, frozenset))
+                       else value)
+    if name == "skip":
+        return tuple(sorted(_skip_ids(value)))
+    if name == "url":
+        text = _lines(value).strip().split("\n")[0].strip()
+        vid = (text if downloader.BARE_ID_RE.match(text)
+               else downloader.video_id_from_url(text))
+        return downloader.watch_url(vid) if vid else text
+    if name in ("channel", "in_channel"):
+        return _lines(value).strip().split("\n")[0].strip().rstrip("/")
+    if name == "query":
+        return _lines(value).strip()
+    return value
+
+
+def _lookup(fn):
+    """An answer route, with the cache in front and the bot-check pause around.
+
+    The pause is checked only when YouTube would actually be asked: a cached
+    answer is still served while it lasts.
+    """
+    signature = inspect.signature(fn)
+
+    def cache_key(*args, **kwargs):
+        try:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            key = (fn.__name__,) + tuple((name, _key_part(name, value))
+                                         for name, value in bound.arguments.items())
+            hash(key)
+        except Exception:                 # unhashable or unbindable: no cache
+            return None
+        return key
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        def compute():
+            _check_bot_pause()
+            try:
+                answer = fn(*args, **kwargs)
+            except LookupFailed as e:
+                _note_outcome(str(e))
+                raise
+            _note_outcome(_answer_error(answer))
+            return answer
+
+        return CACHE.run(cache_key(*args, **kwargs), compute)
+
+    wrapper.cache_key = cache_key
+    wrapper.peek = lambda *args, **kwargs: CACHE.peek(cache_key(*args, **kwargs))
+    return wrapper
+
+
+def reset_engine_state():
+    """Forget every kept answer and any bot-check pause - for a test, which
+    stubs the engine and would otherwise be handed the last test's answer."""
+    CACHE.clear()
+    reset_bot_pause()
+
+
+def engine_status():
+    """What /api/health and yt_health say about the engine."""
+    left, reason = bot_pause_left()
+    return {"slots": ENGINE.size, "in_use": ENGINE.in_use(),
+            "cache_seconds": CACHE.seconds, "cached_answers": len(CACHE),
+            "cache_hits": CACHE.hits, "cache_misses": CACHE.misses,
+            "shared_fetches": CACHE.shared,
+            "bot_pause_seconds_left": left, "bot_pause_reason": reason}
 
 
 def _skip_ids(skip):
@@ -987,6 +1400,7 @@ def one_url(value, what):
     return downloader.watch_url(vid)
 
 
+@_lookup
 def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
                     min_duration=180):
     """What a channel link expands to, without downloading anything.
@@ -1006,7 +1420,7 @@ def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
     with downloader_globals(MIN_VIEWS=int(views or 0), LIMIT=int(limit or 0),
                             SKIP_IDS=_skip_ids(skip),
                             INCLUDE_SHORTS=bool(shorts),
-                            MIN_DURATION=min_duration):
+                            MIN_DURATION=min_duration) as d:
         found, name, err = d.list_channel_videos(
             url, deadline=time.monotonic() + PREVIEW_SECONDS)
         # None on a /shorts tab, where the floor is waived (see is_shorts_tab).
@@ -1017,6 +1431,7 @@ def preview_channel(channel, views=0, limit=20, skip="", shorts=False,
             "matched": len(found), "videos": found, "error": err}
 
 
+@_lookup
 def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
                    this_month=False, views=0, limit=0, skip="",
                    match="related", shorts=False, min_duration=180, dates=True):
@@ -1037,7 +1452,6 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
                                 f"got {match!r}")
     min_duration = _floor_seconds(min_duration)
 
-    d = downloader
     with downloader_globals(
             SEARCH_QUERY=query, IN_CHANNEL=in_channel or None,
             # 0 leaves it None, which makes search_depth() pick by route.
@@ -1048,7 +1462,7 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
             SKIP_IDS=_skip_ids(skip), SEARCH_TIMEOUT=ROUTE_SECONDS,
             SEARCH_MATCH=match, INCLUDE_SHORTS=bool(shorts),
             MIN_DURATION=min_duration, RESOLVE_DATES=bool(dates),
-            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
+            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS) as d:
         items, err = d.search_items(query)
         _since, window = d.search_window()
         rows = [d.search_row(item, number) for number, item in enumerate(items, 1)]
@@ -1084,29 +1498,32 @@ def search_youtube(query, in_channel="", count=0, sort="relevance", days=0,
 # returned here and now: no job, no folder, no files to collect afterwards.
 # Downloading is still a job, because a video file has to live somewhere.
 
+@_lookup
 def video_info(url):
     """One video's details. Nothing is downloaded and no files are written."""
     url = one_url(url, "url")
-    with downloader_globals():
-        details, err = downloader.video_details(url)
+    with downloader_globals() as d:
+        details, err = d.video_details(url)
     if err:
         raise LookupFailed(err)
     return details
 
 
+@_lookup
 def video_transcript(url, sub_lang="en"):
     """One video's transcript, as text, in both the grouped and per-word forms."""
     url = one_url(url, "url")
     if not SUB_LANG_RE.fullmatch(str(sub_lang or "en")):
         raise BadField("sub_lang", f"sub_lang must be a language code such as en "
                                    f"or pt-BR, got {sub_lang!r}")
-    with downloader_globals(SUB_LANG=str(sub_lang or "en"), DOWNLOAD_SUBS=True):
-        transcript, err = downloader.video_transcript(url)
+    with downloader_globals(SUB_LANG=str(sub_lang or "en"), DOWNLOAD_SUBS=True) as d:
+        transcript, err = d.video_transcript(url)
     if err:
         raise LookupFailed(err)
     return transcript
 
 
+@_lookup
 def video_comments(url, limit=100, replies=False, sort="top"):
     """One video's comments, threaded, as data."""
     url = one_url(url, "url")
@@ -1119,13 +1536,14 @@ def video_comments(url, limit=100, replies=False, sort="top"):
     if limit > INT_MAX["comment_limit"]:
         raise BadField("limit", f"limit is too large (at most {INT_MAX['comment_limit']})")
     with downloader_globals(COMMENT_LIMIT=limit, COMMENT_REPLIES=bool(replies),
-                            COMMENT_SORT=sort, COMMENT_TIMEOUT=ROUTE_SECONDS):
-        comments, err = downloader.video_comments(url)
+                            COMMENT_SORT=sort, COMMENT_TIMEOUT=ROUTE_SECONDS) as d:
+        comments, err = d.video_comments(url)
     if err:
         raise LookupFailed(err)
     return comments
 
 
+@_lookup
 def channel_info(channel, shorts=False, min_duration=180):
     # Note: the wall is SEARCH_DEADLINE, which the downloader reads in
     # resolve_dates and take_in_window. A listing's own requests are bounded by
@@ -1140,13 +1558,14 @@ def channel_info(channel, shorts=False, min_duration=180):
         raise BadField("channel", f"not a channel link: {url}")
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
                             MIN_DURATION=_floor_seconds(min_duration),
-                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
-        details, err = downloader.channel_details(url)
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS) as d:
+        details, err = d.channel_details(url)
     if err:
         raise LookupFailed(err)
     return details
 
 
+@_lookup
 def resolve_link(url):
     """The canonical channel behind any link - a handle, a tab, or a video."""
     link = _lines(url).strip().split("\n")[0].strip()
@@ -1164,13 +1583,14 @@ def resolve_link(url):
     if problem:
         raise BadField("url", problem)
     link = downloader.canonical_link(link)
-    with downloader_globals(SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
-        found, err = downloader.resolve_channel(link)
+    with downloader_globals(SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS) as d:
+        found, err = d.resolve_channel(link)
     if err:
         raise LookupFailed(err)
     return found
 
 
+@_lookup
 def channel_video_rows(channel, limit=0, shorts=False, min_duration=180, skip=""):
     """A channel's long videos, newest first, with each one's ratio to the
     channel's own average."""
@@ -1182,13 +1602,14 @@ def channel_video_rows(channel, limit=0, shorts=False, min_duration=180, skip=""
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
                             MIN_DURATION=_floor_seconds(min_duration),
                             SKIP_IDS=_skip_ids(skip),
-                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
-        answer, err = downloader.channel_videos(url, limit=max(0, int(limit or 0)))
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS) as d:
+        answer, err = d.channel_videos(url, limit=max(0, int(limit or 0)))
     if err:
         raise LookupFailed(err)
     return answer
 
 
+@_lookup
 def channel_playlist_rows(channel, shorts=False, min_duration=180):
     """A channel's playlists, each split into long videos and short-form."""
     url = _lines(channel).strip().split("\n")[0].strip()
@@ -1198,22 +1619,23 @@ def channel_playlist_rows(channel, shorts=False, min_duration=180):
         raise BadField("channel", f"not a channel link: {url}")
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
                             MIN_DURATION=_floor_seconds(min_duration),
-                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
-        answer, err = downloader.channel_playlists(url)
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS) as d:
+        answer, err = d.channel_playlists(url)
     if err and not answer:
         raise LookupFailed(err)
     return answer
 
 
+@_lookup
 def similar_to(url, limit=0, shorts=False, min_duration=180, dates=True, skip=""):
     """Long videos like this one, found by searching for its title."""
     link = one_url(url, "url")
     with downloader_globals(INCLUDE_SHORTS=bool(shorts),
                             MIN_DURATION=_floor_seconds(min_duration),
                             RESOLVE_DATES=bool(dates), SKIP_IDS=_skip_ids(skip),
-                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS):
-        answer, err = downloader.similar_videos(link, count=max(0, int(limit or 0)))
-        tally = dict(downloader.SEARCH_COUNTS[0] or {})
+                            SEARCH_DEADLINE=time.monotonic() + ROUTE_SECONDS) as d:
+        answer, err = d.similar_videos(link, count=max(0, int(limit or 0)))
+        tally = dict(d.SEARCH_COUNTS[0] or {})
     if err:
         raise LookupFailed(err)
     # The same date accounting /api/search reports: without it, "published":
@@ -1361,7 +1783,7 @@ def build_app():
                 "public_url": PUBLIC_URL[0],
                 "cookies": os.path.isfile(os.path.join(DEFAULT_OUT, "cookies.txt")),
                 "default_folder": DEFAULT_OUT, "tools": tools_present(),
-                "jobs": dict(states)}
+                "jobs": dict(states), "engine": engine_status()}
 
     @app.get("/api/preview", tags=["channels"], dependencies=keyed)
     def preview(channel: str = Query(..., description="A channel link."),
@@ -1383,13 +1805,16 @@ def build_app():
         question. A link to a channel's /shorts tab is a request for Shorts, so
         the floor is not applied there.
 
-        One preview, search or lookup runs at a time; another gets 503. On the
-        public link a request must finish within about 60 s, so keep the limit
-        small there."""
+        Up to YTMEER_ENGINE_SLOTS (default 4) previews, searches and lookups
+        run at once; past that a request waits up to 5 s for a slot, then gets
+        503. On the public link a request must finish within about 60 s, so
+        keep the limit small there."""
         try:
             return preview_channel(channel, views, limit, skip, shorts, min_duration)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "channel"))
+        except LookupFailed as e:             # BackingOff: paused after a bot check
+            raise HTTPException(502, str(e))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
 
@@ -1448,13 +1873,18 @@ def build_app():
         reading found=0 as "nothing was published". sort=date/oldest needs every
         date up front and still asks YouTube, which scans less deep.
 
-        One search, preview or lookup runs at a time; another gets 503."""
+        Up to YTMEER_ENGINE_SLOTS (default 4) searches, previews and lookups
+        run at once; past that a request waits up to 5 s for a slot, then gets
+        503. The same search asked again within YTMEER_CACHE_TTL (15 min) is
+        answered from memory and says so: cached true, cache_age_seconds."""
         try:
             answer = search_youtube(query, in_channel, count, sort, days,
                                     this_month, views, limit, skip,
                                     match, shorts, min_duration, dates)
         except ValueError as e:
             raise unprocessable(str(e), "query", getattr(e, "field", "query"))
+        except LookupFailed as e:             # BackingOff: paused after a bot check
+            raise HTTPException(502, str(e))
         except PreviewBusy as e:
             raise HTTPException(503, str(e))
         if answer.get("error") and not answer.get("results"):
