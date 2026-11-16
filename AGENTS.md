@@ -249,6 +249,18 @@ A search's publish dates run up to three yt-dlp extractions at once (§5.3);
 the two beyond its own come from one pool the whole process shares, and only
 when free, so four slots dating at once run six extractions, never twelve.
 
+**Each slot keeps a warm yt-dlp.** Video details, comments, captions, channel
+pages and the flat search scan run in one long-lived yt-dlp process per slot
+(`ytdlp_worker.py`) instead of a new `yt-dlp` each time, so a slot's calls after
+its first skip starting yt-dlp and re-downloading YouTube's ~2 MB player script
+— about 2.4s each (§5.4). The answers are the command's own: same output, same
+exit code, and a timeout still kills it with whatever it started. It runs under
+the yt-dlp command's own Python (its shebang), never the server's. A call it
+cannot take runs the old way in the time left. A search's publish-date fetches,
+the CLI and download jobs never use it. `YTMEER_WARM_YTDLP=0` turns it off;
+`engine` in `/api/health` counts the processes (`warm_processes`, `warm_runs`,
+`warm_declined`).
+
 **A repeat comes from memory.** The same question asked again within
 `YTMEER_CACHE_TTL` (default 900s; `0` turns it off) is answered at once, without
 YouTube and without a slot, and says so: `cached: true` and
@@ -399,6 +411,9 @@ YouTube's own date search, which scans only 40 deep and returns far fewer.
 
 Uncontended, one call at a time. Several at once cost the same each, up to
 the slot count (§4.1); a repeat within the cache's 15 minutes costs nothing.
+A slot's first call pays ~2.4s more than its later ones, while its warm yt-dlp
+starts and fetches YouTube's player script (§4.1); the CLI pays that on every
+call.
 
 | Operation | Measured |
 |---|---|
@@ -406,7 +421,7 @@ the slot count (§4.1); a repeat within the cache's 15 minutes costs nothing.
 | Dated search scan | ~2s per result |
 | Publish dates, 10 survivors | ~20s, three runs at once (35.7s in one run) |
 | Search, `limit=10`, with dates | ~37s (49s with its dates in one run) |
-| Video details | ~5-8s (4.7s and 7.7s on 16 Nov 2026) |
+| Video details | ~3-3.5s on a warm slot (3.1s, 3.4s); ~7s for a slot's first call (6.7s). It was 4.3-7.7s every time |
 | The same question again | ~0s (cache, §4.1) |
 | Channel details (278 videos) | ~23s |
 | Channel videos (278 listed) | ~11s |

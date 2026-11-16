@@ -685,7 +685,31 @@ subprocess timeout.
 | 3 different `yt_video` at once | ~14.2s, one after another | **4.7s** |
 | The same 3 asked again | 14.2s again | **0.003s** (cache) |
 | `yt_comments`, 20 comments | 9.7s (two yt-dlp runs) | **5.2s** (one) |
+| One `yt_video`, on a slot already used | 6.8s and 4.3s (a new yt-dlp each) | **3.1s** and **3.4s** (warm) |
 | `yt_search`, `limit=10`, with dates | 49.0s (dates in one run: 35.7s) | **37.4s** (three runs: 20.2s) |
+
+**A warm yt-dlp per slot.** A lookup used to start the `yt-dlp` command for
+every call, and each new process paid twice before YouTube even answered:
+about 0.3s to start Python and import yt-dlp, and 1.7-2.2s to download
+YouTube's ~2 MB player script again, because yt-dlp keeps it for one process
+only. Now each slot keeps one yt-dlp process running (`ytdlp_worker.py`) and
+hands it the single-shot runs - video details, comments, captions, channel
+pages and the flat search scan - with that player script kept between calls.
+A slot's first call still pays both (6.7s measured); the ones after it do not.
+
+It answers exactly as the command would: the same output, the same exit code,
+and a timeout still kills it, along with any deno or node it started. It runs
+under the yt-dlp command's own Python, read from its shebang (3.14 here), never
+the server's 3.15, whose bgutil plugin does not match its script. A call it
+cannot take - busy, failed to start, died mid-run - runs the old way, in the
+time that is left. It is replaced every 200 calls, exits after 10 minutes
+unused, and dies with the server. `YTMEER_WARM_YTDLP=0` turns it off. A
+search's publish-date fetches still start yt-dlp each time, because what they
+print before a timeout counts; the CLI and download jobs are unchanged.
+`/api/health` counts the warm processes under `engine`.
+
+The rest of a lookup is YouTube: the watch page, two player API calls, the
+n-challenge and the format manifests.
 
 **Dates three at a time, bounded for the whole process.** A search's publish
 dates are split over up to three yt-dlp runs. Every run beyond a search's own
@@ -693,10 +717,6 @@ is borrowed from one pool all the slots share, `YTMEER_DATE_WORKERS - 1` big,
 and only if it is free when the dating starts. So four slots dating at once run
 six extractions, never twelve, and a search that finds the pool empty dates in
 one run, as before, rather than waiting for a lane.
-
-Starting yt-dlp is not the cost: it is about 0.4s of a 7.7s lookup. The rest is
-YouTube - the watch page, two player API calls, its ~2 MB player script (fetched
-again by every run) and the n-challenge.
 
 **Repeats come from memory.** The same question within `YTMEER_CACHE_TTL`
 (default 900s, `0` turns it off) is answered at once, without YouTube or a slot,
@@ -1297,6 +1317,7 @@ can open beats a URL it cannot.
 | `YTMEER_CACHE_TTL` | `900` | seconds an answer is kept for the next caller asking the same thing; `0` turns the cache off |
 | `YTMEER_CACHE_SIZE` | `256` | answers kept at most, oldest out first |
 | `YTMEER_BOT_PAUSE` | `60` | seconds every lookup pauses after a bot check, doubling while it recurs, at most 900; `0` never pauses |
+| `YTMEER_WARM_YTDLP` | `1` | one warm yt-dlp process per slot, so a lookup skips starting yt-dlp and re-fetching YouTube's player script (~2.4s); `0` starts the `yt-dlp` command for every call, as before |
 | `YTMEER_DATE_WORKERS` | `3` | yt-dlp runs one search's publish dates are split across, 1-8; five videos or fewer stay one run. The runs past a call's first come from one pool of `N - 1` that every slot shares, taken only when free, so four slots dating at once run at most six. `1` turns the split off. Read by the command line too |
 | `YTMEER_MAX_JOBS` | `50` | finished jobs kept in memory. Files are never touched |
 
