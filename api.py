@@ -992,8 +992,11 @@ class EnginePool:
     #                    would stop one slot's caption asks and let the others
     #                    lengthen the block.
     #   po_token_first - "this IP needs the PO-token client", learnt once.
+    #   DATE_LANES     - the extra yt-dlp runs publish dates may borrow. Per
+    #                    slot, four slots dating at once could each split
+    #                    three ways: twelve extractions from one IP.
     SHARED = ("RATE_LIMITED", "RATE_LIMITED_LINE", "RATE_LIMITED_AT",
-              "po_token_first")
+              "po_token_first", "DATE_LANES")
 
     def __init__(self, size):
         self.size = max(1, int(size))
@@ -1727,8 +1730,9 @@ def build_app():
                                    "(YouTube's own results page, so near-matches "
                                    "come too) or exact (the narrower ytsearch).")
         dates: bool = Field(True, description="Fetch each search result's "
-                            "publish date. About 2.1s per video, for the "
-                            "results that survive the filters.")
+                            "publish date. About 2.1s per video, up to "
+                            "three yt-dlp runs at once, for the results that "
+                            "survive the filters.")
         shorts: bool = Field(False, description="Include short-form videos. "
                              "Left out by default. Overrides min_duration, "
                              "which it sets to 0.")
@@ -1838,9 +1842,10 @@ def build_app():
                dates: bool = Query(True, description="Fetch each result's "
                                    "publish date. The cheap search route "
                                    "returns none, so these cost about 2.1s per "
-                                   "video and are fetched only for the results "
-                                   "that survive the filters - use limit to "
-                                   "keep that small."),
+                                   "video, up to three yt-dlp runs at once (10 "
+                                   "took 20s), and are fetched only for the "
+                                   "results that survive the filters - use "
+                                   "limit to keep that small."),
                shorts: bool = Query(False, description="Include short-form "
                                     "videos. Left out by default. Overrides "
                                     "min_duration, which it sets to 0."),
@@ -2061,7 +2066,8 @@ def build_app():
                                               le=INT_MAX["min_duration"],
                                               description="Length floor, seconds."),
                     dates: bool = Query(True, description="Fetch publish dates "
-                                        "(about 2.1s per video)."),
+                                        "(about 2.1s per video, up to three "
+                                        "yt-dlp runs at once)."),
                     skip: str = Query("", description="Links or ids to leave "
                                       "out, as skip.txt would.")):
         """Long videos like this one. YouTube's related feed is not reachable

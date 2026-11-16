@@ -879,6 +879,81 @@ class TestEngineSlots(EngineCase):
         self.assertNotEqual(second.MIN_DURATION, 7)
         self.assertNotEqual(api.downloader.MIN_DURATION, 7)
 
+    def _dating_engine(self, slots):
+        """slots engine copies, all dating through a scripted yt-dlp that
+        waits on a gate - so a test can count the runs in flight at once."""
+        d = api.downloader
+        # Swapped in BEFORE the copies are made: they take the shared pool from
+        # the imported module at birth, and that hand-over is what is tested.
+        self.stub(d, DATE_LANES=threading.BoundedSemaphore(2))
+        pool = self.pool(slots)
+        saved = d.po_token_first[0]
+        d.po_token_first[0] = True            # one route, shared by every slot
+        self.addCleanup(d.po_token_first.__setitem__, 0, saved)
+        nowhere = os.path.join(tempfile.gettempdir(), "ytmeer-none", "cookies.txt")
+        for module in pool.modules():
+            self.stub(module, DATE_WORKERS=3, DATE_CHUNK_MIN=3, COOKIES_FILE=nowhere)
+        gate, lock, live, peak, runs = (threading.Event(), threading.Lock(), [0], [0], [])
+
+        def run(cmd, **kw):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                runs.append(cmd)
+            gate.wait(5)
+            with lock:
+                live[0] -= 1
+            ids = [url[-11:] for url in cmd[cmd.index("--") + 1:]]
+            return subprocess.CompletedProcess(
+                cmd, 0, "".join(f"{v}\t1700000000\n" for v in ids), "")
+
+        self.stub(subprocess, run=run)
+        return pool, gate, live, peak, runs
+
+    def test_every_slot_borrows_its_extra_date_runs_from_one_pool(self):
+        # A pool per copy would let three slots dating at once split three
+        # ways each: nine extractions from one IP. With one pool it is each
+        # slot's own run plus the pool's two.
+        pool, gate, live, peak, _runs = self._dating_engine(3)
+        for module in pool.modules():
+            self.assertIs(module.DATE_LANES, api.downloader.DATE_LANES)
+        answers = []
+
+        def date(module, letter):
+            items = [{"id": f"{letter}{n:010d}",
+                      "url": module.watch_url(f"{letter}{n:010d}"), "epoch": None}
+                     for n in range(9)]
+            answers.append(module.resolve_dates(items))
+
+        threads = [threading.Thread(target=date, args=(module, letter))
+                   for module, letter in zip(pool.modules(), "abc")]
+        for t in threads:
+            t.start()
+        try:
+            self.assertTrue(self.until(lambda: live[0] == 5), "five runs should start")
+            time.sleep(0.3)                   # time for a sixth to sneak in
+            self.assertEqual(live[0], 5, "a slot split past the shared pool")
+        finally:
+            gate.set()
+            for t in threads:
+                t.join(10)
+        self.assertEqual(peak[0], 5)
+        self.assertEqual(answers, [(9, None)] * 3)
+
+    def test_a_search_alone_dates_its_ten_in_three_runs(self):
+        # The route itself, end to end: nothing in the per-request reset may
+        # turn the split off.
+        _pool, gate, _live, _peak, runs = self._dating_engine(1)
+        gate.set()                            # overlap is the test above's business
+        entries = [{"id": f"v{n:010d}", "title": str(n), "view_count": 10 + n,
+                    "duration": 900} for n in range(30)]
+        self.stub_all(search_flat=lambda query, count: (list(entries), None))
+        answer = api.search_youtube("cats", limit=10)
+        self.assertEqual((answer["found"], answer["dates_fetched"]), (10, 10))
+        self.assertIsNone(answer["date_error"])
+        self.assertTrue(all(row["published"] for row in answer["results"]))
+        self.assertEqual(sorted(len(cmd[cmd.index("--") + 1:]) for cmd in runs), [3, 3, 4])
+
     def test_a_bad_setting_in_the_environment_is_the_default(self):
         os.environ["YTMEER_TEST_INT"] = "four"
         try:
