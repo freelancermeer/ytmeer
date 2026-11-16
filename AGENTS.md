@@ -231,15 +231,40 @@ used to accept any host carrying `v=<11 chars>`.
 **Status codes:** `422` the request was wrong — the body names the field in
 `detail[0].loc`; `502` YouTube would not answer, **including a search whose
 engine failed and found nothing** (a bot check, a timeout — formerly a `200`
-with `found: 0`); `503` another in-process request holds the engine; `401` bad
-or missing key, including a non-ASCII one.
+with `found: 0`), and a lookup **paused** after a bot check (below); `503`
+every engine slot stayed taken for 5s; `401` bad or missing key, including a
+non-ASCII one.
 
 A **partial** answer stays a `200`: results with a noted `error` or
 `date_error` (say, the publish dates could not be fetched) is still an answer.
 
-**One lookup, search or preview at a time.** They share the engine's module
-globals. A second gets `503` — retry, do not queue. Every request resets every
-global it can set, so nothing leaks between them.
+**Up to four lookups at once.** Searches, previews and lookups run side by side
+on `YTMEER_ENGINE_SLOTS` engine slots (default **4**, at most 16), each slot on
+its own copy of the engine's module globals, so nothing one request sets can
+reach another. Every request resets every global it can set, so nothing leaks
+between requests either. Past the last slot a request waits up to 5s and then
+gets `503` — retry, do not queue. More slots is more requests from one IP at
+once, which is what YouTube's bot check reacts to; that is why it is four.
+
+**A repeat comes from memory.** The same question asked again within
+`YTMEER_CACHE_TTL` (default 900s; `0` turns it off) is answered at once, without
+YouTube and without a slot, and says so: `cached: true` and
+`cache_age_seconds`. One video spelled two ways (`dQw4w9WgXcQ`, a `youtu.be`
+link, a watch link with `&t=`) is one question. Identical requests that overlap
+share one fetch. A failure is never kept, and nor is a partial answer — one
+with `error`, `date_error`, `listing_error`, `count_failures` or `out_of_time`
+set — so asking again can still do better. The views in a cached answer are as
+old as its `cache_age_seconds`.
+
+**A bot check pauses every lookup.** YouTube's "Sign in to confirm you're not a
+bot" refuses this IP, not one video, and asking again is what makes it last
+longer. So the first one pauses every lookup in the process for
+`YTMEER_BOT_PAUSE` seconds (default 60), doubling each time it comes back after
+a pause, up to 900; an answer that gets through resets it. A paused lookup is a
+`502` naming the seconds left, and nothing is asked of YouTube — wait, do not
+retry in a loop. Cached answers are still served meanwhile. A rejected
+`cookies.txt` and a caption `429` (§6.8) pause nothing. `GET /api/health` has
+an `engine` block: slots in use, the cache, and any pause.
 
 Every route sets a **120s wall** (`/api/preview` keeps its own 45s). The
 paid-per-video work honours it: the metadata lookup, date fetching, the window
@@ -364,18 +389,23 @@ YouTube's own date search, which scans only 40 deep and returns far fewer.
 
 ### 5.4 Budget from the measured costs
 
+Uncontended, one call at a time. Several at once cost the same each, up to
+the slot count (§4.1); a repeat within the cache's 15 minutes costs nothing.
+
 | Operation | Measured |
 |---|---|
-| Flat search scan | ~0.07s per result |
+| Flat search scan | ~0.07s per result (150 in ~12s) |
 | Dated search scan | ~2s per result |
-| Publish date, per video | ~2.1s |
-| Video details | ~3s |
+| Publish date, per video | ~2.1s (~3s each for a batch of 3) |
+| Video details | ~5-8s (4.7s and 7.7s on 16 Nov 2026) |
+| The same question again | ~0s (cache, §4.1) |
 | Channel details (278 videos) | ~23s |
 | Channel videos (278 listed) | ~11s |
 | Playlists (5, with counts) | ~8s |
 | Similar videos (no dates) | ~24s |
 | Similar videos (with dates, 20 kept) | ~65s |
 | Transcript | ~9s |
+| 20 comments | ~5s (one yt-dlp run; it was two, 9.7s) |
 | 100 comments | ~7s (~19s with replies) |
 | Channel listing | one request per 100 videos |
 
@@ -614,7 +644,8 @@ it is the only one worth simply retrying. A `--dry-run` that finds nothing new i
 - **One download per folder, across every process** (§12). A second one exits
   75 rather than mixing its logs into the first's. A report may still run
   alongside a download; two reports may not.
-- **One in-process API request at a time** (§4.1).
+- **Four in-process lookups at once** (`YTMEER_ENGINE_SLOTS`, §4.1) — for the
+  whole fleet: subagents share their parent's MCP server process.
 - **`--channel-videos` returns no publish dates** at all (§5.3).
 - **`published` is `null`** on a search unless dates were fetched (§5.3).
 - **`created`, `lifetime_views` and `country` are scraped** and can go `null`
@@ -653,16 +684,28 @@ Three things differ from the REST API, deliberately:
 - **Absolute paths, not URLs.** The editor is on this machine, so
   `yt_job_status` hands over `/Users/…/Title.mp4` rather than
   `/jobs/{id}/files/…`. There is no file-download tool; the editor opens the path.
-- **A busy engine waits, it does not fail.** `YTMEER_BUSY_WAIT` (default 90s)
-  replaces the API's 5s, which existed because a queued HTTP request would hit a
-  proxy timeout. Over stdio there is no proxy, and an agent comparing two
-  channels fires both calls at once.
+- **A full engine waits, then fails.** A call past the last slot waits up to
+  `YTMEER_BUSY_WAIT` (default 90s) where the API waits 5s, which it does because
+  a queued HTTP request would hit a proxy timeout. Over stdio there is no
+  proxy, and an agent comparing two channels fires both calls at once. A cached
+  answer needs no slot at all, and `yt_health` never takes one.
 - **§0, §5.1, §5.2 and §5.3 are written into the tool descriptions**, so a model
   in another editor follows them without having read this file.
 
-Everything else is unchanged: the long-form floor, one in-process request at a
-time, the cost table in §5.4, and the limits in §10 all apply exactly as they do
-over HTTP.
+Everything else is unchanged: the long-form floor, the slot limit, the cache,
+the bot-check pause, the cost table in §5.4, and the limits in §10 all apply
+exactly as they do over HTTP.
+
+**One server per editor session, shared by its subagents.** Each Claude Code
+session launches its own `mcp_server.py`; the subagents it starts do not — they
+call through their parent's process. So five parallel subagents are five
+callers on one server's four slots, and the engine settings are set once, in
+the server's `env` block:
+
+```json
+"ytmeer": {"command": "python3", "args": ["<path>/mcp_server.py"],
+           "env": {"YTMEER_ENGINE_SLOTS": "4", "YTMEER_CACHE_TTL": "900"}}
+```
 
 **Remote.** `--http` serves the same tools as streamable HTTP for a client that
 cannot launch a local process (claude.ai in a browser). It **refuses to start

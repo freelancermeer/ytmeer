@@ -501,6 +501,7 @@ async def yt_video(
     A value YouTube does not publish comes back null, never "NA" - that is the
     only way to tell "no likes" from "likes hidden". Read captions.auto before
     asking for a transcript: only an auto-generated track has word timings.
+    About 5-8s; asking again for the same video is answered from the cache.
     """
     return await _call(api.video_info, url)
 
@@ -644,7 +645,7 @@ async def yt_comments(
 
     Each top-level comment carries author, likes, published (PKT), text and its
     replies. total_on_video against fetched shows what the limit left behind.
-    About 7s for 100 comments, 19s with replies.
+    One yt-dlp run: about 5s for 20 comments, 7s for 100, 19s with replies.
     """
     return await _call(api.video_comments, url, limit, replies, sort)
 
