@@ -42,8 +42,9 @@ failures once at the end: act on "ok" and "skipped".
 Lookups run side by side, YTMEER_ENGINE_SLOTS (default 4) at a time, each on
 its own copy of downloader.py's module globals (EnginePool). A repeat within
 YTMEER_CACHE_TTL (900s) is answered from memory and says cached: true; a bot
-check pauses every lookup for YTMEER_BOT_PAUSE (60s, doubling). /api/health
-reports all three under "engine".
+check pauses every lookup for YTMEER_BOT_PAUSE (60s, doubling). Each slot keeps
+one warm yt-dlp process (ytdlp_worker.py; YTMEER_WARM_YTDLP=0 turns it off).
+/api/health reports all four under "engine".
 
 Only build_app() and main() import fastapi; the rest is stdlib, so it imports -
 and tests - without it.
@@ -73,6 +74,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import downloader  # noqa: E402  - stdlib-only, and cheap to import
+import ytdlp_worker  # noqa: E402  - likewise
 
 DOWNLOADER = os.path.join(HERE, "downloader.py")
 KEY_FILE = os.path.join(HERE, ".api_key")
@@ -953,6 +955,12 @@ def _env_int(name, default, low, high=None):
 # settings. More slots is more requests from this IP at once, which is what
 # YouTube's bot check reacts to - hence a small default, and the pause below.
 ENGINE_SLOTS = _env_int("YTMEER_ENGINE_SLOTS", 4, 1, 16)
+# One warm yt-dlp process per slot (ytdlp_worker.py), so a lookup stops paying
+# for starting yt-dlp and for YouTube's player script on every run - about
+# 2.4s of the 7.7s a video's details took. 0 runs every yt-dlp as a process of
+# its own, as before. Only these slots ever use it: the CLI and download jobs
+# never import this file, and test_downloader.py never holds a slot.
+WARM_YTDLP = _env_int("YTMEER_WARM_YTDLP", 1, 0, 1) == 1
 
 
 def _engine_copy(index):
@@ -1000,6 +1008,7 @@ class EnginePool:
         self._cond = threading.Condition()
         self._busy = [False] * self.size
         self._modules = [downloader] + [None] * (self.size - 1)
+        self._warm = [None] * self.size
 
     def acquire(self, timeout):
         """The index of a free slot, or None once timeout seconds have passed."""
@@ -1031,6 +1040,32 @@ class EnginePool:
         """Every engine module made so far - for a test that stubs them all."""
         return [m for m in self._modules if m is not None]
 
+    def warm(self, index):
+        """Slot index's warm yt-dlp, made the first time it is asked for (its
+        process starts at its first call). None with YTMEER_WARM_YTDLP=0, or
+        where one cannot work (Windows). Only its holder calls this."""
+        if not WARM_YTDLP or not ytdlp_worker.supported():
+            return None
+        worker = self._warm[index]
+        if worker is None:
+            worker = self._warm[index] = ytdlp_worker.WarmYtdlp()
+        return worker
+
+    def warm_status(self):
+        """What /api/health says about the warm processes, summed over slots."""
+        workers = [w for w in self._warm if w is not None]
+        states = [w.status() for w in workers]
+        return {"warm_ytdlp": bool(WARM_YTDLP and ytdlp_worker.supported()),
+                "warm_processes": sum(1 for s in states if s["alive"]),
+                "warm_runs": sum(s["runs"] for s in states),
+                "warm_declined": sum(s["declined"] for s in states)}
+
+    def stop_warm(self):
+        """Let every warm process go; each starts again when next needed."""
+        for worker in self._warm:
+            if worker is not None:
+                worker.stop()
+
     def in_use(self):
         with self._cond:
             return sum(self._busy)
@@ -1056,6 +1091,7 @@ def downloader_globals(wait=None, **overrides):
         raise PreviewBusy(f"{pool.size} other searches, previews or lookups are "
                           f"still running (every engine slot is taken); try "
                           f"again in a minute, or ask for less")
+    d = None
     try:
         d = pool.module(index)
         for name, value in ROUTE_GLOBALS.items():
@@ -1064,10 +1100,16 @@ def downloader_globals(wait=None, **overrides):
             setattr(d, name, value.copy() if hasattr(value, "copy") else value)
         d.COOKIES_FILE = os.path.join(DEFAULT_OUT, "cookies.txt")  # as a job would
         d.use_cookies[0] = True               # a replaced cookies.txt gets its chance
+        # This slot's warm yt-dlp, for this request only. Slot 0 is the
+        # downloader module itself, which test_downloader.py drives directly,
+        # so it is put back to None the moment the request is over.
+        d.WARM_YTDLP = pool.warm(index)
         for name, value in overrides.items():
             setattr(d, name, value)
         yield d
     finally:
+        if d is not None:
+            d.WARM_YTDLP = None
         pool.release(index)
 
 
@@ -1349,6 +1391,7 @@ def reset_engine_state():
     stubs the engine and would otherwise be handed the last test's answer."""
     CACHE.clear()
     reset_bot_pause()
+    ENGINE.stop_warm()
 
 
 def engine_status():
@@ -1358,7 +1401,8 @@ def engine_status():
             "cache_seconds": CACHE.seconds, "cached_answers": len(CACHE),
             "cache_hits": CACHE.hits, "cache_misses": CACHE.misses,
             "shared_fetches": CACHE.shared,
-            "bot_pause_seconds_left": left, "bot_pause_reason": reason}
+            "bot_pause_seconds_left": left, "bot_pause_reason": reason,
+            **ENGINE.warm_status()}
 
 
 def _skip_ids(skip):

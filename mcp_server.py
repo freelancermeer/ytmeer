@@ -47,6 +47,9 @@ Environment, all optional:
     YTMEER_BOT_PAUSE   seconds every lookup pauses after YouTube's bot check
                        (default 60, doubling while it keeps coming back, at
                        most 900; 0 never pauses).
+    YTMEER_WARM_YTDLP  1 (default): each slot keeps one yt-dlp process warm
+                       (ytdlp_worker.py), ~2.4s off every lookup after the
+                       slot's first. 0 starts the yt-dlp command per call.
     YTMEER_MAX_JOBS    finished jobs kept in memory (default 50). Nothing else
                        evicts them in a long-lived process. Files are untouched.
 
@@ -185,10 +188,12 @@ def _engine_note():
             f"{api.BOT_PAUSE_FIRST}s, doubling while it recurs) and fails at once "
             f"with \"paused, not tried\". Do not retry in a loop: wait the time it "
             f"names. Cached answers are still served meanwhile.")
+    details = ("video details ~3-4s (~7s for a slot's first call, while its "
+               "yt-dlp starts)" if api.WARM_YTDLP else "video details ~5-8s")
     lines.append(
-        "Costs worth budgeting (measured, uncontended): video details ~5-8s, 20 "
-        "comments ~5s, a search ~12s to scan 150 results plus ~3s per publish "
-        "date, channel details ~23s, a transcript ~9s.")
+        f"Costs worth budgeting (measured, uncontended): {details}, 20 comments "
+        f"~5s, a search ~12s to scan 150 results plus ~3s per publish date, "
+        f"channel details ~23s, a transcript ~9s.")
     return "\n\n".join(textwrap.fill(line, 78) for line in lines)
 
 

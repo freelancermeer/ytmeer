@@ -604,6 +604,46 @@ def child_env():
     return env
 
 
+# The warm yt-dlp (ytdlp_worker.py). api's engine slots set this, for the length
+# of one request, to their slot's ytdlp_worker.WarmYtdlp. None - the default, and
+# all the CLI, a download job and test_downloader.py ever have - runs every
+# yt-dlp as a process of its own.
+WARM_YTDLP = None
+# The stages it may run: one yt-dlp run each, whose output is read once it has
+# finished. Not search_dated or search_dates: on a timeout, what they printed
+# before the cut is still part of the answer (flushed_lines), so they keep the
+# plain subprocess that was written against.
+WARM_STAGES = frozenset({"metadata", "comments", "caption", "channel_page"})
+
+
+def run_command(stage, cmd, kwargs, started):
+    """subprocess.run(cmd, **kwargs) - in the slot's warm yt-dlp when it can.
+
+    Returns (CompletedProcess, ran_warm). The warm process answers as
+    subprocess.run would, TimeoutExpired included. When it declines - busy,
+    unable to start, died mid-run - the command runs here as it always did,
+    with what is left of its timeout rather than all of it again.
+    """
+    warm = WARM_YTDLP if stage in WARM_STAGES else None
+    if warm is None:
+        return subprocess.run(cmd, **kwargs), False
+    out = warm.run(cmd, **kwargs)
+    if out is not None:
+        return out, True
+    log_debug("warm_declined", stage=stage, reason=warm.problem)
+    timeout = kwargs.get("timeout")
+    if timeout is None:
+        return subprocess.run(cmd, **kwargs), False
+    left = timeout - (time.monotonic() - started)
+    if left <= 0:
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    try:
+        return subprocess.run(cmd, **dict(kwargs, timeout=left)), False
+    except subprocess.TimeoutExpired as e:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=e.output,
+                                        stderr=e.stderr) from None
+
+
 def run_logged(stage, cmd, **kwargs):
     """Run a captured subprocess and record its full lifecycle in the trace."""
     kwargs.setdefault("env", child_env())
@@ -613,7 +653,7 @@ def run_logged(stage, cmd, **kwargs):
     started = time.monotonic()
     log_debug("command_start", stage=stage, command=cmd, timeout=kwargs.get("timeout"))
     try:
-        out = subprocess.run(cmd, **kwargs)
+        out, warm = run_command(stage, cmd, kwargs, started)
     except subprocess.TimeoutExpired as e:
         log_debug("command_timeout", stage=stage, command=cmd,
                   duration=round(time.monotonic() - started, 3),
@@ -627,7 +667,8 @@ def run_logged(stage, cmd, **kwargs):
               duration=round(time.monotonic() - started, 3),
               returncode=getattr(out, "returncode", None),
               stdout_tail=_text(getattr(out, "stdout", "")),
-              stderr_tail=_text(getattr(out, "stderr", "")))
+              stderr_tail=_text(getattr(out, "stderr", "")),
+              **({"warm": True} if warm else {}))
     return out
 
 
